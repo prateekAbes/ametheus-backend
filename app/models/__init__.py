@@ -5,6 +5,7 @@ from app.models.team import Team, TeamMember
 from app.models.tournament import Tournament, TournamentRegistration
 from app.models.match import Match
 from app.models.admin import TournamentAdminAssignment, AuditLog
+from app.models.dispute import Dispute
 
 __all__ = [
     "Base",
@@ -17,4 +18,5 @@ __all__ = [
     "Match",
     "TournamentAdminAssignment",
     "AuditLog",
+    "Dispute",
 ]

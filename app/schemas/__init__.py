@@ -6,6 +6,8 @@ class UserBase(BaseModel):
     email: str
     username: str
     role: str = "PLAYER"
+    display_name: Optional[str] = None
+    clerk_user_id: Optional[str] = None
     avatar_url: Optional[str] = None
     riot_id: Optional[str] = None
     steam_id: Optional[str] = None
@@ -74,6 +76,7 @@ class TeamResponse(BaseModel):
 class TournamentResponse(BaseModel):
     id: str
     slug: str
+    organizer_id: Optional[str] = None
     title: str
     game_slug: str
     game_name: str
@@ -127,6 +130,28 @@ class MatchResultSubmit(BaseModel):
     score_b: int
     evidence_url: Optional[str] = "https://r2.ametheus.gg/proof.png"
     captain_notes: Optional[str] = None
+
+# Dispute
+class DisputeCreate(BaseModel):
+    reason: str
+    description: str
+    evidence_url: Optional[str] = None
+
+class DisputeResolve(BaseModel):
+    resolution_notes: str
+    decision: str = "RESOLVED"  # RESOLVED or CLOSED
+
+class DisputeResponse(BaseModel):
+    id: str
+    tournament_id: str
+    match_id: str
+    submitted_by: str
+    reason: str
+    description: str
+    evidence_url: Optional[str] = None
+    status: str
+    created_at: str
+    model_config = ConfigDict(from_attributes=True)
 
 # Leaderboard
 class LeaderboardEntryResponse(BaseModel):

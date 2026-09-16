@@ -8,7 +8,8 @@ from app.models.tournament import Tournament
 from app.models.game import Game
 from app.models.team import Team, TeamMember
 from app.models.match import Match
-from app.schemas import MatchResponse, MatchResultSubmit
+from app.schemas import MatchResponse, MatchResultSubmit, DisputeCreate
+from app.models.dispute import Dispute
 
 router = APIRouter()
 
@@ -82,3 +83,36 @@ async def submit_match_result(
 
     await db.commit()
     return {"status": "success", "message": "Match result & proof submitted for admin verification"}
+
+@router.post("/{id}/dispute")
+async def create_match_dispute(
+    id: str,
+    payload: DisputeCreate,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    m_res = await db.execute(select(Match).where(Match.id == id))
+    match = m_res.scalars().first()
+    if not match:
+        raise HTTPException(status_code=404, detail="Match not found")
+
+    dispute = Dispute(
+        tournament_id=match.tournament_id,
+        match_id=match.id,
+        submitted_by=current_user.id,
+        reason=payload.reason,
+        description=payload.description,
+        evidence_url=payload.evidence_url,
+        status="OPEN",
+    )
+    db.add(dispute)
+    match.status = "DISPUTED"
+    match.dispute_notes = payload.description
+    await db.commit()
+    await db.refresh(dispute)
+
+    return {
+        "status": "success",
+        "message": "Dispute opened and match frozen for administrative review",
+        "dispute_id": dispute.id,
+    }

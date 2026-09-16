@@ -119,20 +119,26 @@ async def populate_seed_data(db: AsyncSession):
     # 1. Users
     super_admin = User(
         id="usr_super_admin",
+        clerk_user_id="user_super_admin_clerk",
         email="admin@ametheus.gg",
         username="super_admin",
+        display_name="Super Admin",
         role="SUPER_ADMIN",
     )
     tournament_admin = User(
         id="usr_arbiter_val",
+        clerk_user_id="user_arbiter_val_clerk",
         email="arbiter@ametheus.gg",
         username="arbiter_val",
-        role="TOURNAMENT_ADMIN",
+        display_name="Valorant Arbiter",
+        role="ORGANIZER",
     )
     captain_vortex = User(
         id="usr_vortex_lead",
+        clerk_user_id="user_vortex_lead_clerk",
         email="vortex@solaris.gg",
         username="vortex_lead",
+        display_name="Vortex Lead",
         role="PLAYER",
         riot_id="Vortex#APEX",
         steam_id="STEAM_0:1:88291039",
@@ -185,6 +191,7 @@ async def populate_seed_data(db: AsyncSession):
     val_tourn = Tournament(
         slug="ametheus-valorant-open-01",
         game_id=val_game.id,
+        organizer_id=tournament_admin.id,
         title="AMETHEUS VALORANT INVITATIONAL 2026",
         prize_pool_inr=50000,
         entry_fee_inr=60,

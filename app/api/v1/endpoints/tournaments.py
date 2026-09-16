@@ -1,6 +1,6 @@
 import json
 from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from app.api.deps import get_db, get_current_user
@@ -19,6 +19,9 @@ async def list_tournaments(
     db: AsyncSession = Depends(get_db),
 ):
     query = select(Tournament)
+    if status:
+        query = query.where(Tournament.status == status)
+
     result = await db.execute(query)
     tournaments = result.scalars().all()
 
@@ -46,6 +49,7 @@ async def list_tournaments(
             TournamentResponse(
                 id=t.id,
                 slug=t.slug,
+                organizer_id=t.organizer_id,
                 title=t.title,
                 game_slug=game_obj.slug if game_obj else "valorant",
                 game_name=game_obj.name if game_obj else "Valorant",
@@ -75,7 +79,11 @@ async def list_tournaments(
 
 @router.get("/{slug}", response_model=TournamentResponse)
 async def get_tournament_by_slug(slug: str, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(Tournament).where(Tournament.slug == slug))
+    result = await db.execute(
+        select(Tournament).where(
+            (Tournament.slug == slug) | (Tournament.id == slug)
+        )
+    )
     t = result.scalars().first()
     if not t:
         raise HTTPException(status_code=404, detail="Tournament not found")
@@ -99,6 +107,7 @@ async def get_tournament_by_slug(slug: str, db: AsyncSession = Depends(get_db)):
     return TournamentResponse(
         id=t.id,
         slug=t.slug,
+        organizer_id=t.organizer_id,
         title=t.title,
         game_slug=game_obj.slug if game_obj else "valorant",
         game_name=game_obj.name if game_obj else "Valorant",
@@ -131,21 +140,64 @@ async def register_team_for_tournament(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    """
+    Section 39: Complete Tournament Registration Validation:
+    - Tournament exists
+    - Registration is currently open
+    - Tournament capacity has not been reached
+    - Team exists
+    - Player is captain/authorized
+    - Team belongs to correct game discipline
+    - Team is not already registered
+    """
     t_res = await db.execute(select(Tournament).where(Tournament.id == id))
     tourn = t_res.scalars().first()
     if not tourn:
         raise HTTPException(status_code=404, detail="Tournament not found")
 
+    # 1. Registration open check
+    if tourn.status != "REGISTRATION_OPEN":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Registration is not open for this tournament (current status: {tourn.status})",
+        )
+
+    # 2. Capacity check
+    reg_count = (
+        await db.execute(
+            select(func.count(TournamentRegistration.id)).where(
+                TournamentRegistration.tournament_id == tourn.id
+            )
+        )
+    ).scalar() or 0
+
+    if reg_count >= tourn.max_teams:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Tournament capacity of {tourn.max_teams} squads has been reached",
+        )
+
+    # 3. Team check
     team_res = await db.execute(select(Team).where(Team.id == payload.team_id))
     team = team_res.scalars().first()
     if not team:
         raise HTTPException(status_code=404, detail="Team not found")
 
-    # Check captain authorization
+    # 4. Captain authorization
     if team.captain_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Only team captain can register team for tournaments")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the verified squad captain can register this team",
+        )
 
-    # Check already registered
+    # 5. Game discipline match
+    if team.game_id != tourn.game_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Your squad is registered for a different competitive title than this tournament",
+        )
+
+    # 6. Duplicate registration check
     existing_reg = (
         await db.execute(
             select(TournamentRegistration).where(
@@ -154,9 +206,11 @@ async def register_team_for_tournament(
             )
         )
     ).scalars().first()
-    if existing_reg:
-        raise HTTPException(status_code=400, detail="Team already registered for this tournament")
 
+    if existing_reg:
+        raise HTTPException(status_code=400, detail="Team is already registered for this tournament")
+
+    # 7. Create registration record
     reg = TournamentRegistration(
         tournament_id=tourn.id,
         team_id=team.id,
@@ -169,7 +223,7 @@ async def register_team_for_tournament(
 
     return {
         "status": "success",
-        "message": "Team successfully registered for tournament",
+        "message": f'Squad "{team.name}" successfully registered for {tourn.title}!',
         "order_id": reg.order_id,
         "entry_fee_inr": tourn.entry_fee_inr,
     }

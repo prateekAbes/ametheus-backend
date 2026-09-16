@@ -52,3 +52,19 @@ async def test_team_create_and_join_flow(client):
     assert join_resp.status_code == 200, join_resp.text
     join_data = join_resp.json()
     assert len(join_data["members"]) == 2
+
+    # 3. Lookup team by code
+    lookup_resp = await client.get(f"/api/v1/teams/code/{invite_code.lower()}")
+    assert lookup_resp.status_code == 200
+    assert lookup_resp.json()["name"] == "Vortex Elite"
+
+    # 4. Get my teams
+    my_teams_resp = await client.get("/api/v1/teams/my-teams", headers=headers_captain)
+    assert my_teams_resp.status_code == 200
+    my_teams = my_teams_resp.json()
+    assert len(my_teams) >= 1
+    assert any(t["invite_code"] == invite_code for t in my_teams)
+
+    my_teams_member_resp = await client.get("/api/v1/teams/my-teams", headers=headers_member)
+    assert my_teams_member_resp.status_code == 200
+    assert any(t["invite_code"] == invite_code for t in my_teams_member_resp.json())
