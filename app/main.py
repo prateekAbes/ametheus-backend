@@ -23,6 +23,7 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.CORS_ORIGINS,
+    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -38,3 +39,7 @@ async def root():
         "status": "operational",
         "docs": "/docs",
     }
+
+@app.get("/health")
+async def health_check():
+    return {"status": "ok", "service": "ametheus-backend"}
