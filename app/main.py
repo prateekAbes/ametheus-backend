@@ -8,9 +8,17 @@ from app.models import *  # ensure all models registered
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Auto-create tables for seamless local dev
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    # Auto-create tables on startup (works with both SQLite and PostgreSQL)
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        
+        # Auto-seed database if empty
+        from app.seed import seed_if_empty
+        await seed_if_empty()
+    except Exception as e:
+        print(f"[AMETHEUS Lifespan Warning]: {e}")
+    
     yield
     await engine.dispose()
 
@@ -20,9 +28,11 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+cors_origins = settings.CORS_ORIGINS if isinstance(settings.CORS_ORIGINS, list) else [settings.CORS_ORIGINS]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.CORS_ORIGINS,
+    allow_origins=cors_origins,
     allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],

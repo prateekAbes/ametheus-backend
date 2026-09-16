@@ -2,11 +2,9 @@ services:
   - type: web
     name: ametheus-backend
     runtime: python
-    region: singapore
     plan: free
-    rootDir:
-    buildCommand: "pip install -r requirements.txt && python -m app.seed"
-    startCommand: "uvicorn app.main:app --host 0.0.0.0 --port $PORT"
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
     envVars:
       - key: PYTHON_VERSION
@@ -22,7 +20,6 @@ services:
 
 databases:
   - name: ametheus-db
-    region: singapore
     plan: free
     databaseName: ametheus
     user: ametheus_user
