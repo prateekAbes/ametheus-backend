@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: ametheus-backend
+    runtime: python
+    region: singapore
+    plan: free
+    rootDir: backend
+    buildCommand: "pip install -r requirements.txt && python -m app.seed"
+    startCommand: "uvicorn app.main:app --host 0.0.0.0 --port $PORT"
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.7
+      - key: DATABASE_URL
+        fromDatabase:
+          name: ametheus-db
+          property: connectionString
+      - key: SECRET_KEY
+        generateValue: true
+      - key: CORS_ORIGINS
+        value: "http://localhost:3000,https://ametheus.vercel.app"
+
+databases:
+  - name: ametheus-db
+    region: singapore
+    plan: free
+    databaseName: ametheus
+    user: ametheus_user
