@@ -250,6 +250,99 @@ async def delete_leaderboard_category(
     await db.leaderboard_categories.delete_one({"_id": cat["_id"]})
     return {"status": "success", "message": f"Category '{slug}' deleted successfully"}
 
+class LeaderboardDisqualificationCreate(BaseModel):
+    entity_id: str
+    entity_name: str
+    entity_tag: Optional[str] = ""
+    reason: str = "Administrative Removal"
+    notes: Optional[str] = ""
+
+@router.get("/disqualifications")
+async def list_disqualifications(
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """List all entities currently disqualified from leaderboard standings."""
+    docs = await db.leaderboard_disqualifications.find().sort("disqualified_at", -1).to_list(100)
+    for d in docs:
+        d["id"] = str(d.pop("_id", d.get("id")))
+        if isinstance(d.get("disqualified_at"), datetime):
+            d["disqualified_at"] = d["disqualified_at"].isoformat()
+    return docs
+
+@router.post("/disqualify")
+async def disqualify_leaderboard_entry(
+    payload: LeaderboardDisqualificationCreate,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Admin endpoint to remove/disqualify a player or team from leaderboard rankings."""
+    existing = await db.leaderboard_disqualifications.find_one({"entity_id": payload.entity_id})
+    if existing:
+        return {"status": "exists", "message": f"{payload.entity_name} is already disqualified"}
+    
+    doc = {
+        "_id": f"dq_{uuid.uuid4().hex[:12]}",
+        "entity_id": payload.entity_id,
+        "entity_name": payload.entity_name,
+        "entity_tag": payload.entity_tag or "",
+        "reason": payload.reason,
+        "notes": payload.notes or "",
+        "disqualified_by": admin_user.username,
+        "disqualified_at": datetime.now(timezone.utc),
+    }
+    await db.leaderboard_disqualifications.insert_one(doc)
+    from app.services.audit import record_audit_log
+    await record_audit_log(
+        db=db,
+        operator=admin_user.username,
+        role=admin_user.role,
+        action="LEADERBOARD_DISQUALIFY",
+        target=f"{payload.entity_name} ({payload.entity_id})",
+        details=f"Reason: {payload.reason}. Notes: {payload.notes}",
+    )
+    return {"status": "success", "message": f"{payload.entity_name} removed and disqualified from leaderboard"}
+
+@router.delete("/disqualify/{entity_id}")
+async def reinstate_leaderboard_entry(
+    entity_id: str,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Reinstate a previously disqualified entity back into leaderboard standings."""
+    res = await db.leaderboard_disqualifications.delete_one({"entity_id": entity_id})
+    if res.deleted_count == 0:
+        await db.leaderboard_disqualifications.delete_one({"_id": entity_id})
+    from app.services.audit import record_audit_log
+    await record_audit_log(
+        db=db,
+        operator=admin_user.username,
+        role=admin_user.role,
+        action="LEADERBOARD_REINSTATE",
+        target=f"Entity {entity_id}",
+    )
+    return {"status": "success", "message": f"Entity {entity_id} reinstated into standings"}
+
+@router.delete("/entries/{entity_id}")
+async def remove_entry_direct(
+    entity_id: str,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Direct deletion/disqualification shortcut for an entry."""
+    doc = {
+        "_id": f"dq_{uuid.uuid4().hex[:12]}",
+        "entity_id": entity_id,
+        "entity_name": entity_id,
+        "entity_tag": "",
+        "reason": "Administrative Removal",
+        "notes": "Removed by administrator via direct action",
+        "disqualified_by": admin_user.username,
+        "disqualified_at": datetime.now(timezone.utc),
+    }
+    await db.leaderboard_disqualifications.insert_one(doc)
+    return {"status": "success", "message": f"Entry {entity_id} removed from leaderboard"}
+
 @router.get("", response_model=List[LeaderboardEntryResponse])
 async def get_leaderboard(
     category: Optional[str] = Query(None),
@@ -344,6 +437,22 @@ async def get_leaderboard(
     # Apply minimum matches filter
     if min_matches > 0:
         entries = [e for e in entries if e["matches_played"] >= min_matches]
+
+    # Fetch disqualified entity IDs and tags from db
+    try:
+        dq_docs = await db.leaderboard_disqualifications.find().to_list(length=500)
+        dq_ids = {str(d.get("entity_id", "")) for d in dq_docs}
+        dq_names = {str(d.get("entity_name", "")).lower() for d in dq_docs if d.get("entity_name")}
+        dq_tags = {str(d.get("entity_tag", "")).lower() for d in dq_docs if d.get("entity_tag")}
+
+        entries = [
+            e for e in entries
+            if str(e.get("id", "")) not in dq_ids
+            and str(e.get("name", "")).lower() not in dq_names
+            and (not e.get("tag") or str(e.get("tag", "")).lower() not in dq_tags)
+        ]
+    except Exception as e:
+        print(f"[Leaderboard Disqualification Filter Notice]: {e}")
 
     # Dynamic metric sorting
     if sort_metric == "win_rate":

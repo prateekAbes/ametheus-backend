@@ -100,7 +100,8 @@ async def verify_match_result(
     match = Match.from_mongo(match_doc)
 
     # Verify authorization for this tournament
-    if current_user.role != "SUPER_ADMIN":
+    privileged_roles = ["SUPER_ADMIN", "TOURNAMENT_ADMIN", "MATCH_ARBITER", "ORGANIZER"]
+    if current_user.role not in privileged_roles:
         assign_check = await db.tournament_admin_assignments.find_one({
             "admin_user_id": current_user.id,
             "tournament_id": match.tournament_id,
@@ -146,6 +147,145 @@ async def verify_match_result(
         "next_match_id": next_match.id if next_match else None,
     }
 
+class MatchForfeitPayload(BaseModel):
+    forfeited_team_id: str
+    reason: str = "Disqualification or check-in forfeiture"
+
+@router.post("/matches/{id}/forfeit")
+async def force_match_forfeit(
+    id: str,
+    payload: MatchForfeitPayload,
+    current_user: User = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    privileged_roles = ["SUPER_ADMIN", "TOURNAMENT_ADMIN", "MATCH_ARBITER", "ORGANIZER"]
+    if current_user.role not in privileged_roles:
+        raise HTTPException(status_code=403, detail="Forbidden: Match arbiter authority required")
+
+    match_doc = await db.matches.find_one({"$or": [{"_id": id}, {"id": id}]})
+    if not match_doc:
+        raise HTTPException(status_code=404, detail="Match not found")
+
+    match = Match.from_mongo(match_doc)
+    winner_id = match.team_b_id if payload.forfeited_team_id == match.team_a_id else match.team_a_id
+
+    # Update match status to COMPLETED with forfeit note
+    await db.matches.update_one(
+        {"_id": match_doc["_id"]},
+        {"$set": {
+            "status": "COMPLETED",
+            "winner_team_id": winner_id,
+            "dispute_notes": f"FORFEIT: Team {payload.forfeited_team_id} forfeited. Reason: {payload.reason}",
+        }}
+    )
+
+    from app.services.bracket_engine import advance_bracket_match
+    next_match = await advance_bracket_match(
+        tournament_id=match.tournament_id,
+        completed_match=match,
+        winner_team_id=winner_id,
+        db=db,
+    )
+
+    await record_audit_log(
+        db=db,
+        operator=current_user.username,
+        role=current_user.role,
+        action="FORCE_MATCH_FORFEIT",
+        target=f"Match {match.id} (Forfeited: {payload.forfeited_team_id}, Winner: {winner_id})",
+        details=payload.reason,
+    )
+    return {"status": "success", "message": f"Team {payload.forfeited_team_id} marked as forfeited. Winner: {winner_id}"}
+
+class MatchScoreOverridePayload(BaseModel):
+    score_a: int
+    score_b: int
+    reason: str = "Official arbitrator score correction"
+
+@router.post("/matches/{id}/override-score")
+async def override_match_score(
+    id: str,
+    payload: MatchScoreOverridePayload,
+    current_user: User = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    privileged_roles = ["SUPER_ADMIN", "TOURNAMENT_ADMIN", "MATCH_ARBITER", "ORGANIZER"]
+    if current_user.role not in privileged_roles:
+        raise HTTPException(status_code=403, detail="Forbidden: Match arbiter authority required")
+
+    match_doc = await db.matches.find_one({"$or": [{"_id": id}, {"id": id}]})
+    if not match_doc:
+        raise HTTPException(status_code=404, detail="Match not found")
+
+    match = Match.from_mongo(match_doc)
+    winner_id = match.team_a_id if payload.score_a >= payload.score_b else match.team_b_id
+
+    await db.matches.update_one(
+        {"_id": match_doc["_id"]},
+        {"$set": {
+            "score_a": payload.score_a,
+            "score_b": payload.score_b,
+            "status": "COMPLETED",
+            "winner_team_id": winner_id,
+            "dispute_notes": f"SCORE OVERRIDE ({payload.score_a}-{payload.score_b}): {payload.reason}",
+        }}
+    )
+
+    from app.services.bracket_engine import advance_bracket_match
+    next_match = await advance_bracket_match(
+        tournament_id=match.tournament_id,
+        completed_match=match,
+        winner_team_id=winner_id,
+        db=db,
+    )
+
+    await record_audit_log(
+        db=db,
+        operator=current_user.username,
+        role=current_user.role,
+        action="OVERRIDE_MATCH_SCORE",
+        target=f"Match {match.id} ({payload.score_a} - {payload.score_b})",
+        details=payload.reason,
+    )
+    return {"status": "success", "message": f"Score overridden to {payload.score_a}-{payload.score_b} and certified"}
+
+class MatchRejectProofPayload(BaseModel):
+    reason: str = "Evidence image blurry or inconclusive"
+
+@router.post("/matches/{id}/reject-proof")
+async def reject_match_proof(
+    id: str,
+    payload: MatchRejectProofPayload,
+    current_user: User = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    privileged_roles = ["SUPER_ADMIN", "TOURNAMENT_ADMIN", "MATCH_ARBITER", "ORGANIZER"]
+    if current_user.role not in privileged_roles:
+        raise HTTPException(status_code=403, detail="Forbidden: Match arbiter authority required")
+
+    match_doc = await db.matches.find_one({"$or": [{"_id": id}, {"id": id}]})
+    if not match_doc:
+        raise HTTPException(status_code=404, detail="Match not found")
+
+    # Reset match status to LIVE and attach rejection note
+    await db.matches.update_one(
+        {"_id": match_doc["_id"]},
+        {"$set": {
+            "status": "LIVE",
+            "dispute_notes": f"EVIDENCE REJECTED: {payload.reason}. Team captains must re-upload valid proof.",
+        }}
+    )
+
+    await record_audit_log(
+        db=db,
+        operator=current_user.username,
+        role=current_user.role,
+        action="REJECT_MATCH_PROOF",
+        target=f"Match {id}",
+        details=payload.reason,
+    )
+    return {"status": "success", "message": f"Match proof rejected. Status reset to LIVE for re-upload."}
+
 @router.post("/users/{id}/promote-organizer")
 async def promote_user_to_organizer(
     id: str,
@@ -180,7 +320,14 @@ async def set_user_role(
     admin_user: User = Depends(require_super_admin),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
-    valid_roles = ["PLAYER", "ORGANIZER", "SUPER_ADMIN"]
+    valid_roles = [
+        "PLAYER",
+        "ORGANIZER",
+        "SUPER_ADMIN",
+        "TOURNAMENT_ADMIN",
+        "MATCH_ARBITER",
+        "COMMUNITY_MODERATOR",
+    ]
     if payload.role not in valid_roles:
         raise HTTPException(status_code=400, detail=f"Invalid role. Must be one of: {valid_roles}")
     user_doc = await db.users.find_one({"$or": [{"_id": id}, {"id": id}]})

@@ -59,10 +59,40 @@ async def require_organizer(
         current_user.role = "SUPER_ADMIN"
         return current_user
 
-    if current_user.role not in ["ORGANIZER", "TOURNAMENT_ADMIN", "SUPER_ADMIN"]:
+    if current_user.role not in ["ORGANIZER", "TOURNAMENT_ADMIN", "SUPER_ADMIN", "MATCH_ARBITER"]:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Forbidden: Operation requires ORGANIZER privilege (Rule 9)",
+            detail="Forbidden: Operation requires ORGANIZER or TOURNAMENT_ADMIN privilege (Rule 9)",
+        )
+    return current_user
+
+async def require_match_arbiter(
+    current_user: User = Depends(get_current_user),
+) -> User:
+    admin_emails = {"pk.4081988@gmail.com", "admin@ametheus.gg"}
+    if current_user.email and current_user.email.lower() in admin_emails:
+        current_user.role = "SUPER_ADMIN"
+        return current_user
+
+    if current_user.role not in ["MATCH_ARBITER", "TOURNAMENT_ADMIN", "SUPER_ADMIN"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Forbidden: Operation requires MATCH_ARBITER, TOURNAMENT_ADMIN, or SUPER_ADMIN privilege",
+        )
+    return current_user
+
+async def require_community_moderator(
+    current_user: User = Depends(get_current_user),
+) -> User:
+    admin_emails = {"pk.4081988@gmail.com", "admin@ametheus.gg"}
+    if current_user.email and current_user.email.lower() in admin_emails:
+        current_user.role = "SUPER_ADMIN"
+        return current_user
+
+    if current_user.role not in ["COMMUNITY_MODERATOR", "TOURNAMENT_ADMIN", "SUPER_ADMIN"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Forbidden: Operation requires COMMUNITY_MODERATOR or SUPER_ADMIN privilege",
         )
     return current_user
 
