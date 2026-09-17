@@ -50,18 +50,23 @@ class TournamentCreatePayload(BaseModel):
 
 class TournamentUpdatePayload(BaseModel):
     title: Optional[str] = None
+    game_id: Optional[str] = None
     prize_pool_inr: Optional[int] = None
     entry_fee_inr: Optional[int] = None
     starts_at: Optional[str] = None
     roster_lock_time: Optional[str] = None
     server_region: Optional[str] = None
     max_teams: Optional[int] = None
+    min_team_size: Optional[int] = None
+    max_team_size: Optional[int] = None
     rank_requirement: Optional[str] = None
     format: Optional[str] = None
     banner_url: Optional[str] = None
     description: Optional[str] = None
     rules: Optional[List[str]] = None
     schedule: Optional[List[Dict[str, Any]]] = None
+    prizes: Optional[List[Dict[str, Any]]] = None
+    status: Optional[str] = None
 
 def slugify(text: str) -> str:
     s = text.lower().strip()
@@ -211,8 +216,16 @@ async def update_tournament(
         update_fields["description"] = payload.description
     if payload.rules is not None:
         update_fields["rules"] = payload.rules
-    if payload.schedule is not None:
-        update_fields["schedule"] = payload.schedule
+    if payload.game_id is not None:
+        update_fields["game_id"] = payload.game_id
+    if payload.prizes is not None:
+        update_fields["prizes"] = payload.prizes
+    if payload.min_team_size is not None:
+        update_fields["min_team_size"] = payload.min_team_size
+    if payload.max_team_size is not None:
+        update_fields["max_team_size"] = payload.max_team_size
+    if payload.status is not None:
+        update_fields["status"] = payload.status
 
     if update_fields:
         await db.tournaments.update_one({"_id": tourn["_id"]}, {"$set": update_fields})
@@ -224,6 +237,34 @@ async def update_tournament(
     reg_count = await db.tournament_registrations.count_documents({"$or": [{"tournament_id": tid}, {"tournament_id": updated_tourn.get("slug")}]})
 
     return serialize_tournament_response(updated_tourn, game, reg_count)
+
+@router.delete("/tournaments/{id}")
+async def delete_tournament(
+    id: str,
+    organizer: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    tourn = await db.tournaments.find_one({"$or": [{"_id": id}, {"id": id}]})
+    if not tourn:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+
+    if organizer.role != "SUPER_ADMIN" and tourn.get("organizer_id") != organizer.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Forbidden: You do not have permission to delete this tournament",
+        )
+
+    await db.tournaments.delete_one({"_id": tourn["_id"]})
+    await db.tournament_registrations.delete_many({"$or": [{"tournament_id": id}, {"tournament_id": tourn.get("slug")}]})
+
+    await record_audit_log(
+        db=db,
+        operator=organizer.username,
+        role=organizer.role,
+        action="DELETE_TOURNAMENT",
+        target=f"Tournament {tourn.get('title')} ({id})",
+    )
+    return {"status": "success", "message": f"Tournament '{tourn.get('title')}' successfully deleted"}
 
 @router.post("/tournaments/{id}/publish")
 async def publish_tournament(
