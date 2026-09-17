@@ -78,3 +78,22 @@ async def test_tournament_discovery_and_registration(client):
     )
     assert reg_resp.status_code == 200
     assert reg_resp.json()["status"] == "success"
+
+@pytest.mark.asyncio
+async def test_leaderboard_discovery(client):
+    resp = await client.get("/api/v1/leaderboard")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert isinstance(data, list)
+    assert len(data) >= 1
+    first = data[0]
+    assert "rank" in first
+    assert "name" in first
+    assert "tag" in first
+    assert "rating" in first
+    assert "win_rate" in first
+
+    # Category filter test
+    cat_resp = await client.get("/api/v1/leaderboard?category=pc")
+    assert cat_resp.status_code == 200
+    assert isinstance(cat_resp.json(), list)
