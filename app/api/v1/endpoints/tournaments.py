@@ -12,6 +12,16 @@ from app.schemas import TournamentResponse, TournamentRegisterRequest
 
 router = APIRouter()
 
+def safe_json_loads(val, default):
+    if not val:
+        return default
+    if isinstance(val, (list, dict)):
+        return val
+    try:
+        return json.loads(val)
+    except Exception:
+        return default
+
 @router.get("", response_model=List[TournamentResponse])
 async def list_tournaments(
     game: Optional[str] = None,
@@ -40,10 +50,10 @@ async def list_tournaments(
             )
         ).scalar() or 0
 
-        rules = json.loads(t.rules_json) if t.rules_json else []
-        schedule = json.loads(t.schedule_json) if t.schedule_json else []
-        prizes = json.loads(t.prizes_json) if t.prizes_json else []
-        bracket = json.loads(t.bracket_json) if t.bracket_json else []
+        rules = safe_json_loads(t.rules_json, [])
+        schedule = safe_json_loads(t.schedule_json, [])
+        prizes = safe_json_loads(t.prizes_json, [])
+        bracket = safe_json_loads(t.bracket_json, [])
 
         response.append(
             TournamentResponse(
@@ -65,9 +75,9 @@ async def list_tournaments(
                 max_teams=t.max_teams,
                 rank_requirement=t.rank_requirement,
                 format=t.format,
-                banner_url=t.banner_url,
-                badge_color=t.badge_color,
-                description=t.description,
+                banner_url=t.banner_url or "https://lh3.googleusercontent.com/aida-public/AB6AXuD-g0bK72p2tQe7b3Z3F5WzX8oV0h4vM1bX2m9x_banner",
+                badge_color=t.badge_color or "#E56A10",
+                description=t.description or "",
                 rules=rules,
                 schedule=schedule,
                 prizes=prizes,
@@ -99,10 +109,10 @@ async def get_tournament_by_slug(slug: str, db: AsyncSession = Depends(get_db)):
         )
     ).scalar() or 0
 
-    rules = json.loads(t.rules_json) if t.rules_json else []
-    schedule = json.loads(t.schedule_json) if t.schedule_json else []
-    prizes = json.loads(t.prizes_json) if t.prizes_json else []
-    bracket = json.loads(t.bracket_json) if t.bracket_json else []
+    rules = safe_json_loads(t.rules_json, [])
+    schedule = safe_json_loads(t.schedule_json, [])
+    prizes = safe_json_loads(t.prizes_json, [])
+    bracket = safe_json_loads(t.bracket_json, [])
 
     return TournamentResponse(
         id=t.id,
@@ -123,9 +133,9 @@ async def get_tournament_by_slug(slug: str, db: AsyncSession = Depends(get_db)):
         max_teams=t.max_teams,
         rank_requirement=t.rank_requirement,
         format=t.format,
-        banner_url=t.banner_url,
-        badge_color=t.badge_color,
-        description=t.description,
+        banner_url=t.banner_url or "https://lh3.googleusercontent.com/aida-public/AB6AXuD-g0bK72p2tQe7b3Z3F5WzX8oV0h4vM1bX2m9x_banner",
+        badge_color=t.badge_color or "#E56A10",
+        description=t.description or "",
         rules=rules,
         schedule=schedule,
         prizes=prizes,

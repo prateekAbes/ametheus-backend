@@ -292,13 +292,15 @@ async def populate_seed_data(db: AsyncSession):
     db.add(match1)
 
     # 7. Audit Log
-    log = AuditLog(
+    from app.services.audit import record_audit_log
+    await record_audit_log(
+        db=db,
         operator=super_admin.username,
         role="SUPER_ADMIN",
         action="INITIALIZE_PLATFORM_SEED",
         target="Database Seed",
+        details="Initial platform seeding with official tournament and teams",
     )
-    db.add(log)
     await db.commit()
 
 async def seed_if_empty():

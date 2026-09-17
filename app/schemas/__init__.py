@@ -125,9 +125,9 @@ class TournamentResponse(BaseModel):
     max_teams: int
     rank_requirement: str
     format: str
-    banner_url: str
-    badge_color: str
-    description: str
+    banner_url: Optional[str] = "https://lh3.googleusercontent.com/aida-public/AB6AXuD-g0bK72p2tQe7b3Z3F5WzX8oV0h4vM1bX2m9x_banner"
+    badge_color: Optional[str] = "#E56A10"
+    description: Optional[str] = ""
     rules: List[str] = []
     schedule: List[Dict[str, Any]] = []
     prizes: List[Dict[str, Any]] = []
