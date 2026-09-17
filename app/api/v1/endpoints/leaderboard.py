@@ -12,6 +12,36 @@ from app.schemas import LeaderboardEntryResponse
 
 router = APIRouter()
 
+class LeaderboardStatsSchema(BaseModel):
+    total_awarded_prizes: str = "₹14,50,000+"
+    active_contenders: str = "24,800+"
+    verified_squads: str = "1,120+"
+    top_team_earnings: str = "₹1,85,000"
+    top_team_name: str = "Team Solaris X"
+
+class LeaderboardStatsUpdate(BaseModel):
+    total_awarded_prizes: Optional[str] = None
+    active_contenders: Optional[str] = None
+    verified_squads: Optional[str] = None
+    top_team_earnings: Optional[str] = None
+    top_team_name: Optional[str] = None
+
+class CustomLeaderboardEntryCreate(BaseModel):
+    name: str
+    tag: str
+    type: str = "team"
+    game_slug: str = "valorant"
+    game_name: str = "Valorant"
+    captain: Optional[str] = "@captain"
+    logo_url: Optional[str] = None
+    win_rate: float = 80.0
+    matches_played: int = 10
+    wins: int = 8
+    losses: int = 2
+    rating: int = 2000
+    earnings: int = 25000
+    category: str = "pc"
+
 class LeaderboardCategorySchema(BaseModel):
     id: str
     name: str
@@ -164,6 +194,87 @@ async def ensure_default_categories(db: AsyncIOMotorDatabase):
             doc = dict(c)
             doc["created_at"] = datetime.now(timezone.utc)
             await db.leaderboard_categories.insert_one(doc)
+
+@router.get("/stats", response_model=LeaderboardStatsSchema)
+async def get_leaderboard_stats(db: AsyncIOMotorDatabase = Depends(get_db)):
+    """Retrieve platform overview statistics for leaderboard header."""
+    doc = await db.platform_settings.find_one({"_id": "leaderboard_stats"})
+    if not doc:
+        return LeaderboardStatsSchema()
+    return LeaderboardStatsSchema(
+        total_awarded_prizes=doc.get("total_awarded_prizes", "₹14,50,000+"),
+        active_contenders=doc.get("active_contenders", "24,800+"),
+        verified_squads=doc.get("verified_squads", "1,120+"),
+        top_team_earnings=doc.get("top_team_earnings", "₹1,85,000"),
+        top_team_name=doc.get("top_team_name", "Team Solaris X"),
+    )
+
+@router.patch("/stats", response_model=LeaderboardStatsSchema)
+async def update_leaderboard_stats(
+    payload: LeaderboardStatsUpdate,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Admin endpoint to update the 4 leaderboard overview cards."""
+    updates = {}
+    if payload.total_awarded_prizes is not None:
+        updates["total_awarded_prizes"] = payload.total_awarded_prizes
+    if payload.active_contenders is not None:
+        updates["active_contenders"] = payload.active_contenders
+    if payload.verified_squads is not None:
+        updates["verified_squads"] = payload.verified_squads
+    if payload.top_team_earnings is not None:
+        updates["top_team_earnings"] = payload.top_team_earnings
+    if payload.top_team_name is not None:
+        updates["top_team_name"] = payload.top_team_name
+
+    if updates:
+        await db.platform_settings.update_one(
+            {"_id": "leaderboard_stats"},
+            {"$set": updates},
+            upsert=True,
+        )
+    current = await db.platform_settings.find_one({"_id": "leaderboard_stats"}) or {}
+    return LeaderboardStatsSchema(
+        total_awarded_prizes=current.get("total_awarded_prizes", "₹14,50,000+"),
+        active_contenders=current.get("active_contenders", "24,800+"),
+        verified_squads=current.get("verified_squads", "1,120+"),
+        top_team_earnings=current.get("top_team_earnings", "₹1,85,000"),
+        top_team_name=current.get("top_team_name", "Team Solaris X"),
+    )
+
+@router.post("/entries", response_model=LeaderboardEntryResponse)
+async def create_leaderboard_entry(
+    payload: CustomLeaderboardEntryCreate,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Admin endpoint to add a contender or squad directly onto the leaderboard."""
+    entry_id = f"custom_lb_{uuid.uuid4().hex[:8]}"
+    doc = {
+        "_id": entry_id,
+        "id": entry_id,
+        "name": payload.name,
+        "tag": payload.tag.upper(),
+        "type": payload.type,
+        "game_slug": payload.game_slug,
+        "game_name": payload.game_name,
+        "captain": payload.captain or f"@{payload.name.lower()}",
+        "logo_url": payload.logo_url or "https://images.unsplash.com/photo-1542751371-adc38448a05e?q=80&w=300",
+        "win_rate": payload.win_rate,
+        "matches_played": payload.matches_played,
+        "wins": payload.wins,
+        "losses": payload.losses,
+        "rating": payload.rating,
+        "earnings": payload.earnings,
+        "form": ["W", "W", "W", "W", "W"],
+        "is_verified": True,
+        "category": payload.category,
+        "created_at": datetime.now(timezone.utc),
+    }
+    await db.custom_leaderboard_entries.insert_one(doc)
+    doc["rank"] = 1
+    return LeaderboardEntryResponse(**doc)
 
 @router.get("/categories", response_model=List[LeaderboardCategorySchema])
 async def list_leaderboard_categories(db: AsyncIOMotorDatabase = Depends(get_db)):
@@ -330,6 +441,7 @@ async def remove_entry_direct(
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """Direct deletion/disqualification shortcut for an entry."""
+    await db.custom_leaderboard_entries.delete_one({"$or": [{"_id": entity_id}, {"id": entity_id}]})
     doc = {
         "_id": f"dq_{uuid.uuid4().hex[:12]}",
         "entity_id": entity_id,
@@ -416,6 +528,32 @@ async def get_leaderboard(
                 "form": ["W", "W", "W", "W", "W"],
                 "is_verified": True,
                 "category": game_cat,
+            })
+
+        # Also query custom leaderboard entries
+        custom_cursor = db.custom_leaderboard_entries.find({})
+        custom_docs = await custom_cursor.to_list(length=100)
+        for c in custom_docs:
+            c_id = str(c.get("_id", c.get("id")))
+            entries.append({
+                "rank": 1,
+                "id": c_id,
+                "name": c.get("name", "Team"),
+                "tag": c.get("tag", "TM"),
+                "type": c.get("type", "team"),
+                "game_slug": c.get("game_slug", "valorant"),
+                "game_name": c.get("game_name", "Valorant"),
+                "captain": c.get("captain", "@captain"),
+                "logo_url": c.get("logo_url") or "https://images.unsplash.com/photo-1542751371-adc38448a05e?q=80&w=300",
+                "win_rate": float(c.get("win_rate", 75.0)),
+                "matches_played": int(c.get("matches_played", 10)),
+                "wins": int(c.get("wins", 8)),
+                "losses": int(c.get("losses", 2)),
+                "rating": int(c.get("rating", 2000)),
+                "earnings": int(c.get("earnings", 25000)),
+                "form": c.get("form", ["W", "W", "W", "W", "W"]),
+                "is_verified": bool(c.get("is_verified", True)),
+                "category": c.get("category", "pc"),
             })
     except Exception as e:
         print(f"[Leaderboard DB Query Notice]: {e}")

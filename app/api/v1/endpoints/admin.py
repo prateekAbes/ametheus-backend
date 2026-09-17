@@ -474,3 +474,168 @@ async def trigger_seed_catalog(
     await populate_seed_data(db)
     return {"status": "success", "message": "Platform seed data created successfully"}
 
+# ----------------- PERSONA & AVATAR POOL MANAGEMENT -----------------
+
+DEFAULT_PERSONA_NAMES = [
+    "Shadow", "Nova", "Vortex", "Phantom", "Cyber", "Apex", "Ghost", "Frost",
+    "Titan", "Neon", "Viper", "Rogue", "Blaze", "Pulse", "Storm", "Iron",
+    "Astral", "Echo", "Zero", "Venom", "Spectre", "Hyper", "Havoc", "Glitch",
+    "Atomic", "Zenith", "Omega", "Krypton", "Solar", "Valor"
+]
+
+DEFAULT_PERSONA_AVATARS = [
+    {
+        "id": "stitch-pro-vortex",
+        "name": "Pro Vortex Cyber",
+        "url": "https://images.unsplash.com/photo-1566492031773-4f4e44671857?q=80&w=300&auto=format&fit=crop"
+    },
+    {
+        "id": "stitch-smash-neon",
+        "name": "Neon Striker",
+        "url": "https://images.unsplash.com/photo-1534528741775-53994a69daeb?q=80&w=300&auto=format&fit=crop"
+    },
+    {
+        "id": "stitch-tactical-operator",
+        "name": "Tactical Operator",
+        "url": "https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?q=80&w=300&auto=format&fit=crop"
+    },
+    {
+        "id": "bottts-cyber-reaper",
+        "name": "Cyber Reaper",
+        "url": "https://api.dicebear.com/7.x/bottts/svg?seed=CyberReaper&backgroundColor=0f172a&colors=amber,orange,red"
+    },
+    {
+        "id": "bottts-nova-strike",
+        "name": "Nova Strike",
+        "url": "https://api.dicebear.com/7.x/bottts/svg?seed=NovaStrike&backgroundColor=1e293b&colors=blue,cyan,sky"
+    },
+    {
+        "id": "bottts-apex-ghost",
+        "name": "Apex Ghost",
+        "url": "https://api.dicebear.com/7.x/bottts/svg?seed=ApexGhost&backgroundColor=1e1b4b&colors=emerald,teal,green"
+    }
+]
+
+class PersonaNamePayload(BaseModel):
+    name: str
+
+class PersonaAvatarPayload(BaseModel):
+    name: str
+    url: str
+
+@router.get("/persona-pool")
+async def get_persona_pool(db: AsyncIOMotorDatabase = Depends(get_db)):
+    """
+    Returns the dynamic random name and avatar pool assigned to first-time players.
+    """
+    doc = await db.platform_settings.find_one({"_id": "persona_pool"})
+    if not doc:
+        doc = {
+            "_id": "persona_pool",
+            "names": DEFAULT_PERSONA_NAMES,
+            "avatars": DEFAULT_PERSONA_AVATARS,
+        }
+        await db.platform_settings.insert_one(doc)
+
+    return {
+        "names": doc.get("names", DEFAULT_PERSONA_NAMES),
+        "avatars": doc.get("avatars", DEFAULT_PERSONA_AVATARS),
+    }
+
+@router.post("/persona-pool/names")
+async def add_persona_name(
+    payload: PersonaNamePayload,
+    admin_user: User = Depends(require_super_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    clean_name = payload.name.strip()
+    if not clean_name:
+        raise HTTPException(status_code=400, detail="Name cannot be empty")
+
+    await db.platform_settings.update_one(
+        {"_id": "persona_pool"},
+        {"$addToSet": {"names": clean_name}},
+        upsert=True
+    )
+    await record_audit_log(
+        db=db,
+        operator=admin_user.username,
+        role="SUPER_ADMIN",
+        action="ADD_PERSONA_NAME",
+        target=f"Name: {clean_name}",
+    )
+    return {"status": "success", "message": f'Added "{clean_name}" to persona names pool'}
+
+@router.delete("/persona-pool/names/{name}")
+async def remove_persona_name(
+    name: str,
+    admin_user: User = Depends(require_super_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    await db.platform_settings.update_one(
+        {"_id": "persona_pool"},
+        {"$pull": {"names": name}}
+    )
+    await record_audit_log(
+        db=db,
+        operator=admin_user.username,
+        role="SUPER_ADMIN",
+        action="REMOVE_PERSONA_NAME",
+        target=f"Name: {name}",
+    )
+    return {"status": "success", "message": f'Removed "{name}" from persona names pool'}
+
+@router.post("/persona-pool/avatars")
+async def add_persona_avatar(
+    payload: PersonaAvatarPayload,
+    admin_user: User = Depends(require_super_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    import uuid
+    clean_url = payload.url.strip()
+    clean_name = payload.name.strip()
+    if not clean_url or not clean_name:
+        raise HTTPException(status_code=400, detail="Name and Image URL are required")
+
+    avatar_id = f"avatar-{uuid.uuid4().hex[:8]}"
+    new_avatar = {
+        "id": avatar_id,
+        "name": clean_name,
+        "url": clean_url,
+    }
+
+    await db.platform_settings.update_one(
+        {"_id": "persona_pool"},
+        {"$push": {"avatars": new_avatar}},
+        upsert=True
+    )
+    await record_audit_log(
+        db=db,
+        operator=admin_user.username,
+        role="SUPER_ADMIN",
+        action="ADD_PERSONA_AVATAR",
+        target=f"Avatar: {clean_name}",
+        details=clean_url,
+    )
+    return {"status": "success", "message": f'Added "{clean_name}" to avatar pool', "avatar": new_avatar}
+
+@router.delete("/persona-pool/avatars/{avatar_id}")
+async def remove_persona_avatar(
+    avatar_id: str,
+    admin_user: User = Depends(require_super_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    await db.platform_settings.update_one(
+        {"_id": "persona_pool"},
+        {"$pull": {"avatars": {"$or": [{"id": avatar_id}, {"url": avatar_id}]}}}
+    )
+    await record_audit_log(
+        db=db,
+        operator=admin_user.username,
+        role="SUPER_ADMIN",
+        action="REMOVE_PERSONA_AVATAR",
+        target=f"Avatar ID: {avatar_id}",
+    )
+    return {"status": "success", "message": f"Removed avatar {avatar_id} from persona pool"}
+
+
