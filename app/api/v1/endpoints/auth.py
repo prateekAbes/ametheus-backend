@@ -116,3 +116,31 @@ async def get_current_user_profile(
     Fetch authoritative profile and role of authenticated user.
     """
     return current_user
+
+class UserProfileUpdateRequest(BaseModel):
+    display_name: Optional[str] = None
+    riot_id: Optional[str] = None
+    steam_id: Optional[str] = None
+    avatar_url: Optional[str] = None
+
+@router.put("/profile", response_model=UserResponse)
+async def update_user_profile(
+    payload: UserProfileUpdateRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Update competitive player profile handles (Riot ID, Steam ID, Display Name, Avatar).
+    """
+    if payload.display_name is not None:
+        current_user.display_name = payload.display_name.strip()
+    if payload.riot_id is not None:
+        current_user.riot_id = payload.riot_id.strip()
+    if payload.steam_id is not None:
+        current_user.steam_id = payload.steam_id.strip()
+    if payload.avatar_url is not None:
+        current_user.avatar_url = payload.avatar_url.strip()
+
+    await db.commit()
+    await db.refresh(current_user)
+    return current_user

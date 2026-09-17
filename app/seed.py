@@ -178,120 +178,133 @@ async def populate_seed_data(db: AsyncSession):
         display_name="Apex Leader",
         role="PLAYER",
     )
-    db.add_all([super_admin, tournament_admin, captain_vortex, phantom, omen, sova, jett, apex_lead])
-    await db.flush()
+    
+    existing_user_ids = {u for u in (await db.execute(select(User.id))).scalars()}
+    users_to_add = [u for u in [super_admin, tournament_admin, captain_vortex, phantom, omen, sova, jett, apex_lead] if u.id not in existing_user_ids]
+    if users_to_add:
+        db.add_all(users_to_add)
+        await db.flush()
 
     # 2. Games
-    game_map = {}
+    existing_games = {g.slug: g for g in (await db.execute(select(Game))).scalars()}
+    game_map = dict(existing_games)
     for g_data in GAMES_SEED:
-        game = Game(**g_data)
-        db.add(game)
-        await db.flush()
-        game_map[game.slug] = game
+        if g_data["slug"] not in game_map:
+            game = Game(**g_data)
+            db.add(game)
+            await db.flush()
+            game_map[game.slug] = game
 
     # 3. Teams
-    val_game = game_map["valorant"]
-    solaris_x = Team(
-        game_id=val_game.id,
-        captain_id=captain_vortex.id,
-        name="Solaris X",
-        tag="SLX",
-        invite_code="SR7X4K",
-        max_members=5,
-    )
-    db.add(solaris_x)
-    await db.flush()
+    val_game = game_map.get("valorant") or list(game_map.values())[0]
+    existing_teams = {t.name: t for t in (await db.execute(select(Team))).scalars()}
 
-    mems = [
-        TeamMember(team_id=solaris_x.id, user_id=captain_vortex.id, role="CAPTAIN", game_handle="Vortex#APEX"),
-        TeamMember(team_id=solaris_x.id, user_id="usr_phantom", role="MEMBER", game_handle="Phantom#999"),
-        TeamMember(team_id=solaris_x.id, user_id="usr_omen", role="MEMBER", game_handle="Omen#IND"),
-        TeamMember(team_id=solaris_x.id, user_id="usr_sova", role="MEMBER", game_handle="Sova#DARTS"),
-        TeamMember(team_id=solaris_x.id, user_id="usr_jett", role="MEMBER", game_handle="Jett#WIND"),
-    ]
-    db.add_all(mems)
+    solaris_x = existing_teams.get("Solaris X")
+    if not solaris_x:
+        solaris_x = Team(
+            game_id=val_game.id,
+            captain_id=captain_vortex.id,
+            name="Solaris X",
+            tag="SLX",
+            invite_code="SR7X4K",
+            max_members=5,
+        )
+        db.add(solaris_x)
+        await db.flush()
 
-    apex_strikers = Team(
-        game_id=val_game.id,
-        captain_id="usr_apex_lead",
-        name="Apex Strikers",
-        tag="APX",
-        invite_code="APX999",
-        max_members=5,
-    )
-    db.add(apex_strikers)
-    await db.flush()
+        mems = [
+            TeamMember(team_id=solaris_x.id, user_id=captain_vortex.id, role="CAPTAIN", game_handle="Vortex#APEX"),
+            TeamMember(team_id=solaris_x.id, user_id="usr_phantom", role="MEMBER", game_handle="Phantom#999"),
+            TeamMember(team_id=solaris_x.id, user_id="usr_omen", role="MEMBER", game_handle="Omen#IND"),
+            TeamMember(team_id=solaris_x.id, user_id="usr_sova", role="MEMBER", game_handle="Sova#DARTS"),
+            TeamMember(team_id=solaris_x.id, user_id="usr_jett", role="MEMBER", game_handle="Jett#WIND"),
+        ]
+        db.add_all(mems)
+
+    apex_strikers = existing_teams.get("Apex Strikers")
+    if not apex_strikers:
+        apex_strikers = Team(
+            game_id=val_game.id,
+            captain_id="usr_apex_lead",
+            name="Apex Strikers",
+            tag="APX",
+            invite_code="APX999",
+            max_members=5,
+        )
+        db.add(apex_strikers)
+        await db.flush()
 
     # 4. Tournaments
-    val_tourn = Tournament(
-        slug="ametheus-valorant-open-01",
-        game_id=val_game.id,
-        organizer_id=tournament_admin.id,
-        title="AMETHEUS VALORANT INVITATIONAL 2026",
-        prize_pool_inr=50000,
-        entry_fee_inr=60,
-        status="REGISTRATION_OPEN",
-        starts_at="Today, 8:00 PM IST",
-        roster_lock_time="7:45 PM IST",
-        server_region="AWS Mumbai (ap-south-1)",
-        max_teams=16,
-        rank_requirement="Platinum III or Higher",
-        format="Single Elimination (BO1 / BO3 Finals)",
-        banner_url="https://lh3.googleusercontent.com/aida-public/AB6AXuD-g0bK72p2tQe7b3Z3F5WzX8oV0h4vM1bX2m9x_banner",
-        badge_color="#E56A10",
-        description="Tier-1 tactical competition featuring the best rosters in the sub-continent.",
-        rules_json=json.dumps(["All players must have Vanguard running", "Coaches allowed only in timeouts", "128-tick Mumbai server"]),
-        schedule_json=json.dumps([{"stage": "Check-in", "time": "7:30 PM", "details": "Mandatory check-in"}]),
-        prizes_json=json.dumps([{"rank": "1st Place", "amount": "₹30,000", "share": "60%", "badge": "GOLD"}]),
-        bracket_json=json.dumps([]),
-    )
-    db.add(val_tourn)
-    await db.flush()
+    existing_tourns = {t.slug: t for t in (await db.execute(select(Tournament))).scalars()}
+    val_tourn = existing_tourns.get("ametheus-valorant-open-01")
+    if not val_tourn:
+        val_tourn = Tournament(
+            slug="ametheus-valorant-open-01",
+            game_id=val_game.id,
+            organizer_id=tournament_admin.id,
+            title="AMETHEUS VALORANT INVITATIONAL 2026",
+            prize_pool_inr=50000,
+            entry_fee_inr=60,
+            status="REGISTRATION_OPEN",
+            starts_at="Today, 8:00 PM IST",
+            roster_lock_time="7:45 PM IST",
+            server_region="AWS Mumbai (ap-south-1)",
+            max_teams=16,
+            rank_requirement="Platinum III or Higher",
+            format="Single Elimination (BO1 / BO3 Finals)",
+            banner_url="https://lh3.googleusercontent.com/aida-public/AB6AXuD-g0bK72p2tQe7b3Z3F5WzX8oV0h4vM1bX2m9x_banner",
+            badge_color="#E56A10",
+            description="Tier-1 tactical competition featuring the best rosters in the sub-continent.",
+            rules_json=json.dumps(["All players must have Vanguard running", "Coaches allowed only in timeouts", "128-tick Mumbai server"]),
+            schedule_json=json.dumps([{"stage": "Check-in", "time": "7:30 PM", "details": "Mandatory check-in"}]),
+            prizes_json=json.dumps([{"rank": "1st Place", "amount": "₹30,000", "share": "60%", "badge": "GOLD"}]),
+            bracket_json=json.dumps([]),
+        )
+        db.add(val_tourn)
+        await db.flush()
 
-    reg1 = TournamentRegistration(
-        tournament_id=val_tourn.id,
-        team_id=solaris_x.id,
-        payment_status="PAID",
-        order_id="order_rzp_demo_1",
-        check_in_status="CHECKED_IN",
-    )
-    reg2 = TournamentRegistration(
-        tournament_id=val_tourn.id,
-        team_id=apex_strikers.id,
-        payment_status="PAID",
-        order_id="order_rzp_demo_2",
-        check_in_status="CHECKED_IN",
-    )
-    db.add_all([reg1, reg2])
+        reg1 = TournamentRegistration(
+            tournament_id=val_tourn.id,
+            team_id=solaris_x.id,
+            payment_status="PAID",
+            order_id="order_rzp_demo_1",
+            check_in_status="CHECKED_IN",
+        )
+        reg2 = TournamentRegistration(
+            tournament_id=val_tourn.id,
+            team_id=apex_strikers.id,
+            payment_status="PAID",
+            order_id="order_rzp_demo_2",
+            check_in_status="CHECKED_IN",
+        )
+        db.add_all([reg1, reg2])
 
-    # 5. Tournament Admin Assignment (Rule 2.2)
-    assign = TournamentAdminAssignment(
-        admin_user_id=tournament_admin.id,
-        tournament_id=val_tourn.id,
-        assigned_by=super_admin.id,
-    )
-    db.add(assign)
+        assign = TournamentAdminAssignment(
+            admin_user_id=tournament_admin.id,
+            tournament_id=val_tourn.id,
+            assigned_by=super_admin.id,
+        )
+        db.add(assign)
 
-    # 6. Matches
-    match1 = Match(
-        tournament_id=val_tourn.id,
-        stage="Quarterfinals — Match 1 (BO3)",
-        round_number=1,
-        match_number=1,
-        format="5v5 Competitive Custom (Ascent / Bind / Haven)",
-        scheduled_time="Today, 8:30 PM IST",
-        status="LIVE",
-        team_a_id=solaris_x.id,
-        team_b_id=apex_strikers.id,
-        score_a=11,
-        score_b=9,
-        server_region="AWS Mumbai (ap-south-1) — 128 Tick",
-        lobby_code="AMETHEUS-VAL-QF1-094",
-        lobby_password="VANGUARD_ESCROW_99",
-    )
-    db.add(match1)
+        match1 = Match(
+            tournament_id=val_tourn.id,
+            stage="Quarterfinals — Match 1 (BO3)",
+            round_number=1,
+            match_number=1,
+            format="5v5 Competitive Custom (Ascent / Bind / Haven)",
+            scheduled_time="Today, 8:30 PM IST",
+            status="LIVE",
+            team_a_id=solaris_x.id,
+            team_b_id=apex_strikers.id,
+            score_a=11,
+            score_b=9,
+            server_region="AWS Mumbai (ap-south-1) — 128 Tick",
+            lobby_code="AMETHEUS-VAL-QF1-094",
+            lobby_password="VANGUARD_ESCROW_99",
+        )
+        db.add(match1)
 
-    # 7. Audit Log
+    # 5. Audit Log
     from app.services.audit import record_audit_log
     await record_audit_log(
         db=db,
@@ -306,14 +319,14 @@ async def populate_seed_data(db: AsyncSession):
 async def seed_if_empty():
     try:
         async with AsyncSessionLocal() as db:
-            result = await db.execute(select(func.count(Game.id)))
-            count = result.scalar() or 0
-            if count == 0:
-                print("[AMETHEUS] Database empty. Running initial catalog seeding...")
+            g_count = (await db.execute(select(func.count(Game.id)))).scalar() or 0
+            t_count = (await db.execute(select(func.count(Tournament.id)))).scalar() or 0
+            if g_count == 0 or t_count == 0:
+                print(f"[AMETHEUS] Database has {g_count} games and {t_count} tournaments. Running idempotent seeding...")
                 await populate_seed_data(db)
-                print("[AMETHEUS] Initial catalog seeded successfully!")
+                print("[AMETHEUS] Initial catalog & tournaments seeded successfully!")
             else:
-                print(f"[AMETHEUS] Database contains {count} games. Skipping seed.")
+                print(f"[AMETHEUS] Database contains {g_count} games and {t_count} tournaments.")
     except Exception as e:
         print(f"[AMETHEUS] Seed check notice: {e}")
 

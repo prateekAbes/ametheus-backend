@@ -65,3 +65,24 @@ async def test_super_admin_promote_organizer(client):
     users = res_users.json()
     promoted = next(u for u in users if u["id"] == "user_synced_clerk_999")
     assert promoted["role"] == "ORGANIZER"
+
+@pytest.mark.asyncio
+async def test_update_user_profile(client):
+    headers = make_auth_headers("usr_vortex_lead")
+    payload = {
+        "display_name": "VORTEX ACE",
+        "riot_id": "VORTEX#ACE",
+        "steam_id": "STEAM_0:1:998877",
+    }
+    res = await client.put("/api/v1/auth/profile", json=payload, headers=headers)
+    assert res.status_code == 200
+    data = res.json()
+    assert data["display_name"] == "VORTEX ACE"
+    assert data["riot_id"] == "VORTEX#ACE"
+    assert data["steam_id"] == "STEAM_0:1:998877"
+
+    # Verify GET /me reflects updated profile
+    me_res = await client.get("/api/v1/auth/me", headers=headers)
+    assert me_res.status_code == 200
+    assert me_res.json()["display_name"] == "VORTEX ACE"
+
