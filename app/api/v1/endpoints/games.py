@@ -9,6 +9,54 @@ from app.services.audit import record_audit_log
 
 router = APIRouter()
 
+GAME_FALLBACK_IMAGES = {
+    "valorant": {
+        "banner": "https://images.unsplash.com/photo-1542751371-adc38448a05e?q=80&w=1200&auto=format&fit=crop",
+        "logo": "https://images.unsplash.com/photo-1550745165-9bc0b252726f?q=80&w=300&auto=format&fit=crop",
+    },
+    "counter-strike-2": {
+        "banner": "https://images.unsplash.com/photo-1511512578047-dfb367046420?q=80&w=1200&auto=format&fit=crop",
+        "logo": "https://images.unsplash.com/photo-1579373903781-fd5c0c30c4cd?q=80&w=300&auto=format&fit=crop",
+    },
+    "bgmi": {
+        "banner": "https://images.unsplash.com/photo-1538481199705-c710c4e965fc?q=80&w=1200&auto=format&fit=crop",
+        "logo": "https://images.unsplash.com/photo-1563089145-599997674d42?q=80&w=300&auto=format&fit=crop",
+    },
+    "chess": {
+        "banner": "https://images.unsplash.com/photo-1529699211952-734e80c4d42b?q=80&w=1200&auto=format&fit=crop",
+        "logo": "https://images.unsplash.com/photo-1586165368502-1bad197a6461?q=80&w=300&auto=format&fit=crop",
+    },
+    "call-of-duty-mobile": {
+        "banner": "https://images.unsplash.com/photo-1542751110-97427bbecf20?q=80&w=1200&auto=format&fit=crop",
+        "logo": "https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?q=80&w=300&auto=format&fit=crop",
+    },
+    "free-fire": {
+        "banner": "https://images.unsplash.com/photo-1518709268805-4e9042af9f23?q=80&w=1200&auto=format&fit=crop",
+        "logo": "https://images.unsplash.com/photo-1579783902614-a3fb3927b675?q=80&w=300&auto=format&fit=crop",
+    },
+    "rocket-league": {
+        "banner": "https://images.unsplash.com/photo-1511512578047-dfb367046420?q=80&w=1200&auto=format&fit=crop",
+        "logo": "https://images.unsplash.com/photo-1550745165-9bc0b252726f?q=80&w=300&auto=format&fit=crop",
+    },
+    "smash-karts": {
+        "banner": "https://images.unsplash.com/photo-1518709268805-4e9042af9f23?q=80&w=1200&auto=format&fit=crop",
+        "logo": "https://images.unsplash.com/photo-1563089145-599997674d42?q=80&w=300&auto=format&fit=crop",
+    },
+    "mini-militia": {
+        "banner": "https://images.unsplash.com/photo-1538481199705-c710c4e965fc?q=80&w=1200&auto=format&fit=crop",
+        "logo": "https://images.unsplash.com/photo-1579373903781-fd5c0c30c4cd?q=80&w=300&auto=format&fit=crop",
+    },
+}
+
+def sanitize_game_images(slug: str, banner: str, logo: str):
+    fb = GAME_FALLBACK_IMAGES.get(slug, {
+        "banner": "https://images.unsplash.com/photo-1542751371-adc38448a05e?q=80&w=1200&auto=format&fit=crop",
+        "logo": "https://images.unsplash.com/photo-1550745165-9bc0b252726f?q=80&w=300&auto=format&fit=crop",
+    })
+    b = banner if (banner and "aida-public" not in banner and "_Banner" not in banner) else fb["banner"]
+    l = logo if (logo and "aida-public" not in logo and "_Logo" not in logo) else fb["logo"]
+    return b, l
+
 @router.get("", response_model=List[GameResponse])
 async def list_games(db: AsyncIOMotorDatabase = Depends(get_db)):
     cursor = db.games.find()
@@ -18,6 +66,7 @@ async def list_games(db: AsyncIOMotorDatabase = Depends(get_db)):
     for g in games_docs:
         gid = str(g.get("_id", g.get("id")))
         count = await db.tournaments.count_documents({"$or": [{"game_id": gid}, {"game_slug": g.get("slug")}]})
+        b_url, l_url = sanitize_game_images(g.get("slug", ""), g.get("banner_url", ""), g.get("logo_url", ""))
         data = GameResponse(
             id=gid,
             slug=g["slug"],
@@ -28,8 +77,8 @@ async def list_games(db: AsyncIOMotorDatabase = Depends(get_db)):
             is_team_game=g.get("is_team_game", True),
             min_team_size=g.get("min_team_size", 1),
             max_team_size=g.get("max_team_size", 5),
-            banner_url=g["banner_url"],
-            logo_url=g["logo_url"],
+            banner_url=b_url,
+            logo_url=l_url,
             description=g.get("description", ""),
             server_region=g.get("server_region", "AWS Mumbai (ap-south-1)"),
             anti_cheat=g.get("anti_cheat", "Standard Protocol"),
@@ -48,6 +97,7 @@ async def get_game_by_slug(slug: str, db: AsyncIOMotorDatabase = Depends(get_db)
     
     gid = str(g.get("_id", g.get("id")))
     count = await db.tournaments.count_documents({"$or": [{"game_id": gid}, {"game_slug": g.get("slug")}]})
+    b_url, l_url = sanitize_game_images(g.get("slug", ""), g.get("banner_url", ""), g.get("logo_url", ""))
     return GameResponse(
         id=gid,
         slug=g["slug"],
@@ -58,8 +108,8 @@ async def get_game_by_slug(slug: str, db: AsyncIOMotorDatabase = Depends(get_db)
         is_team_game=g.get("is_team_game", True),
         min_team_size=g.get("min_team_size", 1),
         max_team_size=g.get("max_team_size", 5),
-        banner_url=g["banner_url"],
-        logo_url=g["logo_url"],
+        banner_url=b_url,
+        logo_url=l_url,
         description=g.get("description", ""),
         server_region=g.get("server_region", "AWS Mumbai (ap-south-1)"),
         anti_cheat=g.get("anti_cheat", "Standard Protocol"),

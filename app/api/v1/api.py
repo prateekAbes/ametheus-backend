@@ -1,5 +1,5 @@
 from fastapi import APIRouter
-from app.api.v1.endpoints import games, teams, tournaments, matches, leaderboard, admin, auth, organizer, payments, notifications, wallet
+from app.api.v1.endpoints import games, teams, tournaments, matches, leaderboard, admin, auth, organizer, payments, notifications, wallet, media
 
 api_router = APIRouter()
 api_router.include_router(auth.router, prefix="/auth", tags=["Authentication & Users"])
@@ -13,5 +13,6 @@ api_router.include_router(admin.router, prefix="/admin", tags=["Admin Operations
 api_router.include_router(payments.router, prefix="/payments", tags=["Payments & Escrow"])
 api_router.include_router(notifications.router, prefix="/notifications", tags=["Notifications"])
 api_router.include_router(wallet.router, prefix="/wallet", tags=["Wallet & Withdrawals"])
+api_router.include_router(media.router, prefix="/media", tags=["Media & Image Uploads"])
 
 
