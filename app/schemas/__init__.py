@@ -222,3 +222,18 @@ class AuditLogResponse(BaseModel):
     ip_address: str
     prev_hash: Optional[str] = None
     record_hash: Optional[str] = None
+
+# Notification
+class NotificationResponse(BaseModel):
+    id: str
+    type: str
+    title: str
+    message: str
+    is_read: bool
+    link: Optional[str] = None
+    created_at: Optional[str] = None
+    model_config = ConfigDict(from_attributes=True)
+
+class NotificationListResponse(BaseModel):
+    items: List[NotificationResponse]
+    unread_count: int

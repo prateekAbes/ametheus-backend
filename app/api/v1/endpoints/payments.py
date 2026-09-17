@@ -195,6 +195,15 @@ async def verify_payment(
         target=f"Order {payload.razorpay_order_id} -> Tourn {reg.tournament_id}",
         details=f"Payment ID: {payload.razorpay_payment_id} | Signature verified via HMAC-SHA256",
     )
+    from app.services.notification import create_notification
+    await create_notification(
+        db=db,
+        user_id=current_user.id,
+        title="Escrow Payment Confirmed",
+        message=f"Your entry fee payment (Order: {payload.razorpay_order_id}) has been verified and placed in secure platform escrow.",
+        notification_type="PAYMENT",
+        link="/dashboard",
+    )
     await db.commit()
 
     return {

@@ -235,6 +235,15 @@ async def register_team_for_tournament(
         check_in_status="PENDING",
     )
     db.add(reg)
+    from app.services.notification import create_notification
+    await create_notification(
+        db=db,
+        user_id=current_user.id,
+        title="Tournament Registered",
+        message=f'Squad "{team.name}" is confirmed for "{tourn.title}". Check bracket schedule for match timings.',
+        notification_type="TOURNAMENT",
+        link=f"/tournaments/{tourn.slug}",
+    )
     await db.commit()
 
     return {

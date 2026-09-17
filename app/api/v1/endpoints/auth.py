@@ -94,6 +94,15 @@ async def sync_clerk_user(
             target=user.id,
             details=f"Clerk user {user.username} ({user.email}) registered as {initial_role}",
         )
+        from app.services.notification import create_notification
+        await create_notification(
+            db=db,
+            user_id=user.id,
+            title="Welcome to AMETHEUS",
+            message="Your competitive account is active. Register your team and join active tournament brackets.",
+            notification_type="SYSTEM",
+            link="/tournaments",
+        )
         await db.commit()
         await db.refresh(user)
 

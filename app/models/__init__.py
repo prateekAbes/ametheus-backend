@@ -6,6 +6,7 @@ from app.models.tournament import Tournament, TournamentRegistration
 from app.models.match import Match
 from app.models.admin import TournamentAdminAssignment, AuditLog
 from app.models.dispute import Dispute
+from app.models.notification import Notification
 
 __all__ = [
     "Base",
@@ -19,4 +20,5 @@ __all__ = [
     "TournamentAdminAssignment",
     "AuditLog",
     "Dispute",
+    "Notification",
 ]
