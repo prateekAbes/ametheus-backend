@@ -111,6 +111,49 @@ async def root():
 async def health_check():
     return {"status": "ok", "service": "ametheus-backend"}
 
+@app.get("/health/db")
+async def db_health():
+    from app.core.database import AsyncSessionLocal
+    from sqlalchemy import select, func
+    from app.models.game import Game
+    from app.models.tournament import Tournament
+    from app.models.team import Team
+    from app.models.user import User
+    from app.models.match import Match
+    try:
+        async with AsyncSessionLocal() as session:
+            g = (await session.execute(select(func.count(Game.id)))).scalar() or 0
+            t = (await session.execute(select(func.count(Tournament.id)))).scalar() or 0
+            tm = (await session.execute(select(func.count(Team.id)))).scalar() or 0
+            u = (await session.execute(select(func.count(User.id)))).scalar() or 0
+            m = (await session.execute(select(func.count(Match.id)))).scalar() or 0
+            return {
+                "status": "connected",
+                "counts": {
+                    "games": g,
+                    "tournaments": t,
+                    "teams": tm,
+                    "users": u,
+                    "matches": m,
+                }
+            }
+    except Exception as e:
+        import traceback
+        return {"status": "error", "error": str(e), "trace": traceback.format_exc()}
+
+@app.post("/health/seed")
+async def trigger_seed():
+    from app.seed import populate_seed_data
+    from app.core.database import AsyncSessionLocal
+    try:
+        async with AsyncSessionLocal() as session:
+            await populate_seed_data(session)
+            return {"status": "success", "message": "Database seeded successfully"}
+    except Exception as e:
+        import traceback
+        return {"status": "error", "error": str(e), "trace": traceback.format_exc()}
+
+
 from fastapi import WebSocket, WebSocketDisconnect
 from app.core.ws import ws_manager
 
