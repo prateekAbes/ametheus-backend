@@ -10,34 +10,25 @@ from app.core.security import decode_token
 
 async def get_current_user(
     authorization: Optional[str] = Header(None),
-    x_user_id: Optional[str] = Header(None),
     db: AsyncSession = Depends(get_db),
 ) -> User:
-    target_id: Optional[str] = None
-
-    # 1. Dev / Test explicit user ID header
-    if x_user_id:
-        target_id = x_user_id.strip()
-
-    # 2. Bearer token extraction
-    elif authorization and authorization.startswith("Bearer "):
-        token = authorization.replace("Bearer ", "").strip()
-        payload = decode_token(token)
-        if payload and "sub" in payload:
-            target_id = payload["sub"]
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Unauthorized: Invalid or expired authentication token",
-            )
-    else:
-        # Default unauthenticated rejection
+    if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Unauthorized: Authentication credentials not provided",
+            detail="Unauthorized: Bearer authentication token required",
         )
 
-    # 3. Query user by ID or clerk_user_id
+    token = authorization.replace("Bearer ", "").strip()
+    payload = decode_token(token)
+    if not payload or "sub" not in payload:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unauthorized: Invalid or expired authentication token",
+        )
+
+    target_id = payload["sub"]
+
+    # Authoritative DB lookup by clerk_user_id or user.id
     result = await db.execute(
         select(User).where(
             or_(User.id == target_id, User.clerk_user_id == target_id)
@@ -46,18 +37,10 @@ async def get_current_user(
     user = result.scalars().first()
 
     if not user:
-        # Auto-create local user profile with default role PLAYER (Rule 21)
-        user = User(
-            id=target_id,
-            clerk_user_id=target_id if target_id.startswith("user_") else None,
-            email=f"{target_id}@ametheus.gg",
-            username=target_id.replace("usr_", "").replace("user_", ""),
-            display_name=target_id.replace("usr_", "").replace("user_", "").replace("_", " ").title(),
-            role="SUPER_ADMIN" if "super_admin" in target_id else "PLAYER",
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unauthorized: User not found in AMETHEUS. Please complete profile sync.",
         )
-        db.add(user)
-        await db.commit()
-        await db.refresh(user)
 
     return user
 

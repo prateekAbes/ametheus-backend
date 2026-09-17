@@ -6,6 +6,8 @@ from app.api.deps import get_db, get_current_user
 from app.models.user import User
 from app.models.game import Game
 from app.models.team import Team, TeamMember
+from app.models.tournament import Tournament, TournamentRegistration
+from app.services.audit import record_audit_log
 from app.schemas import TeamCreate, TeamJoin, TeamResponse, TeamMemberResponse
 
 router = APIRouter()
@@ -155,3 +157,145 @@ async def get_team(id: str, db: AsyncSession = Depends(get_db)):
     if not team:
         raise HTTPException(status_code=404, detail="Team not found")
     return await serialize_team(team, db)
+
+@router.post("/{id}/leave")
+async def leave_team(
+    id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Allow a non-captain member to voluntarily leave the roster.
+    """
+    team_res = await db.execute(select(Team).where(Team.id == id))
+    team = team_res.scalars().first()
+    if not team:
+        raise HTTPException(status_code=404, detail="Team not found")
+
+    if team.captain_id == current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="The captain cannot leave the team. Disband the team or transfer leadership.",
+        )
+
+    mem_res = await db.execute(
+        select(TeamMember).where(
+            TeamMember.team_id == id,
+            TeamMember.user_id == current_user.id,
+        )
+    )
+    membership = mem_res.scalars().first()
+    if not membership:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="You are not a member of this team roster.",
+        )
+
+    await db.delete(membership)
+    await record_audit_log(
+        db=db,
+        operator=current_user.username,
+        role=current_user.role,
+        action="LEAVE_TEAM",
+        target=f"Team {team.name} ({team.id})",
+        details=f"User {current_user.username} left team {team.name}",
+    )
+    await db.commit()
+    return {"status": "success", "message": f"Successfully left team {team.name}"}
+
+@router.post("/{id}/kick/{user_id}")
+async def kick_team_member(
+    id: str,
+    user_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Captain or Super Admin privilege: Remove a member from the team roster.
+    """
+    team_res = await db.execute(select(Team).where(Team.id == id))
+    team = team_res.scalars().first()
+    if not team:
+        raise HTTPException(status_code=404, detail="Team not found")
+
+    if team.captain_id != current_user.id and current_user.role != "SUPER_ADMIN":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the team captain or platform admin can remove roster members.",
+        )
+
+    if user_id == team.captain_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot kick the team captain.",
+        )
+
+    mem_res = await db.execute(
+        select(TeamMember).where(
+            TeamMember.team_id == id,
+            TeamMember.user_id == user_id,
+        )
+    )
+    membership = mem_res.scalars().first()
+    if not membership:
+        raise HTTPException(status_code=404, detail="Member not found on this team roster.")
+
+    await db.delete(membership)
+    await record_audit_log(
+        db=db,
+        operator=current_user.username,
+        role=current_user.role,
+        action="KICK_TEAM_MEMBER",
+        target=f"User {user_id} <- Team {team.name} ({team.id})",
+        details=f"Captain {current_user.username} removed user {user_id}",
+    )
+    await db.commit()
+    return {"status": "success", "message": "Member removed from team roster"}
+
+@router.delete("/{id}")
+async def delete_team(
+    id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Captain or Super Admin privilege: Disband the team.
+    """
+    team_res = await db.execute(select(Team).where(Team.id == id))
+    team = team_res.scalars().first()
+    if not team:
+        raise HTTPException(status_code=404, detail="Team not found")
+
+    if team.captain_id != current_user.id and current_user.role != "SUPER_ADMIN":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the team captain or platform admin can disband the team.",
+        )
+
+    # Check for active tournament registrations
+    reg_res = await db.execute(
+        select(TournamentRegistration)
+        .join(Tournament, Tournament.id == TournamentRegistration.tournament_id)
+        .where(
+            TournamentRegistration.team_id == id,
+            Tournament.status == "ONGOING",
+        )
+    )
+    active_regs = reg_res.scalars().all()
+    if active_regs:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot disband team while participating in an active ongoing tournament.",
+        )
+
+    await db.delete(team)
+    await record_audit_log(
+        db=db,
+        operator=current_user.username,
+        role=current_user.role,
+        action="DISBAND_TEAM",
+        target=f"Team {team.name} ({team.id})",
+        details=f"Team {team.name} disbanded by {current_user.username}",
+    )
+    await db.commit()
+    return {"status": "success", "message": f"Team '{team.name}' has been disbanded"}

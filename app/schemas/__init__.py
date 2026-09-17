@@ -41,6 +41,39 @@ class GameResponse(BaseModel):
     active_tournaments_count: int = 0
     model_config = ConfigDict(from_attributes=True)
 
+class GameCreate(BaseModel):
+    slug: str
+    name: str
+    category: str
+    platform: str
+    tag: str
+    is_team_game: bool = True
+    min_team_size: int = 1
+    max_team_size: int = 5
+    banner_url: str = "https://images.unsplash.com/photo-1542751371-adc38448a05e"
+    logo_url: str = "https://images.unsplash.com/photo-1542751371-adc38448a05e"
+    description: str = ""
+    server_region: str = "AWS Mumbai (ap-south-1)"
+    anti_cheat: str = "Standard Protocol"
+    match_protocol: str = "Custom Lobby"
+    accent_color: Optional[str] = "#E56A10"
+
+class GameUpdate(BaseModel):
+    name: Optional[str] = None
+    category: Optional[str] = None
+    platform: Optional[str] = None
+    tag: Optional[str] = None
+    is_team_game: Optional[bool] = None
+    min_team_size: Optional[int] = None
+    max_team_size: Optional[int] = None
+    banner_url: Optional[str] = None
+    logo_url: Optional[str] = None
+    description: Optional[str] = None
+    server_region: Optional[str] = None
+    anti_cheat: Optional[str] = None
+    match_protocol: Optional[str] = None
+    accent_color: Optional[str] = None
+
 # Team
 class TeamMemberResponse(BaseModel):
     id: str
@@ -187,3 +220,5 @@ class AuditLogResponse(BaseModel):
     action: str
     target: str
     ip_address: str
+    prev_hash: Optional[str] = None
+    record_hash: Optional[str] = None

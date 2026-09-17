@@ -1,7 +1,7 @@
 import pytest
 from app.models.game import Game
 from app.models.user import User
-from tests.conftest import TestSessionLocal
+from tests.conftest import TestSessionLocal, make_auth_headers
 
 @pytest.mark.asyncio
 async def test_organizer_tournament_crud_and_ownership(client):
@@ -29,7 +29,7 @@ async def test_organizer_tournament_crud_and_ownership(client):
         g_id = g.id
 
     # 2. Player cannot create tournament (Rule 9)
-    headers_player = {"x-user-id": "usr_player_99"}
+    headers_player = make_auth_headers("usr_vortex_lead")
     payload = {
         "game_id": g_id,
         "title": "Grandmaster Blitz Cup",
@@ -43,16 +43,15 @@ async def test_organizer_tournament_crud_and_ownership(client):
     assert res_p.status_code == 403
 
     # 3. Create users via /auth/sync and promote them
-    headers_super = {"x-user-id": "usr_super_admin"}
-    await client.post("/api/v1/auth/sync", json={"clerk_user_id": "usr_org_a", "email": "a@ametheus.gg", "username": "org_a"})
-    await client.post("/api/v1/auth/sync", json={"clerk_user_id": "usr_org_b", "email": "b@ametheus.gg", "username": "org_b"})
+    headers_super = make_auth_headers("usr_super_admin")
+    headers_org_a = make_auth_headers("usr_org_a")
+    headers_org_b = make_auth_headers("usr_org_b")
+    await client.post("/api/v1/auth/sync", json={"clerk_user_id": "usr_org_a", "email": "a@ametheus.gg", "username": "org_a"}, headers=headers_org_a)
+    await client.post("/api/v1/auth/sync", json={"clerk_user_id": "usr_org_b", "email": "b@ametheus.gg", "username": "org_b"}, headers=headers_org_b)
     res_pa = await client.post("/api/v1/admin/users/usr_org_a/promote-organizer", headers=headers_super)
     assert res_pa.status_code == 200
     res_pb = await client.post("/api/v1/admin/users/usr_org_b/promote-organizer", headers=headers_super)
     assert res_pb.status_code == 200
-
-    headers_org_a = {"x-user-id": "usr_org_a"}
-    headers_org_b = {"x-user-id": "usr_org_b"}
 
     # 4. Organizer A creates tournament
     res_create = await client.post("/api/v1/organizer/tournaments", json=payload, headers=headers_org_a)
@@ -116,3 +115,30 @@ async def test_organizer_tournament_crud_and_ownership(client):
     )
     assert verify_res.status_code == 200
     assert "winner advanced in bracket" in verify_res.json()["message"].lower()
+
+    # 10. Test controlled state transitions
+    # Creating tournament C
+    res_c = await client.post("/api/v1/organizer/tournaments", json=payload, headers=headers_org_a)
+    assert res_c.status_code == 201
+    c_id = res_c.json()["id"]
+
+    # Publish: DRAFT -> REGISTRATION_OPEN
+    pub_res = await client.post(f"/api/v1/organizer/tournaments/{c_id}/publish", headers=headers_org_a)
+    assert pub_res.status_code == 200
+
+    # Close registration: REGISTRATION_OPEN -> REGISTRATION_CLOSED
+    close_res = await client.post(f"/api/v1/organizer/tournaments/{c_id}/close-registration", headers=headers_org_a)
+    assert close_res.status_code == 200
+
+    # Re-open registration: REGISTRATION_CLOSED -> REGISTRATION_OPEN
+    reopen_res = await client.post(f"/api/v1/organizer/tournaments/{c_id}/publish", headers=headers_org_a)
+    assert reopen_res.status_code == 200
+
+    # Cancel: REGISTRATION_OPEN -> CANCELLED
+    cancel_res = await client.post(f"/api/v1/organizer/tournaments/{c_id}/cancel", headers=headers_org_a)
+    assert cancel_res.status_code == 200
+
+    # Try illegal transition: CANCELLED -> REGISTRATION_OPEN -> 400
+    illegal_res = await client.post(f"/api/v1/organizer/tournaments/{c_id}/publish", headers=headers_org_a)
+    assert illegal_res.status_code == 400
+    assert "Illegal tournament transition" in illegal_res.json()["detail"]

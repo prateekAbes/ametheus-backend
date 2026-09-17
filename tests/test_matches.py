@@ -1,6 +1,6 @@
 import pytest
 from app.models.match import Match
-from tests.conftest import TestSessionLocal
+from tests.conftest import TestSessionLocal, make_auth_headers
 
 @pytest.mark.asyncio
 async def test_match_score_submission_flow(client):
@@ -29,7 +29,7 @@ async def test_match_score_submission_flow(client):
         "evidence_url": "https://r2.ametheus.gg/proof.png",
         "captain_notes": "Clean match, no overtimes",
     }
-    headers = {"x-user-id": "usr_vortex_lead"}
+    headers = make_auth_headers("usr_vortex_lead")
     resp = await client.post(f"/api/v1/matches/{m_id}/submit-result", json=submit_payload, headers=headers)
     assert resp.status_code == 200, resp.text
     assert resp.json()["status"] == "success"
@@ -52,7 +52,7 @@ async def test_match_score_submission_flow(client):
     disp_id = disp_resp.json()["dispute_id"]
 
     # Super Admin lists disputes
-    headers_super = {"x-user-id": "usr_super_admin"}
+    headers_super = make_auth_headers("usr_super_admin")
     admin_disp = await client.get("/api/v1/admin/disputes", headers=headers_super)
     assert admin_disp.status_code == 200
     assert any(d["id"] == disp_id for d in admin_disp.json())
@@ -64,3 +64,14 @@ async def test_match_score_submission_flow(client):
         headers=headers_super,
     )
     assert resolve_resp.status_code == 200
+
+    # 4. Verify match is unfrozen from DISPUTED state
+    m_after = await client.get("/api/v1/matches")
+    assert m_after.status_code == 200
+    m_data = [x for x in m_after.json() if x["id"] == m_id][0]
+    assert m_data["status"] == "PENDING_VERIFICATION"
+
+    # 5. Test check-in endpoint
+    check_in_resp = await client.post(f"/api/v1/matches/{m_id}/check-in", headers=headers)
+    assert check_in_resp.status_code == 200
+    assert "Check-in verified" in check_in_resp.json()["message"]

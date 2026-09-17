@@ -143,7 +143,42 @@ async def populate_seed_data(db: AsyncSession):
         riot_id="Vortex#APEX",
         steam_id="STEAM_0:1:88291039",
     )
-    db.add_all([super_admin, tournament_admin, captain_vortex])
+    phantom = User(
+        id="usr_phantom",
+        email="phantom@solaris.gg",
+        username="phantom",
+        display_name="Phantom",
+        role="PLAYER",
+    )
+    omen = User(
+        id="usr_omen",
+        email="omen@solaris.gg",
+        username="omen",
+        display_name="Omen",
+        role="PLAYER",
+    )
+    sova = User(
+        id="usr_sova",
+        email="sova@solaris.gg",
+        username="sova",
+        display_name="Sova",
+        role="PLAYER",
+    )
+    jett = User(
+        id="usr_jett",
+        email="jett@solaris.gg",
+        username="jett",
+        display_name="Jett",
+        role="PLAYER",
+    )
+    apex_lead = User(
+        id="usr_apex_lead",
+        email="lead@apexstrikers.gg",
+        username="apex_lead",
+        display_name="Apex Leader",
+        role="PLAYER",
+    )
+    db.add_all([super_admin, tournament_admin, captain_vortex, phantom, omen, sova, jett, apex_lead])
     await db.flush()
 
     # 2. Games

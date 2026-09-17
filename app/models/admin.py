@@ -24,3 +24,5 @@ class AuditLog(Base, TimestampMixin):
     target = Column(String(128), nullable=False)
     details = Column(Text, nullable=True)
     ip_address = Column(String(64), default="127.0.0.1")
+    prev_hash = Column(String(64), nullable=True)
+    record_hash = Column(String(64), nullable=True)

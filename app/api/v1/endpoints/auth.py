@@ -1,9 +1,12 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Header, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, or_
 from app.api.deps import get_db, get_current_user
+from app.core.security import decode_token
 from app.models.user import User
-from app.schemas import UserResponse, UserBase
+from app.models.admin import AuditLog
+from app.services.audit import record_audit_log
+from app.schemas import UserResponse
 from pydantic import BaseModel
 from typing import Optional
 
@@ -19,12 +22,36 @@ class UserSyncRequest(BaseModel):
 @router.post("/sync", response_model=UserResponse)
 async def sync_clerk_user(
     payload: UserSyncRequest,
+    authorization: Optional[str] = Header(None),
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Synchronize authenticated Clerk profile with AMETHEUS DB (Rule 21).
+    Synchronize authenticated Clerk profile with AMETHEUS DB.
+    Requires verified Clerk Bearer token matching payload.clerk_user_id.
     Default role is always PLAYER.
     """
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Bearer token required to sync user profile",
+        )
+
+    token = authorization.replace("Bearer ", "").strip()
+    token_claims = decode_token(token)
+    if not token_claims or "sub" not in token_claims:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired authentication token",
+        )
+
+    # Security check: Token subject must match the clerk_user_id being synced
+    token_sub = token_claims["sub"]
+    if token_sub != payload.clerk_user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Forbidden: Token subject does not match profile ID",
+        )
+
     result = await db.execute(
         select(User).where(
             or_(
@@ -46,7 +73,9 @@ async def sync_clerk_user(
         await db.commit()
         await db.refresh(user)
     else:
-        # Create new user with default PLAYER role
+        from app.core.config import settings
+        # Assign SUPER_ADMIN for the designated admin email, PLAYER for everyone else
+        initial_role = "SUPER_ADMIN" if payload.email == settings.SUPER_ADMIN_EMAIL else "PLAYER"
         user = User(
             id=payload.clerk_user_id,
             clerk_user_id=payload.clerk_user_id,
@@ -54,9 +83,17 @@ async def sync_clerk_user(
             username=payload.username,
             display_name=payload.display_name or payload.username,
             avatar_url=payload.avatar_url,
-            role="PLAYER",
+            role=initial_role,
         )
         db.add(user)
+        await record_audit_log(
+            db=db,
+            operator=user.id,
+            role=initial_role,
+            action="USER_SYNCED",
+            target=user.id,
+            details=f"Clerk user {user.username} ({user.email}) registered as {initial_role}",
+        )
         await db.commit()
         await db.refresh(user)
 

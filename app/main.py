@@ -53,3 +53,27 @@ async def root():
 @app.get("/health")
 async def health_check():
     return {"status": "ok", "service": "ametheus-backend"}
+
+from fastapi import WebSocket, WebSocketDisconnect
+from app.core.ws import ws_manager
+
+@app.websocket("/ws/ticker")
+async def websocket_match_ticker(websocket: WebSocket):
+    """
+    Real-time live match ticker WebSocket broadcast.
+    """
+    await ws_manager.connect(websocket)
+    try:
+        # Initial handshake message
+        await websocket.send_json({
+            "type": "CONNECTION_ESTABLISHED",
+            "message": "Connected to AMETHEUS Live Match Engine Ticker",
+        })
+        while True:
+            data = await websocket.receive_text()
+            if data == "ping":
+                await websocket.send_text("pong")
+    except WebSocketDisconnect:
+        ws_manager.disconnect(websocket)
+    except Exception:
+        ws_manager.disconnect(websocket)

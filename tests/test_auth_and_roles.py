@@ -1,9 +1,8 @@
 import pytest
-from app.core.security import create_access_token
+from tests.conftest import make_auth_headers
 
 @pytest.mark.asyncio
 async def test_unauthenticated_request_returns_401(client):
-    # Unauthenticated request to protected endpoint must return 401
     res = await client.get("/api/v1/auth/me")
     assert res.status_code == 401
     assert "Unauthorized" in res.json()["detail"]
@@ -16,14 +15,12 @@ async def test_invalid_token_returns_401(client):
 
 @pytest.mark.asyncio
 async def test_valid_token_authenticates_user(client):
-    # Generate valid HS256 token for user_alpha
-    token = create_access_token({"sub": "user_alpha_clerk_id"})
-    headers = {"Authorization": f"Bearer {token}"}
+    headers = make_auth_headers("usr_vortex_lead")
     res = await client.get("/api/v1/auth/me", headers=headers)
     assert res.status_code == 200
     data = res.json()
     assert data["role"] == "PLAYER"
-    assert data["id"] == "user_alpha_clerk_id"
+    assert data["id"] == "usr_vortex_lead"
 
 @pytest.mark.asyncio
 async def test_clerk_user_sync_endpoint(client):
@@ -34,7 +31,8 @@ async def test_clerk_user_sync_endpoint(client):
         "display_name": "Synced Legend",
         "avatar_url": "https://r2.ametheus.gg/avatars/999.png",
     }
-    res = await client.post("/api/v1/auth/sync", json=payload)
+    headers = make_auth_headers("user_synced_clerk_999")
+    res = await client.post("/api/v1/auth/sync", json=payload, headers=headers)
     assert res.status_code == 200
     data = res.json()
     assert data["clerk_user_id"] == "user_synced_clerk_999"
@@ -43,8 +41,8 @@ async def test_clerk_user_sync_endpoint(client):
 
 @pytest.mark.asyncio
 async def test_super_admin_promote_organizer(client):
-    headers_super = {"x-user-id": "usr_super_admin"}
-    headers_player = {"x-user-id": "user_synced_clerk_999"}
+    headers_super = make_auth_headers("usr_super_admin")
+    headers_player = make_auth_headers("user_synced_clerk_999")
 
     # 1. Non-super admin cannot promote
     res_fail = await client.post(

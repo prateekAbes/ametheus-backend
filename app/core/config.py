@@ -14,8 +14,10 @@ class Settings(BaseSettings):
         "http://localhost:3000",
         "http://127.0.0.1:3000",
         "http://localhost:8000",
+        "https://ametheus-frontend.vercel.app",
     ]
     CLERK_ISSUER: str = os.getenv("CLERK_ISSUER", "https://clerk.ametheus.gg")
+    SUPER_ADMIN_EMAIL: str = os.getenv("SUPER_ADMIN_EMAIL", "pk.4081988@gmail.com")
     RAZORPAY_KEY_ID: str = os.getenv("RAZORPAY_KEY_ID", "rzp_test_ametheus_escrow")
     RAZORPAY_KEY_SECRET: str = os.getenv("RAZORPAY_KEY_SECRET", "mock_secret_key_escrow_123")
 

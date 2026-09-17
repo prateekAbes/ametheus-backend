@@ -10,9 +10,28 @@ from app.models.user import User
 from app.models.game import Game
 from app.models.tournament import Tournament, TournamentRegistration
 from app.models.match import Match
+from app.services.audit import record_audit_log
 from app.schemas import TournamentResponse
 
 router = APIRouter()
+
+VALID_TRANSITIONS = {
+    "DRAFT": ["REGISTRATION_OPEN", "CANCELLED"],
+    "REGISTRATION_OPEN": ["REGISTRATION_CLOSED", "LIVE", "CANCELLED"],
+    "REGISTRATION_CLOSED": ["UPCOMING", "LIVE", "REGISTRATION_OPEN", "CANCELLED"],
+    "UPCOMING": ["LIVE", "CANCELLED"],
+    "LIVE": ["COMPLETED", "CANCELLED"],
+    "COMPLETED": [],
+    "CANCELLED": [],
+}
+
+def validate_tournament_transition(current_status: str, next_status: str):
+    allowed = VALID_TRANSITIONS.get(current_status, [])
+    if next_status not in allowed:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Illegal tournament transition from {current_status} to {next_status}. Allowed next states: {allowed}",
+        )
 
 class TournamentCreatePayload(BaseModel):
     game_id: str
@@ -226,7 +245,7 @@ async def publish_tournament(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Publish tournament (opens registration): DRAFT -> REGISTRATION_OPEN.
+    Publish tournament (opens registration): DRAFT/REGISTRATION_CLOSED -> REGISTRATION_OPEN.
     """
     res = await db.execute(select(Tournament).where(Tournament.id == id))
     tourn = res.scalars().first()
@@ -239,9 +258,90 @@ async def publish_tournament(
             detail="Forbidden: You do not own this tournament (Rule 20)",
         )
 
+    validate_tournament_transition(tourn.status, "REGISTRATION_OPEN")
+    prev_status = tourn.status
     tourn.status = "REGISTRATION_OPEN"
+
+    await record_audit_log(
+        db=db,
+        operator=organizer.username,
+        role=organizer.role,
+        action="TOURNAMENT_STATE_CHANGE",
+        target=f"Tournament {tourn.title} ({tourn.id})",
+        details=f"Status transitioned: {prev_status} -> REGISTRATION_OPEN",
+    )
     await db.commit()
     return {"status": "success", "message": "Tournament published! Registration is now OPEN."}
+
+@router.post("/tournaments/{id}/close-registration")
+async def close_tournament_registration(
+    id: str,
+    organizer: User = Depends(require_organizer),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Close registrations: REGISTRATION_OPEN -> REGISTRATION_CLOSED.
+    """
+    res = await db.execute(select(Tournament).where(Tournament.id == id))
+    tourn = res.scalars().first()
+    if not tourn:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+
+    if organizer.role != "SUPER_ADMIN" and tourn.organizer_id != organizer.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Forbidden: You do not own this tournament (Rule 20)",
+        )
+
+    validate_tournament_transition(tourn.status, "REGISTRATION_CLOSED")
+    prev_status = tourn.status
+    tourn.status = "REGISTRATION_CLOSED"
+
+    await record_audit_log(
+        db=db,
+        operator=organizer.username,
+        role=organizer.role,
+        action="TOURNAMENT_STATE_CHANGE",
+        target=f"Tournament {tourn.title} ({tourn.id})",
+        details=f"Status transitioned: {prev_status} -> REGISTRATION_CLOSED",
+    )
+    await db.commit()
+    return {"status": "success", "message": "Tournament registration is now CLOSED. Rosters locked."}
+
+@router.post("/tournaments/{id}/cancel")
+async def cancel_tournament(
+    id: str,
+    organizer: User = Depends(require_organizer),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Cancel tournament: transitions to CANCELLED.
+    """
+    res = await db.execute(select(Tournament).where(Tournament.id == id))
+    tourn = res.scalars().first()
+    if not tourn:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+
+    if organizer.role != "SUPER_ADMIN" and tourn.organizer_id != organizer.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Forbidden: You do not own this tournament (Rule 20)",
+        )
+
+    validate_tournament_transition(tourn.status, "CANCELLED")
+    prev_status = tourn.status
+    tourn.status = "CANCELLED"
+
+    await record_audit_log(
+        db=db,
+        operator=organizer.username,
+        role=organizer.role,
+        action="TOURNAMENT_CANCELLED",
+        target=f"Tournament {tourn.title} ({tourn.id})",
+        details=f"Status transitioned: {prev_status} -> CANCELLED",
+    )
+    await db.commit()
+    return {"status": "success", "message": f"Tournament '{tourn.title}' has been cancelled."}
 
 @router.get("/my-tournaments", response_model=List[TournamentResponse])
 async def get_my_organized_tournaments(
@@ -322,7 +422,21 @@ async def generate_single_elimination_bracket(
     if organizer.role != "SUPER_ADMIN" and tourn.organizer_id != organizer.id:
         raise HTTPException(status_code=403, detail="Forbidden: You do not own this tournament (Rule 20)")
 
+    validate_tournament_transition(tourn.status, "LIVE")
+    prev_status = tourn.status
+
     bracket_info = await build_single_elimination_bracket(tournament=tourn, db=db)
+
+    await record_audit_log(
+        db=db,
+        operator=organizer.username,
+        role=organizer.role,
+        action="GENERATE_BRACKET",
+        target=f"Tournament {tourn.title} ({tourn.id})",
+        details=f"Generated {bracket_info['total_rounds']}-round bracket. Status: {prev_status} -> LIVE",
+    )
+    await db.commit()
+
     return {
         "status": "success",
         "message": f"Single Elimination Bracket generated with {bracket_info['total_rounds']} rounds! Tournament is LIVE.",

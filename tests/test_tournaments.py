@@ -1,14 +1,17 @@
 import pytest
+from tests.conftest import make_auth_headers, TestSessionLocal
+from app.models.user import User
 from app.models.game import Game
 from app.models.team import Team
 from app.models.tournament import Tournament
-from tests.conftest import TestSessionLocal
 
 @pytest.mark.asyncio
 async def test_tournament_discovery_and_registration(client):
-    headers_captain = {"x-user-id": "usr_tourn_captain"}
+    headers_captain = make_auth_headers("usr_tourn_captain")
 
     async with TestSessionLocal() as db:
+        u = User(id="usr_tourn_captain", clerk_user_id="usr_tourn_captain", email="tc@test.com", username="tourn_captain", role="PLAYER")
+        db.add(u)
         g = Game(
             slug="valorant-tourn-test",
             name="Valorant",

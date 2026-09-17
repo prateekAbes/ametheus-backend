@@ -61,7 +61,35 @@ async def captain_check_in(
     if not match:
         raise HTTPException(status_code=404, detail="Match not found")
 
-    return {"status": "success", "message": "Captain successfully checked in"}
+    # Verify user is a roster member of either competing team or admin
+    if (match.team_a_id or match.team_b_id) and current_user.role not in ["SUPER_ADMIN", "ORGANIZER"]:
+        competing_teams = [tid for tid in [match.team_a_id, match.team_b_id] if tid]
+        mem_check = await db.execute(
+            select(TeamMember).where(
+                TeamMember.team_id.in_(competing_teams),
+                TeamMember.user_id == current_user.id,
+            )
+        )
+        if not mem_check.scalars().first():
+            raise HTTPException(
+                status_code=403,
+                detail="You are not registered on either competing roster for this match.",
+            )
+
+    if match.status == "CHECK_IN_OPEN":
+        match.status = "LIVE"
+
+    from app.services.audit import record_audit_log
+    await record_audit_log(
+        db=db,
+        operator=current_user.username,
+        role=current_user.role,
+        action="MATCH_CHECK_IN",
+        target=f"Match {match.id}",
+        details=f"Player @{current_user.username} checked in. Match status is {match.status}.",
+    )
+    await db.commit()
+    return {"status": "success", "message": f"Check-in verified. Match is {match.status}."}
 
 @router.post("/{id}/submit-result")
 async def submit_match_result(
@@ -75,13 +103,47 @@ async def submit_match_result(
     if not match:
         raise HTTPException(status_code=404, detail="Match not found")
 
+    # Verify user is a roster member of either competing team or admin
+    if (match.team_a_id or match.team_b_id) and current_user.role not in ["SUPER_ADMIN", "ORGANIZER"]:
+        competing_teams = [tid for tid in [match.team_a_id, match.team_b_id] if tid]
+        mem_check = await db.execute(
+            select(TeamMember).where(
+                TeamMember.team_id.in_(competing_teams),
+                TeamMember.user_id == current_user.id,
+            )
+        )
+        if not mem_check.scalars().first():
+            raise HTTPException(
+                status_code=403,
+                detail="Only participating roster members or platform arbiters can submit scores.",
+            )
+
     match.score_a = payload.score_a
     match.score_b = payload.score_b
     match.evidence_url = payload.evidence_url
     match.captain_notes = payload.captain_notes
     match.status = "PENDING_VERIFICATION"
 
+    from app.services.audit import record_audit_log
+    await record_audit_log(
+        db=db,
+        operator=current_user.username,
+        role=current_user.role,
+        action="SUBMIT_MATCH_RESULT",
+        target=f"Match {match.id} (Score: {payload.score_a}-{payload.score_b})",
+        details=f"Proof: {payload.evidence_url or 'None'} | Notes: {payload.captain_notes or 'None'}",
+    )
     await db.commit()
+
+    from app.core.ws import ws_manager
+    await ws_manager.broadcast({
+        "type": "MATCH_SCORE_SUBMITTED",
+        "match_id": match.id,
+        "score_a": payload.score_a,
+        "score_b": payload.score_b,
+        "status": "PENDING_VERIFICATION",
+    })
+
     return {"status": "success", "message": "Match result & proof submitted for admin verification"}
 
 @router.post("/{id}/dispute")

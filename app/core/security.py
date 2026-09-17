@@ -21,9 +21,11 @@ def create_access_token(data: Dict[str, Any], expires_delta: Optional[timedelta]
 def decode_token(token: str) -> Optional[Dict[str, Any]]:
     """
     Decodes either internal HS256 tokens or Clerk RS256 JWT tokens.
+    Cryptographically verifies RS256 tokens using Clerk's official JWKS.
+    No unverified signature bypass is permitted.
     """
     try:
-        # First check header without verification to determine algorithm
+        # First inspect header without verification to determine algorithm & kid
         unverified_header = jwt.get_unverified_header(token)
         alg = unverified_header.get("alg", "HS256")
 
@@ -31,9 +33,23 @@ def decode_token(token: str) -> Optional[Dict[str, Any]]:
             return jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"])
 
         if alg == "RS256":
-            # Clerk JWT decoding via JWKS
-            issuer = settings.CLERK_ISSUER.rstrip("/")
             kid = unverified_header.get("kid")
+            if not kid:
+                return None
+
+            # Inspect claims to find issuer
+            unverified_payload = jwt.decode(token, options={"verify_signature": False})
+            issuer = unverified_payload.get("iss", "").rstrip("/")
+
+            # Verify issuer is authorized
+            is_valid_issuer = (
+                issuer == settings.CLERK_ISSUER.rstrip("/")
+                or issuer.endswith(".clerk.accounts.dev")
+                or "clerk." in issuer
+            )
+            if not is_valid_issuer:
+                print(f"[AUTH] Rejected unauthorized token issuer: {issuer}")
+                return None
 
             # Check if JWKS is cached or fetch
             global _jwks_cache
@@ -46,7 +62,8 @@ def decode_token(token: str) -> Optional[Dict[str, Any]]:
                         for key in jwks.get("keys", []):
                             _jwks_cache[key["kid"]] = jwt.algorithms.RSAAlgorithm.from_jwk(json.dumps(key))
                 except Exception as e:
-                    print(f"[AUTH] Could not fetch Clerk JWKS: {e}")
+                    print(f"[AUTH] Could not fetch Clerk JWKS from {jwks_url}: {e}")
+                    return None
 
             if kid in _jwks_cache:
                 public_key = _jwks_cache[kid]
@@ -57,8 +74,8 @@ def decode_token(token: str) -> Optional[Dict[str, Any]]:
                     options={"verify_aud": False}
                 )
 
-            # Fallback: unverified decode for dev/mocking if remote JWKS unavailable
-            return jwt.decode(token, options={"verify_signature": False})
+            # Key not found in JWKS - reject!
+            return None
 
         return None
     except Exception as e:

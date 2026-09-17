@@ -3,7 +3,7 @@ services:
     name: ametheus-backend
     runtime: python
     plan: free
-    buildCommand: pip install -r requirements.txt
+    buildCommand: pip install -r requirements.txt && alembic upgrade head
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
     envVars:
@@ -16,7 +16,9 @@ services:
       - key: SECRET_KEY
         generateValue: true
       - key: CORS_ORIGINS
-        value: "http://localhost:3000,https://ametheus.vercel.app"
+        value: "http://localhost:3000,https://ametheus-frontend.vercel.app,https://ametheus.vercel.app"
+      - key: SUPER_ADMIN_EMAIL
+        value: "pk.4081988@gmail.com"
 
 databases:
   - name: ametheus-db

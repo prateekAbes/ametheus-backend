@@ -1,3 +1,4 @@
+import secrets
 import json
 import math
 from typing import List, Optional, Dict, Any
@@ -33,14 +34,13 @@ async def build_single_elimination_bracket(
 
     num_teams = len(teams)
     if num_teams < 2:
-        # Pad with mock contenders if needed for seeded testing
         num_teams = 4
 
     total_rounds = max(1, math.ceil(math.log2(num_teams)))
     matches_in_r1 = 2 ** (total_rounds - 1)
 
     bracket_tree = []
-    round_matches_db = []
+    bye_matches = []
 
     # Clear existing matches for this tournament if regenerating
     old_matches = await db.execute(select(Match).where(Match.tournament_id == tournament.id))
@@ -68,8 +68,15 @@ async def build_single_elimination_bracket(
                     team_a_id = teams[t_idx_a].id
                 if t_idx_b < len(teams):
                     team_b_id = teams[t_idx_b].id
-                status = "CHECK_IN_OPEN" if team_a_id and team_b_id else "SCHEDULED"
 
+                if team_a_id and team_b_id:
+                    status = "CHECK_IN_OPEN"
+                elif team_a_id and not team_b_id:
+                    status = "BYE"
+                else:
+                    status = "SCHEDULED"
+
+            lobby_pw = f"AMT-{secrets.token_hex(3).upper()}"
             db_match = Match(
                 tournament_id=tournament.id,
                 stage=stage_name,
@@ -80,12 +87,16 @@ async def build_single_elimination_bracket(
                 status=status,
                 team_a_id=team_a_id,
                 team_b_id=team_b_id,
+                winner_team_id=team_a_id if status == "BYE" else None,
                 server_region=tournament.server_region,
                 lobby_code=f"AMETHEUS-{tournament.slug[:6].upper()}-R{r}M{m_idx}",
-                lobby_password="VANGUARD_SECURE_99",
+                lobby_password=lobby_pw,
             )
             db.add(db_match)
             await db.flush()
+
+            if status == "BYE":
+                bye_matches.append(db_match)
 
             r_bracket["matches"].append({
                 "id": db_match.id,
@@ -97,6 +108,11 @@ async def build_single_elimination_bracket(
             })
 
         bracket_tree.append(r_bracket)
+
+    # Auto-advance all BYE contenders into the next round
+    for bm in bye_matches:
+        if bm.winner_team_id:
+            await advance_bracket_match(tournament.id, bm, bm.winner_team_id, db)
 
     tournament.bracket_json = json.dumps(bracket_tree)
     tournament.status = "LIVE"
