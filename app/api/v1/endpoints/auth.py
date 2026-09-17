@@ -58,20 +58,25 @@ async def sync_clerk_user(
         ]
     })
 
+    from app.core.config import settings
+    admin_emails = {settings.SUPER_ADMIN_EMAIL.lower(), "admin@ametheus.gg"}
+    is_super_admin = payload.email.lower() in admin_emails
+
     if user_doc:
-        # Update metadata without overwriting authoritative role
+        # Update metadata and ensure super admin role if designated email
         update_fields = {"clerk_user_id": payload.clerk_user_id}
         if payload.display_name:
             update_fields["display_name"] = payload.display_name
         if payload.avatar_url:
             update_fields["avatar_url"] = payload.avatar_url
+        if is_super_admin:
+            update_fields["role"] = "SUPER_ADMIN"
         await db.users.update_one({"_id": user_doc["_id"]}, {"$set": update_fields})
         updated_doc = await db.users.find_one({"_id": user_doc["_id"]})
         return User.from_mongo(updated_doc)
     else:
-        from app.core.config import settings
-        # Assign SUPER_ADMIN for the designated admin email, PLAYER for everyone else
-        initial_role = "SUPER_ADMIN" if payload.email == settings.SUPER_ADMIN_EMAIL else "PLAYER"
+        # Assign SUPER_ADMIN for designated admin emails, PLAYER for everyone else
+        initial_role = "SUPER_ADMIN" if is_super_admin else "PLAYER"
         user = User(
             id=payload.clerk_user_id,
             clerk_user_id=payload.clerk_user_id,

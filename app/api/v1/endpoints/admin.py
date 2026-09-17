@@ -1,7 +1,8 @@
 from typing import List
+from pydantic import BaseModel
 from fastapi import APIRouter, Depends, HTTPException, status
 from motor.motor_asyncio import AsyncIOMotorDatabase
-from app.api.deps import get_db, get_current_user, require_super_admin
+from app.api.deps import get_db, get_current_user, require_super_admin, require_organizer
 from app.models.user import User
 from app.models.admin import TournamentAdminAssignment, AuditLog
 from app.models.match import Match
@@ -169,6 +170,32 @@ async def promote_user_to_organizer(
     )
     return {"status": "success", "message": f"User {user_doc['username']} successfully promoted to ORGANIZER"}
 
+class UserRoleUpdate(BaseModel):
+    role: str
+
+@router.post("/users/{id}/set-role")
+async def set_user_role(
+    id: str,
+    payload: UserRoleUpdate,
+    admin_user: User = Depends(require_super_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    valid_roles = ["PLAYER", "ORGANIZER", "SUPER_ADMIN"]
+    if payload.role not in valid_roles:
+        raise HTTPException(status_code=400, detail=f"Invalid role. Must be one of: {valid_roles}")
+    user_doc = await db.users.find_one({"$or": [{"_id": id}, {"id": id}]})
+    if not user_doc:
+        raise HTTPException(status_code=404, detail="User not found")
+    await db.users.update_one({"_id": user_doc["_id"]}, {"$set": {"role": payload.role}})
+    await record_audit_log(
+        db=db,
+        operator=admin_user.username,
+        role="SUPER_ADMIN",
+        action="UPDATE_USER_ROLE",
+        target=f"User {user_doc['username']} -> {payload.role}",
+    )
+    return {"status": "success", "message": f"User {user_doc['username']} role updated to {payload.role}"}
+
 @router.get("/users")
 async def list_platform_users(
     admin_user: User = Depends(require_super_admin),
@@ -195,7 +222,7 @@ async def list_platform_users(
 
 @router.get("/disputes", response_model=List[DisputeResponse])
 async def list_disputes(
-    admin_user: User = Depends(require_super_admin),
+    admin_user: User = Depends(require_organizer),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     cursor = db.disputes.find().sort("created_at", -1)
@@ -262,7 +289,7 @@ async def resolve_dispute(
 
 @router.get("/stats")
 async def get_admin_stats(
-    admin_user: User = Depends(require_super_admin),
+    admin_user: User = Depends(require_organizer),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """

@@ -3,25 +3,19 @@ services:
     name: ametheus-backend
     runtime: python
     plan: free
-    buildCommand: pip install -r requirements.txt && alembic upgrade head
+    buildCommand: pip install -r requirements.txt
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.7
-      - key: DATABASE_URL
-        fromDatabase:
-          name: ametheus-db
-          property: connectionString
+      - key: MONGODB_URI
+        sync: false
+      - key: MONGODB_DB_NAME
+        value: ametheus
       - key: SECRET_KEY
         generateValue: true
       - key: CORS_ORIGINS
         value: "http://localhost:3000,https://ametheus-frontend.vercel.app,https://ametheus.vercel.app"
       - key: SUPER_ADMIN_EMAIL
         value: "pk.4081988@gmail.com"
-
-databases:
-  - name: ametheus-db
-    plan: free
-    databaseName: ametheus
-    user: ametheus_user
