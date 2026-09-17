@@ -306,3 +306,12 @@ async def get_admin_stats(
         "active_matches": active_matches,
         "platform_escrow_vault": 1245000,
     }
+
+@router.post("/seed-catalog")
+async def trigger_seed_catalog(
+    admin_user: User = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    from app.seed import populate_seed_data
+    await populate_seed_data(db)
+    return {"status": "success", "message": "Platform seed data created successfully"}
