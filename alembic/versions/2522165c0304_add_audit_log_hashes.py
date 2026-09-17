@@ -23,12 +23,28 @@ def upgrade() -> None:
     bind = op.get_bind()
     from sqlalchemy import inspect
     inspector = inspect(bind)
-    if "audit_logs" in inspector.get_table_names():
+    tables = set(inspector.get_table_names())
+
+    if "audit_logs" in tables:
         columns = {c['name'] for c in inspector.get_columns('audit_logs')}
         if 'prev_hash' not in columns:
             op.add_column('audit_logs', sa.Column('prev_hash', sa.String(length=64), nullable=True))
         if 'record_hash' not in columns:
             op.add_column('audit_logs', sa.Column('record_hash', sa.String(length=64), nullable=True))
+
+    if "tournaments" in tables:
+        t_cols = {c['name'] for c in inspector.get_columns('tournaments')}
+        if 'organizer_id' not in t_cols:
+            op.add_column('tournaments', sa.Column('organizer_id', sa.String(length=64), nullable=True))
+
+    if "tournament_registrations" in tables:
+        reg_cols = {c['name'] for c in inspector.get_columns('tournament_registrations')}
+        if 'order_id' not in reg_cols:
+            op.add_column('tournament_registrations', sa.Column('order_id', sa.String(length=64), nullable=True))
+        if 'payment_status' not in reg_cols:
+            op.add_column('tournament_registrations', sa.Column('payment_status', sa.String(length=32), server_default="FREE", nullable=False))
+        if 'check_in_status' not in reg_cols:
+            op.add_column('tournament_registrations', sa.Column('check_in_status', sa.String(length=32), server_default="PENDING", nullable=False))
 
 
 def downgrade() -> None:

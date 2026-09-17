@@ -8,10 +8,51 @@ from app.models import *  # ensure all models registered
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Auto-create tables on startup (works with both SQLite and PostgreSQL)
+    # Auto-create tables and reconcile schema on startup (SQLite and PostgreSQL)
     try:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+
+            def _reconcile_schema(sync_conn):
+                from sqlalchemy import inspect, text
+                insp = inspect(sync_conn)
+                tables = set(insp.get_table_names())
+
+                if "tournaments" in tables:
+                    cols = {c['name'] for c in insp.get_columns("tournaments")}
+                    if "organizer_id" not in cols:
+                        sync_conn.execute(text("ALTER TABLE tournaments ADD COLUMN organizer_id VARCHAR(64)"))
+
+                if "audit_logs" in tables:
+                    cols = {c['name'] for c in insp.get_columns("audit_logs")}
+                    if "prev_hash" not in cols:
+                        sync_conn.execute(text("ALTER TABLE audit_logs ADD COLUMN prev_hash VARCHAR(64)"))
+                    if "record_hash" not in cols:
+                        sync_conn.execute(text("ALTER TABLE audit_logs ADD COLUMN record_hash VARCHAR(64)"))
+
+                if "tournament_registrations" in tables:
+                    cols = {c['name'] for c in insp.get_columns("tournament_registrations")}
+                    if "order_id" not in cols:
+                        sync_conn.execute(text("ALTER TABLE tournament_registrations ADD COLUMN order_id VARCHAR(64)"))
+                    if "payment_status" not in cols:
+                        sync_conn.execute(text("ALTER TABLE tournament_registrations ADD COLUMN payment_status VARCHAR(32) DEFAULT 'FREE'"))
+                    if "check_in_status" not in cols:
+                        sync_conn.execute(text("ALTER TABLE tournament_registrations ADD COLUMN check_in_status VARCHAR(32) DEFAULT 'PENDING'"))
+
+                if "users" in tables:
+                    cols = {c['name'] for c in insp.get_columns("users")}
+                    if "clerk_user_id" not in cols:
+                        sync_conn.execute(text("ALTER TABLE users ADD COLUMN clerk_user_id VARCHAR(128)"))
+                    if "role" not in cols:
+                        sync_conn.execute(text("ALTER TABLE users ADD COLUMN role VARCHAR(32) DEFAULT 'PLAYER'"))
+                    if "inr_balance" not in cols:
+                        sync_conn.execute(text("ALTER TABLE users ADD COLUMN inr_balance VARCHAR(32) DEFAULT '0'"))
+                    if "riot_id" not in cols:
+                        sync_conn.execute(text("ALTER TABLE users ADD COLUMN riot_id VARCHAR(64)"))
+                    if "steam_id" not in cols:
+                        sync_conn.execute(text("ALTER TABLE users ADD COLUMN steam_id VARCHAR(64)"))
+
+            await conn.run_sync(_reconcile_schema)
         
         # Auto-seed database if empty
         from app.seed import seed_if_empty
