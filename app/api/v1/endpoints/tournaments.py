@@ -55,6 +55,9 @@ async def list_tournaments(
         prizes = safe_json_loads(t.prizes_json, [])
         bracket = safe_json_loads(t.bracket_json, [])
 
+        prize_inr = t.prize_pool_inr if t.prize_pool_inr is not None else 0
+        fee_inr = t.entry_fee_inr if t.entry_fee_inr is not None else 0
+
         response.append(
             TournamentResponse(
                 id=t.id,
@@ -63,16 +66,16 @@ async def list_tournaments(
                 title=t.title,
                 game_slug=game_obj.slug if game_obj else "valorant",
                 game_name=game_obj.name if game_obj else "Valorant",
-                prize_pool=f"₹{t.prize_pool_inr:,}",
-                prize_pool_inr=t.prize_pool_inr,
-                entry_fee=f"₹{t.entry_fee_inr} / Team" if t.entry_fee_inr > 0 else "₹0 / Free",
-                entry_fee_inr=t.entry_fee_inr,
-                status=t.status,
-                starts_at=t.starts_at,
-                roster_lock_time=t.roster_lock_time,
-                server_region=t.server_region,
+                prize_pool=f"₹{prize_inr:,}",
+                prize_pool_inr=prize_inr,
+                entry_fee=f"₹{fee_inr} / Team" if fee_inr > 0 else "₹0 / Free",
+                entry_fee_inr=fee_inr,
+                status=t.status or "REGISTRATION_OPEN",
+                starts_at=t.starts_at or "TBD",
+                roster_lock_time=t.roster_lock_time or "TBD",
+                server_region=t.server_region or "AWS Mumbai (ap-south-1)",
                 registered_teams=reg_count,
-                max_teams=t.max_teams,
+                max_teams=t.max_teams or 16,
                 rank_requirement=t.rank_requirement,
                 format=t.format,
                 banner_url=t.banner_url or "https://lh3.googleusercontent.com/aida-public/AB6AXuD-g0bK72p2tQe7b3Z3F5WzX8oV0h4vM1bX2m9x_banner",
@@ -114,6 +117,9 @@ async def get_tournament_by_slug(slug: str, db: AsyncSession = Depends(get_db)):
     prizes = safe_json_loads(t.prizes_json, [])
     bracket = safe_json_loads(t.bracket_json, [])
 
+    prize_inr = t.prize_pool_inr if t.prize_pool_inr is not None else 0
+    fee_inr = t.entry_fee_inr if t.entry_fee_inr is not None else 0
+
     return TournamentResponse(
         id=t.id,
         slug=t.slug,
@@ -121,18 +127,18 @@ async def get_tournament_by_slug(slug: str, db: AsyncSession = Depends(get_db)):
         title=t.title,
         game_slug=game_obj.slug if game_obj else "valorant",
         game_name=game_obj.name if game_obj else "Valorant",
-        prize_pool=f"₹{t.prize_pool_inr:,}",
-        prize_pool_inr=t.prize_pool_inr,
-        entry_fee=f"₹{t.entry_fee_inr} / Team" if t.entry_fee_inr > 0 else "₹0 / Free",
-        entry_fee_inr=t.entry_fee_inr,
-        status=t.status,
-        starts_at=t.starts_at,
-        roster_lock_time=t.roster_lock_time,
-        server_region=t.server_region,
+        prize_pool=f"₹{prize_inr:,}",
+        prize_pool_inr=prize_inr,
+        entry_fee=f"₹{fee_inr} / Team" if fee_inr > 0 else "₹0 / Free",
+        entry_fee_inr=fee_inr,
+        status=t.status or "REGISTRATION_OPEN",
+        starts_at=t.starts_at or "TBD",
+        roster_lock_time=t.roster_lock_time or "TBD",
+        server_region=t.server_region or "AWS Mumbai (ap-south-1)",
         registered_teams=reg_count,
-        max_teams=t.max_teams,
-        rank_requirement=t.rank_requirement,
-        format=t.format,
+        max_teams=t.max_teams or 16,
+        rank_requirement=t.rank_requirement or "Open to All Ranks",
+        format=t.format or "Single Elimination Bracket",
         banner_url=t.banner_url or "https://lh3.googleusercontent.com/aida-public/AB6AXuD-g0bK72p2tQe7b3Z3F5WzX8oV0h4vM1bX2m9x_banner",
         badge_color=t.badge_color or "#E56A10",
         description=t.description or "",

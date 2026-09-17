@@ -20,8 +20,15 @@ depends_on: Union[str, Sequence[str], None] = None
 
 def upgrade() -> None:
     """Upgrade schema."""
-    op.add_column('audit_logs', sa.Column('prev_hash', sa.String(length=64), nullable=True))
-    op.add_column('audit_logs', sa.Column('record_hash', sa.String(length=64), nullable=True))
+    bind = op.get_bind()
+    from sqlalchemy import inspect
+    inspector = inspect(bind)
+    if "audit_logs" in inspector.get_table_names():
+        columns = {c['name'] for c in inspector.get_columns('audit_logs')}
+        if 'prev_hash' not in columns:
+            op.add_column('audit_logs', sa.Column('prev_hash', sa.String(length=64), nullable=True))
+        if 'record_hash' not in columns:
+            op.add_column('audit_logs', sa.Column('record_hash', sa.String(length=64), nullable=True))
 
 
 def downgrade() -> None:

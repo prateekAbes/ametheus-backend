@@ -110,21 +110,21 @@ class TournamentResponse(BaseModel):
     id: str
     slug: str
     organizer_id: Optional[str] = None
-    title: str
-    game_slug: str
-    game_name: str
-    prize_pool: str
-    prize_pool_inr: int
-    entry_fee: str
-    entry_fee_inr: int
-    status: str
-    starts_at: str
-    roster_lock_time: str
-    server_region: str
-    registered_teams: int
-    max_teams: int
-    rank_requirement: str
-    format: str
+    title: Optional[str] = "Championship"
+    game_slug: Optional[str] = "valorant"
+    game_name: Optional[str] = "Valorant"
+    prize_pool: Optional[str] = "₹0"
+    prize_pool_inr: Optional[int] = 0
+    entry_fee: Optional[str] = "₹0 / Free"
+    entry_fee_inr: Optional[int] = 0
+    status: Optional[str] = "REGISTRATION_OPEN"
+    starts_at: Optional[str] = "TBD"
+    roster_lock_time: Optional[str] = "TBD"
+    server_region: Optional[str] = "AWS Mumbai (ap-south-1)"
+    registered_teams: Optional[int] = 0
+    max_teams: Optional[int] = 16
+    rank_requirement: Optional[str] = "Open to All Ranks"
+    format: Optional[str] = "Single Elimination Bracket"
     banner_url: Optional[str] = "https://lh3.googleusercontent.com/aida-public/AB6AXuD-g0bK72p2tQe7b3Z3F5WzX8oV0h4vM1bX2m9x_banner"
     badge_color: Optional[str] = "#E56A10"
     description: Optional[str] = ""
