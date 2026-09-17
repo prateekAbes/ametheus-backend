@@ -1,19 +1,31 @@
-from sqlalchemy import Column, String, Boolean, ForeignKey, Text
-from sqlalchemy.orm import relationship
-from app.core.database import Base
-from app.models.base import TimestampMixin, generate_uuid
+from typing import Optional
+from datetime import datetime
+from pydantic import BaseModel, Field
+from app.models.base import generate_uuid, get_utc_now
 
-class Notification(Base, TimestampMixin):
-    __tablename__ = "notifications"
+class Notification(BaseModel):
+    id: str = Field(default_factory=generate_uuid)
+    user_id: str
+    type: str = "SYSTEM"  # SYSTEM, TOURNAMENT, MATCH, PAYMENT, DISPUTE
+    title: str
+    message: str
+    is_read: bool = False
+    link: Optional[str] = None
+    metadata_json: str = "{}"
+    created_at: datetime = Field(default_factory=get_utc_now)
+    updated_at: datetime = Field(default_factory=get_utc_now)
 
-    id = Column(String(36), primary_key=True, default=generate_uuid)
-    user_id = Column(String(64), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
-    type = Column(String(32), default="SYSTEM", nullable=False)  # SYSTEM, TOURNAMENT, MATCH, PAYMENT, DISPUTE
-    title = Column(String(128), nullable=False)
-    message = Column(Text, nullable=False)
-    is_read = Column(Boolean, default=False, nullable=False)
-    link = Column(String(256), nullable=True)
-    metadata_json = Column(Text, default="{}", nullable=False)
+    def to_mongo(self) -> dict:
+        d = self.model_dump()
+        d["_id"] = d.pop("id")
+        return d
 
-    # Relationships
-    user = relationship("User", foreign_keys=[user_id])
+    @classmethod
+    def from_mongo(cls, doc: Optional[dict]):
+        if not doc:
+            return None
+        d = dict(doc)
+        if "_id" in d and "id" not in d:
+            d["id"] = str(d.pop("_id"))
+        return cls(**d)
+

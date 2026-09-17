@@ -1,12 +1,8 @@
 from typing import List
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
-from app.api.deps import get_db, get_current_user, require_super_admin, RequireTournamentAdmin
+from motor.motor_asyncio import AsyncIOMotorDatabase
+from app.api.deps import get_db, get_current_user, require_super_admin
 from app.models.user import User
-from app.models.game import Game
-from app.models.team import Team
-from app.models.tournament import Tournament
 from app.models.admin import TournamentAdminAssignment, AuditLog
 from app.models.match import Match
 from app.models.dispute import Dispute
@@ -22,15 +18,15 @@ async def assign_tournament_admin(
     id: str,
     payload: AdminAssignmentCreate,
     admin_user: User = Depends(require_super_admin),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncIOMotorDatabase = Depends(get_db),
 ):
-    # Rule 2.2: Assign tournament admin
+    # Rule 2.2: Assign tournament admin in MongoDB
     assignment = TournamentAdminAssignment(
         admin_user_id=payload.admin_user_id,
         tournament_id=id,
         assigned_by=admin_user.id,
     )
-    db.add(assignment)
+    await db.tournament_admin_assignments.insert_one(assignment.to_mongo())
 
     # Record in cryptographic audit log
     await record_audit_log(
@@ -40,27 +36,26 @@ async def assign_tournament_admin(
         action="ASSIGN_TOURNAMENT_ADMIN",
         target=f"Admin {payload.admin_user_id} -> Tournament {id}",
     )
-    await db.commit()
     return {"status": "success", "message": "Tournament Admin successfully assigned"}
 
 @router.get("/audit-logs", response_model=List[AuditLogResponse])
 async def list_audit_logs(
     admin_user: User = Depends(require_super_admin),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncIOMotorDatabase = Depends(get_db),
 ):
-    result = await db.execute(select(AuditLog))
-    logs = result.scalars().all()
+    cursor = db.audit_logs.find().sort("created_at", -1).limit(100)
+    logs = await cursor.to_list(length=100)
     return [
         AuditLogResponse(
-            id=l.id,
-            timestamp=str(l.created_at),
-            operator=l.operator,
-            role=l.role,
-            action=l.action,
-            target=l.target,
-            ip_address=l.ip_address,
-            prev_hash=l.prev_hash,
-            record_hash=l.record_hash,
+            id=str(l.get("_id", l.get("id"))),
+            timestamp=str(l.get("created_at")),
+            operator=l["operator"],
+            role=l["role"],
+            action=l["action"],
+            target=l["target"],
+            ip_address=l.get("ip_address", "127.0.0.1"),
+            prev_hash=l.get("prev_hash"),
+            record_hash=l.get("record_hash"),
         )
         for l in logs
     ]
@@ -70,41 +65,45 @@ async def list_audit_logs(
 @router.get("/my-tournaments")
 async def get_my_assigned_tournaments(
     current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     if current_user.role == "SUPER_ADMIN":
-        result = await db.execute(select(Tournament))
-        return result.scalars().all()
+        cursor = db.tournaments.find()
+        docs = await cursor.to_list(length=100)
+        from app.core.database import docs_to_list
+        return docs_to_list(docs)
 
     # Query assigned tournaments
-    result = await db.execute(
-        select(Tournament)
-        .join(TournamentAdminAssignment, TournamentAdminAssignment.tournament_id == Tournament.id)
-        .where(TournamentAdminAssignment.admin_user_id == current_user.id)
-    )
-    return result.scalars().all()
+    assign_cursor = db.tournament_admin_assignments.find({"admin_user_id": current_user.id})
+    assignments = await assign_cursor.to_list(length=100)
+    tourn_ids = [a["tournament_id"] for a in assignments if a.get("tournament_id")]
+    
+    if not tourn_ids:
+        return []
+
+    cursor = db.tournaments.find({"$or": [{"_id": {"$in": tourn_ids}}, {"id": {"$in": tourn_ids}}]})
+    docs = await cursor.to_list(length=100)
+    from app.core.database import docs_to_list
+    return docs_to_list(docs)
 
 @router.post("/matches/{id}/verify-result")
 async def verify_match_result(
     id: str,
     current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncIOMotorDatabase = Depends(get_db),
 ):
-    m_res = await db.execute(select(Match).where(Match.id == id))
-    match = m_res.scalars().first()
-    if not match:
+    match_doc = await db.matches.find_one({"$or": [{"_id": id}, {"id": id}]})
+    if not match_doc:
         raise HTTPException(status_code=404, detail="Match not found")
+
+    match = Match.from_mongo(match_doc)
 
     # Verify authorization for this tournament
     if current_user.role != "SUPER_ADMIN":
-        assign_check = (
-            await db.execute(
-                select(TournamentAdminAssignment).where(
-                    TournamentAdminAssignment.admin_user_id == current_user.id,
-                    TournamentAdminAssignment.tournament_id == match.tournament_id,
-                )
-            )
-        ).scalars().first()
+        assign_check = await db.tournament_admin_assignments.find_one({
+            "admin_user_id": current_user.id,
+            "tournament_id": match.tournament_id,
+        })
         if not assign_check:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -129,7 +128,6 @@ async def verify_match_result(
         action="VERIFY_MATCH_RESULT",
         target=f"Match {match.id} (Winner: {winner_team_id})",
     )
-    await db.commit()
 
     from app.core.ws import ws_manager
     await ws_manager.broadcast({
@@ -147,53 +145,50 @@ async def verify_match_result(
         "next_match_id": next_match.id if next_match else None,
     }
 
-
 @router.post("/users/{id}/promote-organizer")
 async def promote_user_to_organizer(
     id: str,
     admin_user: User = Depends(require_super_admin),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """
     Promote an existing player account to ORGANIZER (Rule 22).
     """
-    res = await db.execute(select(User).where(User.id == id))
-    user = res.scalars().first()
-    if not user:
+    user_doc = await db.users.find_one({"$or": [{"_id": id}, {"id": id}]})
+    if not user_doc:
         raise HTTPException(status_code=404, detail="User not found")
 
-    user.role = "ORGANIZER"
+    await db.users.update_one({"_id": user_doc["_id"]}, {"$set": {"role": "ORGANIZER"}})
 
     await record_audit_log(
         db=db,
         operator=admin_user.username,
         role="SUPER_ADMIN",
         action="PROMOTE_ORGANIZER",
-        target=f"User {user.username} ({user.id}) -> ORGANIZER",
+        target=f"User {user_doc['username']} ({id}) -> ORGANIZER",
     )
-    await db.commit()
-    return {"status": "success", "message": f"User {user.username} successfully promoted to ORGANIZER"}
+    return {"status": "success", "message": f"User {user_doc['username']} successfully promoted to ORGANIZER"}
 
 @router.get("/users")
 async def list_platform_users(
     admin_user: User = Depends(require_super_admin),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """
     List all platform users with role indicators for Super Admin dashboard.
     """
-    res = await db.execute(select(User))
-    users = res.scalars().all()
+    cursor = db.users.find()
+    users = await cursor.to_list(length=100)
     return [
         {
-            "id": u.id,
-            "clerk_user_id": u.clerk_user_id,
-            "username": u.username,
-            "display_name": u.display_name,
-            "email": u.email,
-            "role": u.role,
-            "inr_balance": u.inr_balance,
-            "created_at": str(u.created_at),
+            "id": str(u.get("_id", u.get("id"))),
+            "clerk_user_id": u.get("clerk_user_id"),
+            "username": u["username"],
+            "display_name": u.get("display_name"),
+            "email": u["email"],
+            "role": u.get("role", "PLAYER"),
+            "inr_balance": u.get("inr_balance", "0"),
+            "created_at": str(u.get("created_at")),
         }
         for u in users
     ]
@@ -201,21 +196,21 @@ async def list_platform_users(
 @router.get("/disputes", response_model=List[DisputeResponse])
 async def list_disputes(
     admin_user: User = Depends(require_super_admin),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncIOMotorDatabase = Depends(get_db),
 ):
-    res = await db.execute(select(Dispute))
-    disputes = res.scalars().all()
+    cursor = db.disputes.find().sort("created_at", -1)
+    disputes = await cursor.to_list(length=100)
     return [
         DisputeResponse(
-            id=d.id,
-            tournament_id=d.tournament_id,
-            match_id=d.match_id,
-            submitted_by=d.submitted_by,
-            reason=d.reason,
-            description=d.description,
-            evidence_url=d.evidence_url,
-            status=d.status,
-            created_at=str(d.created_at),
+            id=str(d.get("_id", d.get("id"))),
+            tournament_id=d["tournament_id"],
+            match_id=d["match_id"],
+            submitted_by=d["submitted_by"],
+            reason=d["reason"],
+            description=d["description"],
+            evidence_url=d.get("evidence_url"),
+            status=d.get("status", "OPEN"),
+            created_at=str(d.get("created_at")),
         )
         for d in disputes
     ]
@@ -225,76 +220,65 @@ async def resolve_dispute(
     id: str,
     payload: DisputeResolve,
     admin_user: User = Depends(require_super_admin),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncIOMotorDatabase = Depends(get_db),
 ):
-    res = await db.execute(select(Dispute).where(Dispute.id == id))
-    dispute = res.scalars().first()
-    if not dispute:
+    dispute_doc = await db.disputes.find_one({"$or": [{"_id": id}, {"id": id}]})
+    if not dispute_doc:
         raise HTTPException(status_code=404, detail="Dispute not found")
 
-    dispute.status = payload.decision
-    dispute.resolution_notes = payload.resolution_notes
-    dispute.resolved_by = admin_user.id
+    await db.disputes.update_one(
+        {"_id": dispute_doc["_id"]},
+        {"$set": {
+            "status": payload.decision,
+            "resolution_notes": payload.resolution_notes,
+            "resolved_by": admin_user.id,
+        }}
+    )
 
     # Unfreeze associated match if it was suspended in DISPUTED state
-    if dispute.match_id:
-        m_res = await db.execute(select(Match).where(Match.id == dispute.match_id))
-        match = m_res.scalars().first()
-        if match and match.status == "DISPUTED":
-            if match.score_a is not None and match.score_b is not None:
-                match.status = "PENDING_VERIFICATION"
-            else:
-                match.status = "LIVE"
-            match.dispute_notes = f"Dispute resolved ({payload.decision}): {payload.resolution_notes}"
+    match_id = dispute_doc.get("match_id")
+    if match_id:
+        match_doc = await db.matches.find_one({"$or": [{"_id": match_id}, {"id": match_id}]})
+        if match_doc and match_doc.get("status") == "DISPUTED":
+            new_status = "PENDING_VERIFICATION" if (match_doc.get("score_a") is not None and match_doc.get("score_b") is not None) else "LIVE"
+            notes = f"Dispute resolved ({payload.decision}): {payload.resolution_notes}"
+            await db.matches.update_one(
+                {"_id": match_doc["_id"]},
+                {"$set": {"status": new_status, "dispute_notes": notes}}
+            )
 
     await record_audit_log(
         db=db,
         operator=admin_user.username,
         role="SUPER_ADMIN",
         action="RESOLVE_DISPUTE",
-        target=f"Dispute {dispute.id} ({payload.decision})",
+        target=f"Dispute {id} ({payload.decision})",
         details=payload.resolution_notes,
     )
-    await db.commit()
     return {
         "status": "success",
-        "message": f"Dispute {dispute.id} marked as {payload.decision} by Super Admin",
+        "message": f"Dispute {id} marked as {payload.decision} by Super Admin",
     }
 
 @router.get("/stats")
 async def get_admin_stats(
     admin_user: User = Depends(require_super_admin),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """
-    Real-time platform KPI statistics for Super Admin dashboard.
+    Real-time platform KPI statistics for Super Admin dashboard from MongoDB.
     """
-    total_users_res = await db.execute(select(func.count(User.id)))
-    total_users = total_users_res.scalar() or 0
-
-    total_tournaments_res = await db.execute(select(func.count(Tournament.id)))
-    total_tournaments = total_tournaments_res.scalar() or 0
-
-    active_tournaments_res = await db.execute(
-        select(func.count(Tournament.id)).where(Tournament.status.in_(["REGISTRATION_OPEN", "ONGOING"]))
-    )
-    active_tournaments = active_tournaments_res.scalar() or 0
-
-    total_teams_res = await db.execute(select(func.count(Team.id)))
-    total_teams = total_teams_res.scalar() or 0
-
-    total_games_res = await db.execute(select(func.count(Game.id)))
-    total_games = total_games_res.scalar() or 0
-
-    pending_disputes_res = await db.execute(
-        select(func.count(Dispute.id)).where(Dispute.status == "OPEN")
-    )
-    pending_disputes = pending_disputes_res.scalar() or 0
-
-    active_matches_res = await db.execute(
-        select(func.count(Match.id)).where(Match.status.in_(["LIVE", "CHECK_IN_OPEN", "PENDING_VERIFICATION", "DISPUTED"]))
-    )
-    active_matches = active_matches_res.scalar() or 0
+    total_users = await db.users.count_documents({})
+    total_tournaments = await db.tournaments.count_documents({})
+    active_tournaments = await db.tournaments.count_documents({
+        "status": {"$in": ["REGISTRATION_OPEN", "ONGOING", "LIVE"]}
+    })
+    total_teams = await db.teams.count_documents({})
+    total_games = await db.games.count_documents({})
+    pending_disputes = await db.disputes.count_documents({"status": "OPEN"})
+    active_matches = await db.matches.count_documents({
+        "status": {"$in": ["LIVE", "CHECK_IN_OPEN", "PENDING_VERIFICATION", "DISPUTED"]}
+    })
 
     return {
         "total_users": total_users,
@@ -310,8 +294,9 @@ async def get_admin_stats(
 @router.post("/seed-catalog")
 async def trigger_seed_catalog(
     admin_user: User = Depends(require_super_admin),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     from app.seed import populate_seed_data
     await populate_seed_data(db)
     return {"status": "success", "message": "Platform seed data created successfully"}
+

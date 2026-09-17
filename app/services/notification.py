@@ -1,9 +1,9 @@
 from typing import Optional
-from sqlalchemy.ext.asyncio import AsyncSession
+from motor.motor_asyncio import AsyncIOMotorDatabase
 from app.models.notification import Notification
 
 async def create_notification(
-    db: AsyncSession,
+    db: AsyncIOMotorDatabase,
     user_id: str,
     title: str,
     message: str,
@@ -12,7 +12,7 @@ async def create_notification(
     metadata_json: str = "{}",
 ) -> Notification:
     """
-    Create a persisted notification record for a user.
+    Create a persisted notification record for a user in MongoDB.
     """
     notif = Notification(
         user_id=user_id,
@@ -23,7 +23,6 @@ async def create_notification(
         metadata_json=metadata_json,
         is_read=False,
     )
-    db.add(notif)
-    await db.commit()
-    await db.refresh(notif)
+    await db.notifications.insert_one(notif.to_mongo())
     return notif
+

@@ -5,15 +5,14 @@ import httpx
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
+from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from app.api.deps import get_db, get_current_user
 from app.core.config import settings
 from app.models.user import User
-from app.models.tournament import Tournament, TournamentRegistration
-from app.models.team import Team
+from app.models.tournament import TournamentRegistration
 from app.services.audit import record_audit_log
+from app.services.notification import create_notification
 
 router = APIRouter()
 
@@ -30,55 +29,51 @@ class PaymentVerifyRequest(BaseModel):
 async def create_escrow_order(
     payload: OrderCreateRequest,
     current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """
     Creates an escrow order for tournament entry fee via Razorpay.
     """
-    t_res = await db.execute(select(Tournament).where(Tournament.id == payload.tournament_id))
-    tourn = t_res.scalars().first()
+    tourn = await db.tournaments.find_one({"$or": [{"_id": payload.tournament_id}, {"id": payload.tournament_id}]})
     if not tourn:
         raise HTTPException(status_code=404, detail="Tournament not found")
 
-    if tourn.status != "REGISTRATION_OPEN":
+    if tourn.get("status") != "REGISTRATION_OPEN":
         raise HTTPException(status_code=400, detail="Tournament registration is not open")
 
-    team_res = await db.execute(select(Team).where(Team.id == payload.team_id))
-    team = team_res.scalars().first()
+    team = await db.teams.find_one({"$or": [{"_id": payload.team_id}, {"id": payload.team_id}]})
     if not team:
         raise HTTPException(status_code=404, detail="Team not found")
 
-    if team.captain_id != current_user.id and current_user.role != "SUPER_ADMIN":
+    if team.get("captain_id") != current_user.id and current_user.role != "SUPER_ADMIN":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only the squad captain can initiate payment for registration",
         )
 
-    # Check capacity
-    reg_count = (
-        await db.execute(
-            select(func.count(TournamentRegistration.id)).where(
-                TournamentRegistration.tournament_id == tourn.id
-            )
-        )
-    ).scalar() or 0
+    tourn_id = str(tourn.get("_id", tourn.get("id")))
+    team_id = str(team.get("_id", team.get("id")))
 
-    if reg_count >= tourn.max_teams:
+    # Check capacity
+    reg_count = await db.tournament_registrations.count_documents({
+        "$or": [{"tournament_id": tourn_id}, {"tournament_id": tourn.get("slug")}]
+    })
+
+    if reg_count >= tourn.get("max_teams", 16):
         raise HTTPException(status_code=400, detail="Tournament is at maximum capacity")
 
-    amount_inr = tourn.entry_fee_inr
+    amount_inr = tourn.get("entry_fee_inr", 0)
     amount_paise = amount_inr * 100
 
     # If free tournament, create immediate PAID registration
     if amount_inr == 0:
         reg = TournamentRegistration(
-            tournament_id=tourn.id,
-            team_id=team.id,
+            tournament_id=tourn_id,
+            team_id=team_id,
             payment_status="FREE",
             check_in_status="PENDING",
         )
-        db.add(reg)
-        await db.commit()
+        await db.tournament_registrations.insert_one(reg.to_mongo())
         return {
             "status": "free",
             "message": "Free entry tournament. Registration confirmed.",
@@ -97,10 +92,10 @@ async def create_escrow_order(
                     json={
                         "amount": amount_paise,
                         "currency": "INR",
-                        "receipt": f"rcpt_{tourn.slug[:8]}_{team.id[:6]}",
+                        "receipt": f"rcpt_{tourn.get('slug', 't')[:8]}_{team_id[:6]}",
                         "notes": {
-                            "tournament_id": tourn.id,
-                            "team_id": team.id,
+                            "tournament_id": tourn_id,
+                            "team_id": team_id,
                             "captain_id": current_user.id,
                         },
                     },
@@ -109,32 +104,28 @@ async def create_escrow_order(
                 if res.status_code == 200:
                     rzp_order_id = res.json().get("id", rzp_order_id)
         except Exception:
-            pass  # Fall back to sandbox order id
+            pass
 
     # Check existing pending registration
-    existing_reg = (
-        await db.execute(
-            select(TournamentRegistration).where(
-                TournamentRegistration.tournament_id == tourn.id,
-                TournamentRegistration.team_id == team.id,
-            )
-        )
-    ).scalars().first()
+    existing_reg = await db.tournament_registrations.find_one({
+        "tournament_id": tourn_id,
+        "team_id": team_id,
+    })
 
     if existing_reg:
-        existing_reg.order_id = rzp_order_id
-        existing_reg.payment_status = "PENDING"
+        await db.tournament_registrations.update_one(
+            {"_id": existing_reg["_id"]},
+            {"$set": {"order_id": rzp_order_id, "payment_status": "PENDING"}}
+        )
     else:
         reg = TournamentRegistration(
-            tournament_id=tourn.id,
-            team_id=team.id,
+            tournament_id=tourn_id,
+            team_id=team_id,
             payment_status="PENDING",
             order_id=rzp_order_id,
             check_in_status="PENDING",
         )
-        db.add(reg)
-
-    await db.commit()
+        await db.tournament_registrations.insert_one(reg.to_mongo())
 
     return {
         "status": "created",
@@ -143,15 +134,15 @@ async def create_escrow_order(
         "amount_inr": amount_inr,
         "currency": "INR",
         "key_id": settings.RAZORPAY_KEY_ID,
-        "tournament_title": tourn.title,
-        "team_name": team.name,
+        "tournament_title": tourn.get("title"),
+        "team_name": team.get("name"),
     }
 
 @router.post("/verify")
 async def verify_payment(
     payload: PaymentVerifyRequest,
     current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """
     Verifies Razorpay HMAC signature and confirms escrow deposit.
@@ -175,27 +166,26 @@ async def verify_payment(
         )
 
     # Find registration by order_id
-    reg_res = await db.execute(
-        select(TournamentRegistration).where(
-            TournamentRegistration.order_id == payload.razorpay_order_id
-        )
-    )
-    reg = reg_res.scalars().first()
+    reg = await db.tournament_registrations.find_one({
+        "order_id": payload.razorpay_order_id
+    })
     if not reg:
         raise HTTPException(status_code=404, detail="Order registration record not found")
 
-    reg.payment_status = "PAID"
+    await db.tournament_registrations.update_one(
+        {"_id": reg["_id"]},
+        {"$set": {"payment_status": "PAID"}}
+    )
 
-    # Cryptographically audit log the escrow deposit
     await record_audit_log(
         db=db,
         operator=current_user.username,
         role=current_user.role,
         action="ESCROW_DEPOSIT_VERIFIED",
-        target=f"Order {payload.razorpay_order_id} -> Tourn {reg.tournament_id}",
+        target=f"Order {payload.razorpay_order_id} -> Tourn {reg.get('tournament_id')}",
         details=f"Payment ID: {payload.razorpay_payment_id} | Signature verified via HMAC-SHA256",
     )
-    from app.services.notification import create_notification
+
     await create_notification(
         db=db,
         user_id=current_user.id,
@@ -204,7 +194,6 @@ async def verify_payment(
         notification_type="PAYMENT",
         link="/dashboard",
     )
-    await db.commit()
 
     return {
         "status": "success",
@@ -214,17 +203,14 @@ async def verify_payment(
     }
 
 @router.get("/order/{order_id}")
-async def get_order_status(order_id: str, db: AsyncSession = Depends(get_db)):
-    reg_res = await db.execute(
-        select(TournamentRegistration).where(TournamentRegistration.order_id == order_id)
-    )
-    reg = reg_res.scalars().first()
+async def get_order_status(order_id: str, db: AsyncIOMotorDatabase = Depends(get_db)):
+    reg = await db.tournament_registrations.find_one({"order_id": order_id})
     if not reg:
         raise HTTPException(status_code=404, detail="Order not found")
 
     return {
-        "order_id": reg.order_id,
-        "payment_status": reg.payment_status,
-        "tournament_id": reg.tournament_id,
-        "team_id": reg.team_id,
+        "order_id": reg.get("order_id"),
+        "payment_status": reg.get("payment_status"),
+        "tournament_id": reg.get("tournament_id"),
+        "team_id": reg.get("team_id"),
     }

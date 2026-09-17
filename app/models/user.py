@@ -1,22 +1,33 @@
-from sqlalchemy import Column, String
-from sqlalchemy.orm import relationship
-from app.core.database import Base
-from app.models.base import TimestampMixin
+from typing import Optional
+from datetime import datetime
+from pydantic import BaseModel, Field
+from app.models.base import generate_uuid, get_utc_now
 
-class User(Base, TimestampMixin):
-    __tablename__ = "users"
+class User(BaseModel):
+    id: str = Field(default_factory=generate_uuid)
+    clerk_user_id: Optional[str] = None
+    email: str
+    username: str
+    display_name: Optional[str] = None
+    avatar_url: Optional[str] = None
+    role: str = "PLAYER"
+    riot_id: Optional[str] = None
+    steam_id: Optional[str] = None
+    inr_balance: str = "0"
+    created_at: datetime = Field(default_factory=get_utc_now)
+    updated_at: datetime = Field(default_factory=get_utc_now)
 
-    id = Column(String(64), primary_key=True)  # Application User ID or Clerk ID
-    clerk_user_id = Column(String(128), unique=True, index=True, nullable=True)
-    email = Column(String(255), unique=True, index=True, nullable=False)
-    username = Column(String(64), unique=True, index=True, nullable=False)
-    display_name = Column(String(128), nullable=True)
-    avatar_url = Column(String(512), nullable=True)
-    role = Column(String(32), nullable=False, default="PLAYER")  # PLAYER, ORGANIZER, SUPER_ADMIN
-    riot_id = Column(String(64), nullable=True)
-    steam_id = Column(String(64), nullable=True)
-    inr_balance = Column(String(32), default="0")
+    def to_mongo(self) -> dict:
+        d = self.model_dump()
+        d["_id"] = d.pop("id")
+        return d
 
-    # Relationships
-    teams_created = relationship("Team", back_populates="captain")
-    team_memberships = relationship("TeamMember", back_populates="user")
+    @classmethod
+    def from_mongo(cls, doc: Optional[dict]):
+        if not doc:
+            return None
+        d = dict(doc)
+        if "_id" in d and "id" not in d:
+            d["id"] = str(d.pop("_id"))
+        return cls(**d)
+

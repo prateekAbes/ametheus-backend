@@ -1,43 +1,97 @@
-import ssl
-from typing import AsyncGenerator
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-from sqlalchemy.orm import declarative_base
+import uuid
+from typing import Optional, Any, Dict, List
+from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
 from app.core.config import settings
 
-# Configure connect_args based on database dialect
-connect_args = {}
-if "sqlite" in settings.DATABASE_URL:
-    connect_args["check_same_thread"] = False
-elif "postgresql" in settings.DATABASE_URL:
-    # If connecting to remote PostgreSQL (Render, Neon, Supabase, Railway)
-    if "localhost" not in settings.DATABASE_URL and "127.0.0.1" not in settings.DATABASE_URL:
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        connect_args["ssl"] = ctx
+# Global Motor client and database references
+_client: Optional[AsyncIOMotorClient] = None
+_db: Optional[AsyncIOMotorDatabase] = None
 
-# Engine
-engine = create_async_engine(
-    settings.DATABASE_URL,
-    echo=False,
-    future=True,
-    connect_args=connect_args,
-)
+def get_client() -> AsyncIOMotorClient:
+    global _client
+    if _client is None:
+        _client = AsyncIOMotorClient(
+            settings.MONGODB_URI,
+            serverSelectionTimeoutMS=5000,
+        )
+    return _client
 
-# Async Session Factory
-AsyncSessionLocal = async_sessionmaker(
-    engine,
-    class_=AsyncSession,
-    expire_on_commit=False,
-    autocommit=False,
-    autoflush=False,
-)
+def get_database() -> AsyncIOMotorDatabase:
+    global _db
+    if _db is None:
+        client = get_client()
+        _db = client[settings.MONGODB_DB_NAME]
+    return _db
 
-Base = declarative_base()
+def set_database(database: AsyncIOMotorDatabase):
+    """Allows test harnesses (e.g. mongomock-motor) to inject an in-memory database."""
+    global _db
+    _db = database
 
-async def get_db() -> AsyncGenerator[AsyncSession, None]:
-    async with AsyncSessionLocal() as session:
-        try:
-            yield session
-        finally:
-            await session.close()
+async def get_db() -> AsyncIOMotorDatabase:
+    """FastAPI dependency for accessing the MongoDB database."""
+    return get_database()
+
+def doc_to_dict(doc: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Converts a MongoDB document to a dict with 'id' mapped from '_id'."""
+    if doc is None:
+        return None
+    d = dict(doc)
+    if "_id" in d:
+        d["id"] = str(d["_id"])
+    return d
+
+def docs_to_list(docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Converts a list of MongoDB documents into standard dicts with mapped 'id'."""
+    return [doc_to_dict(d) for d in docs if d is not None]
+
+def generate_id() -> str:
+    return uuid.uuid4().hex
+
+async def init_db_indexes(db: AsyncIOMotorDatabase):
+    """Initializes performance and uniqueness indexes on all MongoDB collections."""
+    try:
+        # Users
+        await db.users.create_index("email", unique=True)
+        await db.users.create_index("username", unique=True)
+        await db.users.create_index("clerk_user_id", unique=True, sparse=True)
+
+        # Games
+        await db.games.create_index("slug", unique=True)
+
+        # Tournaments
+        await db.tournaments.create_index("slug", unique=True)
+        await db.tournaments.create_index("game_id")
+        await db.tournaments.create_index("organizer_id")
+        await db.tournaments.create_index("status")
+
+        # Teams
+        await db.teams.create_index("invite_code", unique=True)
+        await db.teams.create_index("captain_id")
+        await db.teams.create_index("game_id")
+
+        # Tournament Registrations
+        await db.tournament_registrations.create_index("tournament_id")
+        await db.tournament_registrations.create_index("team_id")
+        await db.tournament_registrations.create_index("player_id")
+
+        # Matches
+        await db.matches.create_index("tournament_id")
+        await db.matches.create_index("status")
+
+        # Admin Assignments
+        await db.tournament_admin_assignments.create_index([("admin_user_id", 1), ("tournament_id", 1)])
+
+        # Audit Logs
+        await db.audit_logs.create_index("created_at")
+
+        # Disputes
+        await db.disputes.create_index("tournament_id")
+        await db.disputes.create_index("match_id")
+
+        # Notifications
+        await db.notifications.create_index("user_id")
+        await db.notifications.create_index([("user_id", 1), ("is_read", 1)])
+    except Exception as e:
+        print(f"[AMETHEUS MongoDB Warning] Index initialization error: {e}")
+

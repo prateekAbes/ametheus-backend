@@ -1,7 +1,6 @@
 from typing import Optional
 from fastapi import Depends, HTTPException, status, Header
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, or_
+from motor.motor_asyncio import AsyncIOMotorDatabase
 from app.core.database import get_db
 from app.models.user import User
 from app.models.tournament import Tournament
@@ -10,7 +9,7 @@ from app.core.security import decode_token
 
 async def get_current_user(
     authorization: Optional[str] = Header(None),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncIOMotorDatabase = Depends(get_db),
 ) -> User:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(
@@ -28,21 +27,17 @@ async def get_current_user(
 
     target_id = payload["sub"]
 
-    # Authoritative DB lookup by clerk_user_id or user.id
-    result = await db.execute(
-        select(User).where(
-            or_(User.id == target_id, User.clerk_user_id == target_id)
-        )
-    )
-    user = result.scalars().first()
-
-    if not user:
+    # Authoritative DB lookup by clerk_user_id or _id / id
+    user_doc = await db.users.find_one({
+        "$or": [{"_id": target_id}, {"clerk_user_id": target_id}, {"id": target_id}]
+    })
+    if not user_doc:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Unauthorized: User not found in AMETHEUS. Please complete profile sync.",
         )
 
-    return user
+    return User.from_mongo(user_doc)
 
 async def require_player(
     current_user: User = Depends(get_current_user),
@@ -81,28 +76,27 @@ class RequireTournamentOwnershipOrAdmin:
         self,
         id: str,
         current_user: User = Depends(get_current_user),
-        db: AsyncSession = Depends(get_db),
+        db: AsyncIOMotorDatabase = Depends(get_db),
     ) -> User:
         if current_user.role == "SUPER_ADMIN":
             return current_user
 
-        t_res = await db.execute(select(Tournament).where(Tournament.id == id))
-        tourn = t_res.scalars().first()
-        if not tourn:
+        tourn_doc = await db.tournaments.find_one({"_id": id})
+        if not tourn_doc:
+            tourn_doc = await db.tournaments.find_one({"id": id})
+        if not tourn_doc:
             raise HTTPException(status_code=404, detail="Tournament not found")
 
         # Check ownership
-        if tourn.organizer_id == current_user.id:
+        if tourn_doc.get("organizer_id") == current_user.id:
             return current_user
 
         # Check assignment
-        assign_res = await db.execute(
-            select(TournamentAdminAssignment).where(
-                TournamentAdminAssignment.admin_user_id == current_user.id,
-                TournamentAdminAssignment.tournament_id == id,
-            )
-        )
-        if assign_res.scalars().first():
+        assign_doc = await db.tournament_admin_assignments.find_one({
+            "admin_user_id": current_user.id,
+            "tournament_id": id,
+        })
+        if assign_doc:
             return current_user
 
         raise HTTPException(
@@ -112,3 +106,4 @@ class RequireTournamentOwnershipOrAdmin:
 
 # Backward-compatible alias
 RequireTournamentAdmin = RequireTournamentOwnershipOrAdmin
+

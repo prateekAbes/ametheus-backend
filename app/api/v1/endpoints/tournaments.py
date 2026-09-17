@@ -1,12 +1,9 @@
 import json
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
+from motor.motor_asyncio import AsyncIOMotorDatabase
 from app.api.deps import get_db, get_current_user
 from app.models.user import User
-from app.models.game import Game
-from app.models.team import Team, TeamMember
 from app.models.tournament import Tournament, TournamentRegistration
 from app.schemas import TournamentResponse, TournamentRegisterRequest
 
@@ -26,61 +23,59 @@ def safe_json_loads(val, default):
 async def list_tournaments(
     game: Optional[str] = None,
     status: Optional[str] = None,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncIOMotorDatabase = Depends(get_db),
 ):
-    query = select(Tournament)
+    filter_query = {}
     if status:
-        query = query.where(Tournament.status == status)
+        filter_query["status"] = status
 
-    result = await db.execute(query)
-    tournaments = result.scalars().all()
+    cursor = db.tournaments.find(filter_query)
+    tournaments = await cursor.to_list(length=100)
 
     response = []
     for t in tournaments:
-        g_res = await db.execute(select(Game).where(Game.id == t.game_id))
-        game_obj = g_res.scalars().first()
-        if game and game_obj and game_obj.slug != game:
+        tid = str(t.get("_id", t.get("id")))
+        gid = t.get("game_id")
+        game_obj = await db.games.find_one({"$or": [{"_id": gid}, {"id": gid}, {"slug": gid}]})
+        
+        if game and game_obj and game_obj.get("slug") != game:
             continue
 
-        reg_count = (
-            await db.execute(
-                select(func.count(TournamentRegistration.id)).where(
-                    TournamentRegistration.tournament_id == t.id
-                )
-            )
-        ).scalar() or 0
+        reg_count = await db.tournament_registrations.count_documents({
+            "$or": [{"tournament_id": tid}, {"tournament_id": t.get("slug")}]
+        })
 
-        rules = safe_json_loads(t.rules_json, [])
-        schedule = safe_json_loads(t.schedule_json, [])
-        prizes = safe_json_loads(t.prizes_json, [])
-        bracket = safe_json_loads(t.bracket_json, [])
+        rules = safe_json_loads(t.get("rules", t.get("rules_json")), [])
+        schedule = safe_json_loads(t.get("schedule", t.get("schedule_json")), [])
+        prizes = safe_json_loads(t.get("prizes", t.get("prizes_json")), [])
+        bracket = safe_json_loads(t.get("bracket_rounds", t.get("bracket_json")), [])
 
-        prize_inr = t.prize_pool_inr if t.prize_pool_inr is not None else 0
-        fee_inr = t.entry_fee_inr if t.entry_fee_inr is not None else 0
+        prize_inr = t.get("prize_pool_inr") or 0
+        fee_inr = t.get("entry_fee_inr") or 0
 
         response.append(
             TournamentResponse(
-                id=t.id,
-                slug=t.slug,
-                organizer_id=t.organizer_id,
-                title=t.title,
-                game_slug=game_obj.slug if game_obj else "valorant",
-                game_name=game_obj.name if game_obj else "Valorant",
+                id=tid,
+                slug=t["slug"],
+                organizer_id=t.get("organizer_id"),
+                title=t["title"],
+                game_slug=game_obj["slug"] if game_obj else "valorant",
+                game_name=game_obj["name"] if game_obj else "Valorant",
                 prize_pool=f"₹{prize_inr:,}",
                 prize_pool_inr=prize_inr,
                 entry_fee=f"₹{fee_inr} / Team" if fee_inr > 0 else "₹0 / Free",
                 entry_fee_inr=fee_inr,
-                status=t.status or "REGISTRATION_OPEN",
-                starts_at=t.starts_at or "TBD",
-                roster_lock_time=t.roster_lock_time or "TBD",
-                server_region=t.server_region or "AWS Mumbai (ap-south-1)",
+                status=t.get("status", "REGISTRATION_OPEN"),
+                starts_at=t.get("starts_at", "TBD"),
+                roster_lock_time=t.get("roster_lock_time", "TBD"),
+                server_region=t.get("server_region", "AWS Mumbai (ap-south-1)"),
                 registered_teams=reg_count,
-                max_teams=t.max_teams or 16,
-                rank_requirement=t.rank_requirement,
-                format=t.format,
-                banner_url=t.banner_url or "https://lh3.googleusercontent.com/aida-public/AB6AXuD-g0bK72p2tQe7b3Z3F5WzX8oV0h4vM1bX2m9x_banner",
-                badge_color=t.badge_color or "#E56A10",
-                description=t.description or "",
+                max_teams=t.get("max_teams", 16),
+                rank_requirement=t.get("rank_requirement", "Open to All Ranks"),
+                format=t.get("format", "Single Elimination Bracket"),
+                banner_url=t.get("banner_url", "https://lh3.googleusercontent.com/aida-public/AB6AXuD-g0bK72p2tQe7b3Z3F5WzX8oV0h4vM1bX2m9x_banner"),
+                badge_color=t.get("badge_color", "#E56A10"),
+                description=t.get("description", ""),
                 rules=rules,
                 schedule=schedule,
                 prizes=prizes,
@@ -91,57 +86,51 @@ async def list_tournaments(
     return response
 
 @router.get("/{slug}", response_model=TournamentResponse)
-async def get_tournament_by_slug(slug: str, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(
-        select(Tournament).where(
-            (Tournament.slug == slug) | (Tournament.id == slug)
-        )
-    )
-    t = result.scalars().first()
+async def get_tournament_by_slug(slug: str, db: AsyncIOMotorDatabase = Depends(get_db)):
+    t = await db.tournaments.find_one({
+        "$or": [{"slug": slug}, {"_id": slug}, {"id": slug}]
+    })
     if not t:
         raise HTTPException(status_code=404, detail="Tournament not found")
 
-    g_res = await db.execute(select(Game).where(Game.id == t.game_id))
-    game_obj = g_res.scalars().first()
+    tid = str(t.get("_id", t.get("id")))
+    gid = t.get("game_id")
+    game_obj = await db.games.find_one({"$or": [{"_id": gid}, {"id": gid}, {"slug": gid}]})
 
-    reg_count = (
-        await db.execute(
-            select(func.count(TournamentRegistration.id)).where(
-                TournamentRegistration.tournament_id == t.id
-            )
-        )
-    ).scalar() or 0
+    reg_count = await db.tournament_registrations.count_documents({
+        "$or": [{"tournament_id": tid}, {"tournament_id": t.get("slug")}]
+    })
 
-    rules = safe_json_loads(t.rules_json, [])
-    schedule = safe_json_loads(t.schedule_json, [])
-    prizes = safe_json_loads(t.prizes_json, [])
-    bracket = safe_json_loads(t.bracket_json, [])
+    rules = safe_json_loads(t.get("rules", t.get("rules_json")), [])
+    schedule = safe_json_loads(t.get("schedule", t.get("schedule_json")), [])
+    prizes = safe_json_loads(t.get("prizes", t.get("prizes_json")), [])
+    bracket = safe_json_loads(t.get("bracket_rounds", t.get("bracket_json")), [])
 
-    prize_inr = t.prize_pool_inr if t.prize_pool_inr is not None else 0
-    fee_inr = t.entry_fee_inr if t.entry_fee_inr is not None else 0
+    prize_inr = t.get("prize_pool_inr") or 0
+    fee_inr = t.get("entry_fee_inr") or 0
 
     return TournamentResponse(
-        id=t.id,
-        slug=t.slug,
-        organizer_id=t.organizer_id,
-        title=t.title,
-        game_slug=game_obj.slug if game_obj else "valorant",
-        game_name=game_obj.name if game_obj else "Valorant",
+        id=tid,
+        slug=t["slug"],
+        organizer_id=t.get("organizer_id"),
+        title=t["title"],
+        game_slug=game_obj["slug"] if game_obj else "valorant",
+        game_name=game_obj["name"] if game_obj else "Valorant",
         prize_pool=f"₹{prize_inr:,}",
         prize_pool_inr=prize_inr,
         entry_fee=f"₹{fee_inr} / Team" if fee_inr > 0 else "₹0 / Free",
         entry_fee_inr=fee_inr,
-        status=t.status or "REGISTRATION_OPEN",
-        starts_at=t.starts_at or "TBD",
-        roster_lock_time=t.roster_lock_time or "TBD",
-        server_region=t.server_region or "AWS Mumbai (ap-south-1)",
+        status=t.get("status", "REGISTRATION_OPEN"),
+        starts_at=t.get("starts_at", "TBD"),
+        roster_lock_time=t.get("roster_lock_time", "TBD"),
+        server_region=t.get("server_region", "AWS Mumbai (ap-south-1)"),
         registered_teams=reg_count,
-        max_teams=t.max_teams or 16,
-        rank_requirement=t.rank_requirement or "Open to All Ranks",
-        format=t.format or "Single Elimination Bracket",
-        banner_url=t.banner_url or "https://lh3.googleusercontent.com/aida-public/AB6AXuD-g0bK72p2tQe7b3Z3F5WzX8oV0h4vM1bX2m9x_banner",
-        badge_color=t.badge_color or "#E56A10",
-        description=t.description or "",
+        max_teams=t.get("max_teams", 16),
+        rank_requirement=t.get("rank_requirement", "Open to All Ranks"),
+        format=t.get("format", "Single Elimination Bracket"),
+        banner_url=t.get("banner_url", "https://lh3.googleusercontent.com/aida-public/AB6AXuD-g0bK72p2tQe7b3Z3F5WzX8oV0h4vM1bX2m9x_banner"),
+        badge_color=t.get("badge_color", "#E56A10"),
+        description=t.get("description", ""),
         rules=rules,
         schedule=schedule,
         prizes=prizes,
@@ -154,10 +143,10 @@ async def register_team_for_tournament(
     id: str,
     payload: TournamentRegisterRequest,
     current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """
-    Section 39: Complete Tournament Registration Validation:
+    Section 39: Complete Tournament Registration Validation in MongoDB:
     - Tournament exists
     - Registration is currently open
     - Tournament capacity has not been reached
@@ -166,89 +155,87 @@ async def register_team_for_tournament(
     - Team belongs to correct game discipline
     - Team is not already registered
     """
-    t_res = await db.execute(select(Tournament).where(Tournament.id == id))
-    tourn = t_res.scalars().first()
+    tourn = await db.tournaments.find_one({"$or": [{"_id": id}, {"id": id}]})
     if not tourn:
         raise HTTPException(status_code=404, detail="Tournament not found")
 
+    tid = str(tourn.get("_id", tourn.get("id")))
+
     # 1. Registration open check
-    if tourn.status != "REGISTRATION_OPEN":
+    if tourn.get("status") != "REGISTRATION_OPEN":
         raise HTTPException(
             status_code=400,
-            detail=f"Registration is not open for this tournament (current status: {tourn.status})",
+            detail=f"Registration is not open for this tournament (current status: {tourn.get('status')})",
         )
 
     # 2. Capacity check
-    reg_count = (
-        await db.execute(
-            select(func.count(TournamentRegistration.id)).where(
-                TournamentRegistration.tournament_id == tourn.id
-            )
-        )
-    ).scalar() or 0
+    reg_count = await db.tournament_registrations.count_documents({
+        "$or": [{"tournament_id": tid}, {"tournament_id": tourn.get("slug")}]
+    })
 
-    if reg_count >= tourn.max_teams:
+    max_teams = tourn.get("max_teams", 16)
+    if reg_count >= max_teams:
         raise HTTPException(
             status_code=400,
-            detail=f"Tournament capacity of {tourn.max_teams} squads has been reached",
+            detail=f"Tournament capacity of {max_teams} squads has been reached",
         )
 
     # 3. Team check
-    team_res = await db.execute(select(Team).where(Team.id == payload.team_id))
-    team = team_res.scalars().first()
+    team = await db.teams.find_one({"$or": [{"_id": payload.team_id}, {"id": payload.team_id}]})
     if not team:
         raise HTTPException(status_code=404, detail="Team not found")
 
+    team_id = str(team.get("_id", team.get("id")))
+
     # 4. Captain authorization
-    if team.captain_id != current_user.id:
+    if team.get("captain_id") != current_user.id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only the verified squad captain can register this team",
         )
 
     # 5. Game discipline match
-    if team.game_id != tourn.game_id:
+    if team.get("game_id") != tourn.get("game_id"):
         raise HTTPException(
             status_code=400,
             detail="Your squad is registered for a different competitive title than this tournament",
         )
 
     # 6. Duplicate registration check
-    existing_reg = (
-        await db.execute(
-            select(TournamentRegistration).where(
-                TournamentRegistration.tournament_id == tourn.id,
-                TournamentRegistration.team_id == team.id,
-            )
-        )
-    ).scalars().first()
+    existing_reg = await db.tournament_registrations.find_one({
+        "tournament_id": tid,
+        "team_id": team_id,
+    })
 
     if existing_reg:
         raise HTTPException(status_code=400, detail="Team is already registered for this tournament")
 
+    fee_inr = tourn.get("entry_fee_inr", 0)
+
     # 7. Create registration record
     reg = TournamentRegistration(
-        tournament_id=tourn.id,
-        team_id=team.id,
-        payment_status="PAID" if tourn.entry_fee_inr > 0 else "FREE",
-        order_id="order_rzp_mock_123" if tourn.entry_fee_inr > 0 else None,
+        tournament_id=tid,
+        team_id=team_id,
+        payment_status="PAID" if fee_inr > 0 else "FREE",
+        order_id="order_rzp_mock_123" if fee_inr > 0 else None,
         check_in_status="PENDING",
     )
-    db.add(reg)
+    await db.tournament_registrations.insert_one(reg.to_mongo())
+
     from app.services.notification import create_notification
     await create_notification(
         db=db,
         user_id=current_user.id,
         title="Tournament Registered",
-        message=f'Squad "{team.name}" is confirmed for "{tourn.title}". Check bracket schedule for match timings.',
+        message=f'Squad "{team["name"]}" is confirmed for "{tourn["title"]}". Check bracket schedule for match timings.',
         notification_type="TOURNAMENT",
-        link=f"/tournaments/{tourn.slug}",
+        link=f"/tournaments/{tourn['slug']}",
     )
-    await db.commit()
 
     return {
         "status": "success",
-        "message": f'Squad "{team.name}" successfully registered for {tourn.title}!',
+        "message": f'Squad "{team["name"]}" successfully registered for {tourn["title"]}!',
         "order_id": reg.order_id,
-        "entry_fee_inr": tourn.entry_fee_inr,
+        "entry_fee_inr": fee_inr,
     }
+

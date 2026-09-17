@@ -1,53 +1,94 @@
 import json
-from sqlalchemy import Column, String, Integer, ForeignKey, Text
-from sqlalchemy.orm import relationship
-from app.core.database import Base
-from app.models.base import TimestampMixin, generate_uuid
+from typing import Optional, List, Any
+from datetime import datetime
+from pydantic import BaseModel, Field
+from app.models.base import generate_uuid, get_utc_now
 
-class Tournament(Base, TimestampMixin):
-    __tablename__ = "tournaments"
+class Tournament(BaseModel):
+    id: str = Field(default_factory=generate_uuid)
+    slug: str
+    game_id: str
+    organizer_id: Optional[str] = None
+    title: str
+    prize_pool_inr: int = 0
+    entry_fee_inr: int = 0
+    status: str = "REGISTRATION_OPEN"  # DRAFT, REGISTRATION_OPEN, REGISTRATION_CLOSED, UPCOMING, LIVE, COMPLETED, CANCELLED
+    starts_at: str
+    roster_lock_time: str
+    server_region: str = "AWS Mumbai (ap-south-1)"
+    max_teams: int = 16
+    rank_requirement: str = "Open to All Ranks"
+    format: str = "Single Elimination Bracket"
+    banner_url: str
+    badge_color: str = "#E56A10"
+    description: str = ""
+    rules: List[Any] = Field(default_factory=list)
+    schedule: List[Any] = Field(default_factory=list)
+    prizes: List[Any] = Field(default_factory=list)
+    bracket_rounds: List[Any] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=get_utc_now)
+    updated_at: datetime = Field(default_factory=get_utc_now)
 
-    id = Column(String(36), primary_key=True, default=generate_uuid)
-    slug = Column(String(128), unique=True, index=True, nullable=False)
-    game_id = Column(String(36), ForeignKey("games.id"), nullable=False)
-    organizer_id = Column(String(64), ForeignKey("users.id"), nullable=True, index=True)
-    title = Column(String(255), nullable=False)
-    prize_pool_inr = Column(Integer, default=0, nullable=False)
-    entry_fee_inr = Column(Integer, default=0, nullable=False)
-    status = Column(String(32), default="REGISTRATION_OPEN", nullable=False)  # DRAFT, REGISTRATION_OPEN, REGISTRATION_CLOSED, UPCOMING, LIVE, COMPLETED, CANCELLED
-    starts_at = Column(String(64), nullable=False)
-    roster_lock_time = Column(String(64), nullable=False)
-    server_region = Column(String(128), default="AWS Mumbai (ap-south-1)")
-    max_teams = Column(Integer, default=16, nullable=False)
-    rank_requirement = Column(String(64), default="Open to All Ranks")
-    format = Column(String(128), default="Single Elimination Bracket")
-    banner_url = Column(String(512), nullable=False)
-    badge_color = Column(String(32), default="#E56A10")
-    description = Column(Text, nullable=False)
-    rules_json = Column(Text, nullable=False, default="[]")
-    schedule_json = Column(Text, nullable=False, default="[]")
-    prizes_json = Column(Text, nullable=False, default="[]")
-    bracket_json = Column(Text, nullable=False, default="[]")
+    @property
+    def rules_json(self) -> str:
+        return json.dumps(self.rules)
 
-    # Relationships
-    game = relationship("Game", back_populates="tournaments")
-    organizer = relationship("User", foreign_keys=[organizer_id])
-    registrations = relationship("TournamentRegistration", back_populates="tournament")
-    matches = relationship("Match", back_populates="tournament")
-    admin_assignments = relationship("TournamentAdminAssignment", back_populates="tournament")
+    @property
+    def schedule_json(self) -> str:
+        return json.dumps(self.schedule)
 
-class TournamentRegistration(Base, TimestampMixin):
-    __tablename__ = "tournament_registrations"
+    @property
+    def prizes_json(self) -> str:
+        return json.dumps(self.prizes)
 
-    id = Column(String(36), primary_key=True, default=generate_uuid)
-    tournament_id = Column(String(36), ForeignKey("tournaments.id", ondelete="CASCADE"), nullable=False)
-    team_id = Column(String(36), ForeignKey("teams.id", ondelete="CASCADE"), nullable=True)
-    player_id = Column(String(64), ForeignKey("users.id", ondelete="CASCADE"), nullable=True)
-    payment_status = Column(String(32), default="FREE", nullable=False)  # FREE, PENDING, PAID, REFUNDED
-    order_id = Column(String(64), nullable=True)
-    check_in_status = Column(String(32), default="PENDING", nullable=False)  # PENDING, CHECKED_IN
+    @property
+    def bracket_json(self) -> str:
+        return json.dumps(self.bracket_rounds)
 
-    # Relationships
-    tournament = relationship("Tournament", back_populates="registrations")
-    team = relationship("Team", back_populates="registrations")
-    player = relationship("User", foreign_keys=[player_id])
+    def to_mongo(self) -> dict:
+        d = self.model_dump()
+        d["_id"] = d.pop("id")
+        return d
+
+    @classmethod
+    def from_mongo(cls, doc: Optional[dict]):
+        if not doc:
+            return None
+        d = dict(doc)
+        if "_id" in d and "id" not in d:
+            d["id"] = str(d.pop("_id"))
+        # Parse legacy JSON strings if migrated from SQL
+        for field in ["rules", "schedule", "prizes", "bracket_rounds"]:
+            legacy_field = field.replace("bracket_rounds", "bracket") + "_json"
+            if legacy_field in d and field not in d:
+                try:
+                    d[field] = json.loads(d.pop(legacy_field))
+                except Exception:
+                    d[field] = []
+        return cls(**d)
+
+class TournamentRegistration(BaseModel):
+    id: str = Field(default_factory=generate_uuid)
+    tournament_id: str
+    team_id: Optional[str] = None
+    player_id: Optional[str] = None
+    payment_status: str = "FREE"  # FREE, PENDING, PAID, REFUNDED
+    order_id: Optional[str] = None
+    check_in_status: str = "PENDING"  # PENDING, CHECKED_IN
+    created_at: datetime = Field(default_factory=get_utc_now)
+    updated_at: datetime = Field(default_factory=get_utc_now)
+
+    def to_mongo(self) -> dict:
+        d = self.model_dump()
+        d["_id"] = d.pop("id")
+        return d
+
+    @classmethod
+    def from_mongo(cls, doc: Optional[dict]):
+        if not doc:
+            return None
+        d = dict(doc)
+        if "_id" in d and "id" not in d:
+            d["id"] = str(d.pop("_id"))
+        return cls(**d)
+

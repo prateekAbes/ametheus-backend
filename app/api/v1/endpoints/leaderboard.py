@@ -1,13 +1,8 @@
 from typing import List, Optional
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
-from sqlalchemy.orm import selectinload
-from app.core.database import get_db
-from app.models.team import Team
-from app.models.game import Game
-from app.models.user import User
-from app.models.match import Match
+from motor.motor_asyncio import AsyncIOMotorDatabase
+
+from app.api.deps import get_db
 from app.schemas import LeaderboardEntryResponse
 
 router = APIRouter()
@@ -78,49 +73,51 @@ MOCK_LEADERBOARD = [
 @router.get("", response_model=List[LeaderboardEntryResponse])
 async def get_leaderboard(
     category: Optional[str] = Query(None),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     entries: List[dict] = []
 
     try:
         # Query real teams from database
-        t_res = await db.execute(
-            select(Team)
-            .options(selectinload(Team.game), selectinload(Team.captain))
-        )
-        db_teams = t_res.scalars().all()
+        cursor = db.teams.find({})
+        db_teams = await cursor.to_list(length=100)
 
         for idx, team in enumerate(db_teams):
-            game_slug = team.game.slug if team.game else "valorant"
-            game_name = team.game.name if team.game else "Valorant"
-            game_cat = team.game.category if team.game else "pc"
-            captain_user = f"@{team.captain.username}" if team.captain else "@captain"
+            team_id = str(team.get("_id", team.get("id")))
+            gid = team.get("game_id")
+            game = await db.games.find_one({"$or": [{"_id": gid}, {"id": gid}, {"slug": gid}]}) if gid else None
+            game_slug = game["slug"] if game else "valorant"
+            game_name = game["name"] if game else "Valorant"
+            game_cat = game.get("category", "pc") if game else "pc"
+
+            cap_id = team.get("captain_id")
+            captain = await db.users.find_one({"$or": [{"_id": cap_id}, {"id": cap_id}]}) if cap_id else None
+            captain_user = f"@{captain['username']}" if captain and captain.get("username") else "@captain"
 
             # Query match statistics for this team
-            completed_matches = (
-                await db.execute(
-                    select(Match).where(
-                        (Match.team_a_id == team.id) | (Match.team_b_id == team.id),
-                        Match.status == "COMPLETED",
-                    )
-                )
-            ).scalars().all()
+            completed_cursor = db.matches.find({
+                "$and": [
+                    {"$or": [{"team_a_id": team_id}, {"team_b_id": team_id}]},
+                    {"status": "COMPLETED"},
+                ]
+            })
+            completed_matches = await completed_cursor.to_list(length=100)
 
             matches_played = len(completed_matches)
-            wins = sum(1 for m in completed_matches if m.winner_team_id == team.id)
+            wins = sum(1 for m in completed_matches if m.get("winner_team_id") == team_id)
             losses = matches_played - wins
             win_rate = round((wins / matches_played * 100), 1) if matches_played > 0 else 75.0
 
             entries.append({
                 "rank": idx + 1,
-                "id": team.id,
-                "name": team.name,
-                "tag": team.tag,
+                "id": team_id,
+                "name": team.get("name", "Team"),
+                "tag": team.get("tag", "TM"),
                 "type": "team",
                 "game_slug": game_slug,
                 "game_name": game_name,
                 "captain": captain_user,
-                "logo_url": team.logo_url or "https://lh3.googleusercontent.com/aida-public/AB6AXuDdPWn2ez9ufUiy3oobQMiyzKWPPQYVyngmyTfKqJMWwfmrnUALrqljOu3fdZn-93iR00dO8abRLetxpR3H_YY3Lw0kKtOiie2zXvcvZIFoaGNsiSwx85D3D6OxG0gHpFRiib2Ya4XvFEph7nC919c8zczdq9v32ddvS6lpbCcpe-vwqwPx1OMgEU1xRwlEmm5SIE6Rj7g-L0YKOPoAoiiNPDGGv944Lu6ZDoOPAhH3_SduIY6JiOlN",
+                "logo_url": team.get("logo_url") or "https://lh3.googleusercontent.com/aida-public/AB6AXuDdPWn2ez9ufUiy3oobQMiyzKWPPQYVyngmyTfKqJMWwfmrnUALrqljOu3fdZn-93iR00dO8abRLetxpR3H_YY3Lw0kKtOiie2zXvcvZIFoaGNsiSwx85D3D6OxG0gHpFRiib2Ya4XvFEph7nC919c8zczdq9v32ddvS6lpbCcpe-vwqwPx1OMgEU1xRwlEmm5SIE6Rj7g-L0YKOPoAoiiNPDGGv944Lu6ZDoOPAhH3_SduIY6JiOlN",
                 "win_rate": win_rate,
                 "matches_played": max(matches_played, 5),
                 "wins": max(wins, 4),
@@ -150,4 +147,3 @@ async def get_leaderboard(
         entry["rank"] = rank
 
     return [LeaderboardEntryResponse(**e) for e in entries]
-

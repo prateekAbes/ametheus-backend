@@ -1,78 +1,70 @@
 from typing import List
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
+from motor.motor_asyncio import AsyncIOMotorDatabase
 from app.api.deps import get_db, require_super_admin
 from app.models.user import User
 from app.models.game import Game
-from app.models.tournament import Tournament
-from app.models.admin import AuditLog
 from app.schemas import GameResponse, GameCreate, GameUpdate
 from app.services.audit import record_audit_log
 
 router = APIRouter()
 
 @router.get("", response_model=List[GameResponse])
-async def list_games(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(Game))
-    games = result.scalars().all()
+async def list_games(db: AsyncIOMotorDatabase = Depends(get_db)):
+    cursor = db.games.find()
+    games_docs = await cursor.to_list(length=100)
     
     response = []
-    for g in games:
-        t_res = await db.execute(
-            select(func.count(Tournament.id)).where(Tournament.game_id == g.id)
-        )
-        count = t_res.scalar() or 0
+    for g in games_docs:
+        gid = str(g.get("_id", g.get("id")))
+        count = await db.tournaments.count_documents({"$or": [{"game_id": gid}, {"game_slug": g.get("slug")}]})
         data = GameResponse(
-            id=g.id,
-            slug=g.slug,
-            name=g.name,
-            category=g.category,
-            platform=g.platform,
-            tag=g.tag,
-            is_team_game=g.is_team_game,
-            min_team_size=g.min_team_size,
-            max_team_size=g.max_team_size,
-            banner_url=g.banner_url,
-            logo_url=g.logo_url,
-            description=g.description,
-            server_region=g.server_region,
-            anti_cheat=g.anti_cheat,
-            match_protocol=g.match_protocol,
-            accent_color=g.accent_color,
+            id=gid,
+            slug=g["slug"],
+            name=g["name"],
+            category=g.get("category", "pc"),
+            platform=g["platform"],
+            tag=g["tag"],
+            is_team_game=g.get("is_team_game", True),
+            min_team_size=g.get("min_team_size", 1),
+            max_team_size=g.get("max_team_size", 5),
+            banner_url=g["banner_url"],
+            logo_url=g["logo_url"],
+            description=g.get("description", ""),
+            server_region=g.get("server_region", "AWS Mumbai (ap-south-1)"),
+            anti_cheat=g.get("anti_cheat", "Standard Protocol"),
+            match_protocol=g.get("match_protocol", "Custom Lobby"),
+            accent_color=g.get("accent_color", "#E56A10"),
             active_tournaments_count=count,
         )
         response.append(data)
     return response
 
 @router.get("/{slug}", response_model=GameResponse)
-async def get_game_by_slug(slug: str, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(Game).where(Game.slug == slug))
-    g = result.scalars().first()
+async def get_game_by_slug(slug: str, db: AsyncIOMotorDatabase = Depends(get_db)):
+    g = await db.games.find_one({"$or": [{"slug": slug}, {"_id": slug}, {"id": slug}]})
     if not g:
         raise HTTPException(status_code=404, detail="Game not found")
     
-    t_res = await db.execute(
-        select(func.count(Tournament.id)).where(Tournament.game_id == g.id)
-    )
-    count = t_res.scalar() or 0
+    gid = str(g.get("_id", g.get("id")))
+    count = await db.tournaments.count_documents({"$or": [{"game_id": gid}, {"game_slug": g.get("slug")}]})
     return GameResponse(
-        id=g.id,
-        slug=g.slug,
-        name=g.name,
-        category=g.category,
-        platform=g.platform,
-        tag=g.tag,
-        is_team_game=g.is_team_game,
-        min_team_size=g.min_team_size,
-        max_team_size=g.max_team_size,
-        banner_url=g.banner_url,
-        logo_url=g.logo_url,
-        description=g.description,
-        server_region=g.server_region,
-        anti_cheat=g.anti_cheat,
-        match_protocol=g.match_protocol,
-        accent_color=g.accent_color,
+        id=gid,
+        slug=g["slug"],
+        name=g["name"],
+        category=g.get("category", "pc"),
+        platform=g["platform"],
+        tag=g["tag"],
+        is_team_game=g.get("is_team_game", True),
+        min_team_size=g.get("min_team_size", 1),
+        max_team_size=g.get("max_team_size", 5),
+        banner_url=g["banner_url"],
+        logo_url=g["logo_url"],
+        description=g.get("description", ""),
+        server_region=g.get("server_region", "AWS Mumbai (ap-south-1)"),
+        anti_cheat=g.get("anti_cheat", "Standard Protocol"),
+        match_protocol=g.get("match_protocol", "Custom Lobby"),
+        accent_color=g.get("accent_color", "#E56A10"),
         active_tournaments_count=count,
     )
 
@@ -80,13 +72,13 @@ async def get_game_by_slug(slug: str, db: AsyncSession = Depends(get_db)):
 async def create_game(
     payload: GameCreate,
     admin_user: User = Depends(require_super_admin),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """
-    Super Admin privilege: Register a new sanctioned competitive title.
+    Super Admin privilege: Register a new sanctioned competitive title in MongoDB.
     """
-    existing = await db.execute(select(Game).where(Game.slug == payload.slug))
-    if existing.scalars().first():
+    existing = await db.games.find_one({"slug": payload.slug})
+    if existing:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"Game with slug '{payload.slug}' already exists",
@@ -109,7 +101,7 @@ async def create_game(
         match_protocol=payload.match_protocol,
         accent_color=payload.accent_color or "#E56A10",
     )
-    db.add(game)
+    await db.games.insert_one(game.to_mongo())
 
     await record_audit_log(
         db=db,
@@ -119,8 +111,6 @@ async def create_game(
         target=f"Game {game.name} ({game.slug})",
         details=f"Added new competitive game title {game.name}",
     )
-    await db.commit()
-    await db.refresh(game)
 
     return GameResponse(
         id=game.id,
@@ -147,53 +137,49 @@ async def update_game(
     id: str,
     payload: GameUpdate,
     admin_user: User = Depends(require_super_admin),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """
     Super Admin privilege: Update game parameters.
     """
-    res = await db.execute(select(Game).where(Game.id == id))
-    game = res.scalars().first()
-    if not game:
+    game_doc = await db.games.find_one({"$or": [{"_id": id}, {"id": id}]})
+    if not game_doc:
         raise HTTPException(status_code=404, detail="Game not found")
 
     update_data = payload.model_dump(exclude_unset=True)
-    for field, val in update_data.items():
-        setattr(game, field, val)
+    if update_data:
+        await db.games.update_one({"_id": game_doc["_id"]}, {"$set": update_data})
 
     await record_audit_log(
         db=db,
         operator=admin_user.username,
         role="SUPER_ADMIN",
         action="UPDATE_GAME",
-        target=f"Game {game.name} ({game.id})",
+        target=f"Game {game_doc['name']} ({id})",
         details=f"Updated game fields: {list(update_data.keys())}",
     )
-    await db.commit()
-    await db.refresh(game)
 
-    t_res = await db.execute(
-        select(func.count(Tournament.id)).where(Tournament.game_id == game.id)
-    )
-    count = t_res.scalar() or 0
+    updated_doc = await db.games.find_one({"_id": game_doc["_id"]})
+    gid = str(updated_doc.get("_id", updated_doc.get("id")))
+    count = await db.tournaments.count_documents({"$or": [{"game_id": gid}, {"game_slug": updated_doc.get("slug")}]})
 
     return GameResponse(
-        id=game.id,
-        slug=game.slug,
-        name=game.name,
-        category=game.category,
-        platform=game.platform,
-        tag=game.tag,
-        is_team_game=game.is_team_game,
-        min_team_size=game.min_team_size,
-        max_team_size=game.max_team_size,
-        banner_url=game.banner_url,
-        logo_url=game.logo_url,
-        description=game.description,
-        server_region=game.server_region,
-        anti_cheat=game.anti_cheat,
-        match_protocol=game.match_protocol,
-        accent_color=game.accent_color,
+        id=gid,
+        slug=updated_doc["slug"],
+        name=updated_doc["name"],
+        category=updated_doc.get("category", "pc"),
+        platform=updated_doc["platform"],
+        tag=updated_doc["tag"],
+        is_team_game=updated_doc.get("is_team_game", True),
+        min_team_size=updated_doc.get("min_team_size", 1),
+        max_team_size=updated_doc.get("max_team_size", 5),
+        banner_url=updated_doc["banner_url"],
+        logo_url=updated_doc["logo_url"],
+        description=updated_doc.get("description", ""),
+        server_region=updated_doc.get("server_region", "AWS Mumbai (ap-south-1)"),
+        anti_cheat=updated_doc.get("anti_cheat", "Standard Protocol"),
+        match_protocol=updated_doc.get("match_protocol", "Custom Lobby"),
+        accent_color=updated_doc.get("accent_color", "#E56A10"),
         active_tournaments_count=count,
     )
 
@@ -201,34 +187,31 @@ async def update_game(
 async def delete_game(
     id: str,
     admin_user: User = Depends(require_super_admin),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """
     Super Admin privilege: Delete game title if no tournaments depend on it.
     """
-    res = await db.execute(select(Game).where(Game.id == id))
-    game = res.scalars().first()
-    if not game:
+    game_doc = await db.games.find_one({"$or": [{"_id": id}, {"id": id}]})
+    if not game_doc:
         raise HTTPException(status_code=404, detail="Game not found")
 
-    t_res = await db.execute(
-        select(func.count(Tournament.id)).where(Tournament.game_id == game.id)
-    )
-    count = t_res.scalar() or 0
+    gid = str(game_doc.get("_id", game_doc.get("id")))
+    count = await db.tournaments.count_documents({"$or": [{"game_id": gid}, {"game_slug": game_doc.get("slug")}]})
     if count > 0:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Cannot delete game '{game.name}': {count} tournament(s) are linked to it",
+            detail=f"Cannot delete game '{game_doc['name']}': {count} tournament(s) are linked to it",
         )
 
-    await db.delete(game)
+    await db.games.delete_one({"_id": game_doc["_id"]})
     await record_audit_log(
         db=db,
         operator=admin_user.username,
         role="SUPER_ADMIN",
         action="DELETE_GAME",
-        target=f"Game {game.name} ({game.id})",
-        details=f"Deleted game title {game.name}",
+        target=f"Game {game_doc['name']} ({id})",
+        details=f"Deleted game title {game_doc['name']}",
     )
-    await db.commit()
-    return {"status": "success", "message": f"Game '{game.name}' deleted"}
+    return {"status": "success", "message": f"Game '{game_doc['name']}' deleted"}
+

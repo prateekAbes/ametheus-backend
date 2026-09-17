@@ -1,28 +1,54 @@
-from sqlalchemy import Column, String, ForeignKey, Text, BigInteger
-from sqlalchemy.orm import relationship
-from app.core.database import Base
-from app.models.base import TimestampMixin, generate_uuid
+from typing import Optional
+from datetime import datetime
+from pydantic import BaseModel, Field
+from app.models.base import generate_uuid, get_utc_now
 
-class TournamentAdminAssignment(Base, TimestampMixin):
-    __tablename__ = "tournament_admin_assignments"
+class TournamentAdminAssignment(BaseModel):
+    id: str = Field(default_factory=generate_uuid)
+    admin_user_id: str
+    tournament_id: str
+    assigned_by: str
+    created_at: datetime = Field(default_factory=get_utc_now)
+    updated_at: datetime = Field(default_factory=get_utc_now)
 
-    id = Column(String(36), primary_key=True, default=generate_uuid)
-    admin_user_id = Column(String(64), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
-    tournament_id = Column(String(36), ForeignKey("tournaments.id", ondelete="CASCADE"), nullable=False)
-    assigned_by = Column(String(64), ForeignKey("users.id"), nullable=False)
+    def to_mongo(self) -> dict:
+        d = self.model_dump()
+        d["_id"] = d.pop("id")
+        return d
 
-    # Relationships
-    tournament = relationship("Tournament", back_populates="admin_assignments")
+    @classmethod
+    def from_mongo(cls, doc: Optional[dict]):
+        if not doc:
+            return None
+        d = dict(doc)
+        if "_id" in d and "id" not in d:
+            d["id"] = str(d.pop("_id"))
+        return cls(**d)
 
-class AuditLog(Base, TimestampMixin):
-    __tablename__ = "audit_logs"
+class AuditLog(BaseModel):
+    id: str = Field(default_factory=generate_uuid)
+    operator: str
+    role: str
+    action: str
+    target: str
+    details: Optional[str] = None
+    ip_address: str = "127.0.0.1"
+    prev_hash: Optional[str] = None
+    record_hash: Optional[str] = None
+    created_at: datetime = Field(default_factory=get_utc_now)
+    updated_at: datetime = Field(default_factory=get_utc_now)
 
-    id = Column(String(36), primary_key=True, default=generate_uuid)
-    operator = Column(String(64), nullable=False)
-    role = Column(String(32), nullable=False)
-    action = Column(String(64), nullable=False)
-    target = Column(String(128), nullable=False)
-    details = Column(Text, nullable=True)
-    ip_address = Column(String(64), default="127.0.0.1")
-    prev_hash = Column(String(64), nullable=True)
-    record_hash = Column(String(64), nullable=True)
+    def to_mongo(self) -> dict:
+        d = self.model_dump()
+        d["_id"] = d.pop("id")
+        return d
+
+    @classmethod
+    def from_mongo(cls, doc: Optional[dict]):
+        if not doc:
+            return None
+        d = dict(doc)
+        if "_id" in d and "id" not in d:
+            d["id"] = str(d.pop("_id"))
+        return cls(**d)
+

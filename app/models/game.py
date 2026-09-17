@@ -1,28 +1,39 @@
-from sqlalchemy import Column, String, Boolean, Integer, Text
-from sqlalchemy.orm import relationship
-from app.core.database import Base
-from app.models.base import TimestampMixin, generate_uuid
+from typing import Optional
+from datetime import datetime
+from pydantic import BaseModel, Field
+from app.models.base import generate_uuid, get_utc_now
 
-class Game(Base, TimestampMixin):
-    __tablename__ = "games"
+class Game(BaseModel):
+    id: str = Field(default_factory=generate_uuid)
+    slug: str
+    name: str
+    category: str = "pc"
+    platform: str
+    tag: str
+    is_team_game: bool = True
+    min_team_size: int = 1
+    max_team_size: int = 5
+    banner_url: str
+    logo_url: str
+    description: str = ""
+    server_region: str = "AWS Mumbai (ap-south-1)"
+    anti_cheat: str = "Hardware TPM 2.0 Vanguard"
+    match_protocol: str = "Competitive MR12"
+    accent_color: str = "#E56A10"
+    created_at: datetime = Field(default_factory=get_utc_now)
+    updated_at: datetime = Field(default_factory=get_utc_now)
 
-    id = Column(String(36), primary_key=True, default=generate_uuid)
-    slug = Column(String(64), unique=True, index=True, nullable=False)
-    name = Column(String(128), nullable=False)
-    category = Column(String(32), nullable=False, default="pc")  # pc, mobile, crossplay, solo
-    platform = Column(String(64), nullable=False)
-    tag = Column(String(64), nullable=False)
-    is_team_game = Column(Boolean, nullable=False, default=True)
-    min_team_size = Column(Integer, nullable=False, default=1)
-    max_team_size = Column(Integer, nullable=False, default=5)
-    banner_url = Column(String(512), nullable=False)
-    logo_url = Column(String(512), nullable=False)
-    description = Column(Text, nullable=False)
-    server_region = Column(String(128), nullable=False, default="AWS Mumbai (ap-south-1)")
-    anti_cheat = Column(String(128), nullable=False, default="Hardware TPM 2.0 Vanguard")
-    match_protocol = Column(String(128), nullable=False, default="Competitive MR12")
-    accent_color = Column(String(32), default="#E56A10")
+    def to_mongo(self) -> dict:
+        d = self.model_dump()
+        d["_id"] = d.pop("id")
+        return d
 
-    # Relationships
-    tournaments = relationship("Tournament", back_populates="game")
-    teams = relationship("Team", back_populates="game")
+    @classmethod
+    def from_mongo(cls, doc: Optional[dict]):
+        if not doc:
+            return None
+        d = dict(doc)
+        if "_id" in d and "id" not in d:
+            d["id"] = str(d.pop("_id"))
+        return cls(**d)
+

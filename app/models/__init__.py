@@ -1,4 +1,3 @@
-from app.models.base import Base
 from app.models.user import User
 from app.models.game import Game
 from app.models.team import Team, TeamMember
@@ -9,7 +8,6 @@ from app.models.dispute import Dispute
 from app.models.notification import Notification
 
 __all__ = [
-    "Base",
     "User",
     "Game",
     "Team",

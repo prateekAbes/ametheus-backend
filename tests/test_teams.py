@@ -2,7 +2,6 @@ import pytest
 from tests.conftest import make_auth_headers, TestSessionLocal
 from app.models.user import User
 from app.models.game import Game
-from sqlalchemy import select
 
 @pytest.mark.asyncio
 async def test_team_create_and_join_flow(client):
@@ -11,29 +10,10 @@ async def test_team_create_and_join_flow(client):
 
     # Ensure users exist in DB
     async with TestSessionLocal() as db:
-        res_c = await db.execute(select(User).where(User.id == "usr_test_captain"))
-        if not res_c.scalars().first():
-            c = User(id="usr_test_captain", clerk_user_id="usr_test_captain", email="c@test.com", username="test_captain", role="PLAYER")
-            m = User(id="usr_test_teammate", clerk_user_id="usr_test_teammate", email="m@test.com", username="test_teammate", role="PLAYER")
-            db.add_all([c, m])
-            await db.commit()
-
-        # Ensure valorant game exists
-        res_g = await db.execute(select(Game).where(Game.slug == "valorant"))
-        if not res_g.scalars().first():
-            g = Game(
-                slug="valorant",
-                name="Valorant",
-                category="pc",
-                platform="PC",
-                tag="5V5",
-                banner_url="http://banner",
-                logo_url="http://logo",
-                description="desc",
-                max_team_size=5,
-            )
-            db.add(g)
-            await db.commit()
+        c = User(id="usr_test_captain", clerk_user_id="usr_test_captain", email="c@test.com", username="test_captain", role="PLAYER")
+        m = User(id="usr_test_teammate", clerk_user_id="usr_test_teammate", email="m@test.com", username="test_teammate", role="PLAYER")
+        db.add_all([c, m])
+        await db.commit()
 
     # Create Team
     payload = {

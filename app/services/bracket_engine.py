@@ -2,8 +2,7 @@ import secrets
 import json
 import math
 from typing import List, Optional, Dict, Any
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from motor.motor_asyncio import AsyncIOMotorDatabase
 from app.models.tournament import Tournament, TournamentRegistration
 from app.models.team import Team
 from app.models.match import Match
@@ -22,15 +21,17 @@ def get_round_name(round_num: int, total_rounds: int) -> str:
 
 async def build_single_elimination_bracket(
     tournament: Tournament,
-    db: AsyncSession,
+    db: AsyncIOMotorDatabase,
 ) -> Dict[str, Any]:
     # 1. Get registered teams
-    res = await db.execute(
-        select(Team)
-        .join(TournamentRegistration, TournamentRegistration.team_id == Team.id)
-        .where(TournamentRegistration.tournament_id == tournament.id)
-    )
-    teams = res.scalars().all()
+    reg_cursor = db.tournament_registrations.find({"tournament_id": tournament.id})
+    regs = await reg_cursor.to_list(length=100)
+    team_ids = [r.get("team_id") for r in regs if r.get("team_id")]
+    
+    teams = []
+    if team_ids:
+        team_cursor = db.teams.find({"$or": [{"_id": {"$in": team_ids}}, {"id": {"$in": team_ids}}]})
+        teams = await team_cursor.to_list(length=100)
 
     num_teams = len(teams)
     if num_teams < 2:
@@ -43,10 +44,7 @@ async def build_single_elimination_bracket(
     bye_matches = []
 
     # Clear existing matches for this tournament if regenerating
-    old_matches = await db.execute(select(Match).where(Match.tournament_id == tournament.id))
-    for m in old_matches.scalars().all():
-        await db.delete(m)
-    await db.flush()
+    await db.matches.delete_many({"tournament_id": tournament.id})
 
     # Generate matches round by round
     for r in range(1, total_rounds + 1):
@@ -65,9 +63,9 @@ async def build_single_elimination_bracket(
                 t_idx_a = (m_idx - 1) * 2
                 t_idx_b = t_idx_a + 1
                 if t_idx_a < len(teams):
-                    team_a_id = teams[t_idx_a].id
+                    team_a_id = str(teams[t_idx_a].get("_id", teams[t_idx_a].get("id")))
                 if t_idx_b < len(teams):
-                    team_b_id = teams[t_idx_b].id
+                    team_b_id = str(teams[t_idx_b].get("_id", teams[t_idx_b].get("id")))
 
                 if team_a_id and team_b_id:
                     status = "CHECK_IN_OPEN"
@@ -92,8 +90,7 @@ async def build_single_elimination_bracket(
                 lobby_code=f"AMETHEUS-{tournament.slug[:6].upper()}-R{r}M{m_idx}",
                 lobby_password=lobby_pw,
             )
-            db.add(db_match)
-            await db.flush()
+            await db.matches.insert_one(db_match.to_mongo())
 
             if status == "BYE":
                 bye_matches.append(db_match)
@@ -114,54 +111,61 @@ async def build_single_elimination_bracket(
         if bm.winner_team_id:
             await advance_bracket_match(tournament.id, bm, bm.winner_team_id, db)
 
-    tournament.bracket_json = json.dumps(bracket_tree)
-    tournament.status = "LIVE"
-    await db.commit()
+    await db.tournaments.update_one(
+        {"$or": [{"_id": tournament.id}, {"id": tournament.id}]},
+        {"$set": {"bracket_rounds": bracket_tree, "status": "LIVE"}}
+    )
     return {"total_rounds": total_rounds, "bracket": bracket_tree}
 
 async def advance_bracket_match(
     tournament_id: str,
     completed_match: Match,
     winner_team_id: str,
-    db: AsyncSession,
+    db: AsyncIOMotorDatabase,
 ) -> Optional[Match]:
     """
     Advances the winner of completed_match into the next round match.
     """
     completed_match.winner_team_id = winner_team_id
     completed_match.status = "COMPLETED"
-    await db.flush()
+    await db.matches.update_one(
+        {"$or": [{"_id": completed_match.id}, {"id": completed_match.id}]},
+        {"$set": {"winner_team_id": winner_team_id, "status": "COMPLETED"}}
+    )
 
     # Find next round match
     next_round_num = completed_match.round_number + 1
     next_match_num = math.ceil(completed_match.match_number / 2)
-    is_team_a = (completed_match.match_number % 2) != 0  # Odd match_number goes to team_a, even goes to team_b
+    is_team_a = (completed_match.match_number % 2) != 0
 
-    next_res = await db.execute(
-        select(Match).where(
-            Match.tournament_id == tournament_id,
-            Match.round_number == next_round_num,
-            Match.match_number == next_match_num,
-        )
-    )
-    next_match = next_res.scalars().first()
+    next_match_doc = await db.matches.find_one({
+        "tournament_id": tournament_id,
+        "round_number": next_round_num,
+        "match_number": next_match_num,
+    })
 
-    if next_match:
+    next_match = None
+    if next_match_doc:
+        next_match = Match.from_mongo(next_match_doc)
+        update_data = {}
         if is_team_a:
             next_match.team_a_id = winner_team_id
+            update_data["team_a_id"] = winner_team_id
         else:
             next_match.team_b_id = winner_team_id
+            update_data["team_b_id"] = winner_team_id
 
-        if next_match.team_a_id and next_match.team_b_id:
+        if (update_data.get("team_a_id") or next_match.team_a_id) and (update_data.get("team_b_id") or next_match.team_b_id):
             next_match.status = "CHECK_IN_OPEN"
+            update_data["status"] = "CHECK_IN_OPEN"
 
-        await db.flush()
+        await db.matches.update_one({"_id": next_match_doc["_id"]}, {"$set": update_data})
     else:
         # If no next match, this was the Grand Final! Tournament completed!
-        t_res = await db.execute(select(Tournament).where(Tournament.id == tournament_id))
-        tourn = t_res.scalars().first()
-        if tourn:
-            tourn.status = "COMPLETED"
+        await db.tournaments.update_one(
+            {"$or": [{"_id": tournament_id}, {"id": tournament_id}]},
+            {"$set": {"status": "COMPLETED"}}
+        )
 
-    await db.commit()
     return next_match
+

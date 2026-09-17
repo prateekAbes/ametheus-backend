@@ -1,24 +1,33 @@
-from sqlalchemy import Column, String, ForeignKey, Text
-from sqlalchemy.orm import relationship
-from app.core.database import Base
-from app.models.base import TimestampMixin, generate_uuid
+from typing import Optional
+from datetime import datetime
+from pydantic import BaseModel, Field
+from app.models.base import generate_uuid, get_utc_now
 
-class Dispute(Base, TimestampMixin):
-    __tablename__ = "disputes"
+class Dispute(BaseModel):
+    id: str = Field(default_factory=generate_uuid)
+    tournament_id: str
+    match_id: str
+    submitted_by: str
+    reason: str
+    description: str
+    evidence_url: Optional[str] = None
+    status: str = "OPEN"  # OPEN, UNDER_REVIEW, RESOLVED, ESCALATED, CLOSED
+    resolution_notes: Optional[str] = None
+    resolved_by: Optional[str] = None
+    created_at: datetime = Field(default_factory=get_utc_now)
+    updated_at: datetime = Field(default_factory=get_utc_now)
 
-    id = Column(String(36), primary_key=True, default=generate_uuid)
-    tournament_id = Column(String(36), ForeignKey("tournaments.id", ondelete="CASCADE"), nullable=False)
-    match_id = Column(String(36), ForeignKey("matches.id", ondelete="CASCADE"), nullable=False)
-    submitted_by = Column(String(64), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
-    reason = Column(String(128), nullable=False)
-    description = Column(Text, nullable=False)
-    evidence_url = Column(String(512), nullable=True)
-    status = Column(String(32), default="OPEN", nullable=False)  # OPEN, UNDER_REVIEW, RESOLVED, ESCALATED, CLOSED
-    resolution_notes = Column(Text, nullable=True)
-    resolved_by = Column(String(64), ForeignKey("users.id"), nullable=True)
+    def to_mongo(self) -> dict:
+        d = self.model_dump()
+        d["_id"] = d.pop("id")
+        return d
 
-    # Relationships
-    tournament = relationship("Tournament")
-    match = relationship("Match")
-    submitter = relationship("User", foreign_keys=[submitted_by])
-    resolver = relationship("User", foreign_keys=[resolved_by])
+    @classmethod
+    def from_mongo(cls, doc: Optional[dict]):
+        if not doc:
+            return None
+        d = dict(doc)
+        if "_id" in d and "id" not in d:
+            d["id"] = str(d.pop("_id"))
+        return cls(**d)
+

@@ -1,10 +1,8 @@
 from fastapi import APIRouter, Depends, HTTPException, Header, status
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, or_
+from motor.motor_asyncio import AsyncIOMotorDatabase
 from app.api.deps import get_db, get_current_user
 from app.core.security import decode_token
 from app.models.user import User
-from app.models.admin import AuditLog
 from app.services.audit import record_audit_log
 from app.schemas import UserResponse
 from pydantic import BaseModel
@@ -23,10 +21,10 @@ class UserSyncRequest(BaseModel):
 async def sync_clerk_user(
     payload: UserSyncRequest,
     authorization: Optional[str] = Header(None),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """
-    Synchronize authenticated Clerk profile with AMETHEUS DB.
+    Synchronize authenticated Clerk profile with AMETHEUS DB in MongoDB.
     Requires verified Clerk Bearer token matching payload.clerk_user_id.
     Default role is always PLAYER.
     """
@@ -52,26 +50,24 @@ async def sync_clerk_user(
             detail="Forbidden: Token subject does not match profile ID",
         )
 
-    result = await db.execute(
-        select(User).where(
-            or_(
-                User.clerk_user_id == payload.clerk_user_id,
-                User.id == payload.clerk_user_id,
-                User.email == payload.email,
-            )
-        )
-    )
-    user = result.scalars().first()
+    user_doc = await db.users.find_one({
+        "$or": [
+            {"clerk_user_id": payload.clerk_user_id},
+            {"_id": payload.clerk_user_id},
+            {"email": payload.email},
+        ]
+    })
 
-    if user:
+    if user_doc:
         # Update metadata without overwriting authoritative role
-        user.clerk_user_id = payload.clerk_user_id
+        update_fields = {"clerk_user_id": payload.clerk_user_id}
         if payload.display_name:
-            user.display_name = payload.display_name
+            update_fields["display_name"] = payload.display_name
         if payload.avatar_url:
-            user.avatar_url = payload.avatar_url
-        await db.commit()
-        await db.refresh(user)
+            update_fields["avatar_url"] = payload.avatar_url
+        await db.users.update_one({"_id": user_doc["_id"]}, {"$set": update_fields})
+        updated_doc = await db.users.find_one({"_id": user_doc["_id"]})
+        return User.from_mongo(updated_doc)
     else:
         from app.core.config import settings
         # Assign SUPER_ADMIN for the designated admin email, PLAYER for everyone else
@@ -85,7 +81,7 @@ async def sync_clerk_user(
             avatar_url=payload.avatar_url,
             role=initial_role,
         )
-        db.add(user)
+        await db.users.insert_one(user.to_mongo())
         await record_audit_log(
             db=db,
             operator=user.id,
@@ -103,10 +99,7 @@ async def sync_clerk_user(
             notification_type="SYSTEM",
             link="/tournaments",
         )
-        await db.commit()
-        await db.refresh(user)
-
-    return user
+        return user
 
 @router.get("/me", response_model=UserResponse)
 async def get_current_user_profile(
@@ -127,20 +120,27 @@ class UserProfileUpdateRequest(BaseModel):
 async def update_user_profile(
     payload: UserProfileUpdateRequest,
     current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """
     Update competitive player profile handles (Riot ID, Steam ID, Display Name, Avatar).
     """
+    update_data = {}
     if payload.display_name is not None:
-        current_user.display_name = payload.display_name.strip()
+        update_data["display_name"] = payload.display_name.strip()
+        current_user.display_name = update_data["display_name"]
     if payload.riot_id is not None:
-        current_user.riot_id = payload.riot_id.strip()
+        update_data["riot_id"] = payload.riot_id.strip()
+        current_user.riot_id = update_data["riot_id"]
     if payload.steam_id is not None:
-        current_user.steam_id = payload.steam_id.strip()
+        update_data["steam_id"] = payload.steam_id.strip()
+        current_user.steam_id = update_data["steam_id"]
     if payload.avatar_url is not None:
-        current_user.avatar_url = payload.avatar_url.strip()
+        update_data["avatar_url"] = payload.avatar_url.strip()
+        current_user.avatar_url = update_data["avatar_url"]
 
-    await db.commit()
-    await db.refresh(current_user)
+    if update_data:
+        await db.users.update_one({"_id": current_user.id}, {"$set": update_data})
+
     return current_user
+

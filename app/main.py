@@ -1,82 +1,22 @@
 import time
+import traceback
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from sqlalchemy import inspect, text
+
 from app.core.config import settings
-from app.core.database import engine, Base
+from app.core.database import get_database, init_db_indexes
 from app.api.v1.api import api_router
-from app.models import *  # ensure all models registered
-
-def reconcile_schema_sync(sync_conn):
-    """
-    Synchronously create missing tables and alter existing tables to add any missing columns.
-    Ensures seamless compatibility across local SQLite and remote PostgreSQL without data wipe.
-    """
-    Base.metadata.create_all(sync_conn)
-    insp = inspect(sync_conn)
-    tables = set(insp.get_table_names())
-
-    if "users" in tables:
-        cols = {c['name'] for c in insp.get_columns("users")}
-        if "clerk_user_id" not in cols:
-            sync_conn.execute(text("ALTER TABLE users ADD COLUMN clerk_user_id VARCHAR(128)"))
-        if "display_name" not in cols:
-            sync_conn.execute(text("ALTER TABLE users ADD COLUMN display_name VARCHAR(128)"))
-        if "avatar_url" not in cols:
-            sync_conn.execute(text("ALTER TABLE users ADD COLUMN avatar_url VARCHAR(512)"))
-        if "role" not in cols:
-            sync_conn.execute(text("ALTER TABLE users ADD COLUMN role VARCHAR(32) DEFAULT 'PLAYER'"))
-        if "inr_balance" not in cols:
-            sync_conn.execute(text("ALTER TABLE users ADD COLUMN inr_balance VARCHAR(32) DEFAULT '0'"))
-        if "riot_id" not in cols:
-            sync_conn.execute(text("ALTER TABLE users ADD COLUMN riot_id VARCHAR(64)"))
-        if "steam_id" not in cols:
-            sync_conn.execute(text("ALTER TABLE users ADD COLUMN steam_id VARCHAR(64)"))
-
-    if "tournaments" in tables:
-        cols = {c['name'] for c in insp.get_columns("tournaments")}
-        if "organizer_id" not in cols:
-            sync_conn.execute(text("ALTER TABLE tournaments ADD COLUMN organizer_id VARCHAR(64)"))
-
-    if "tournament_registrations" in tables:
-        cols = {c['name'] for c in insp.get_columns("tournament_registrations")}
-        if "order_id" not in cols:
-            sync_conn.execute(text("ALTER TABLE tournament_registrations ADD COLUMN order_id VARCHAR(64)"))
-        if "payment_status" not in cols:
-            sync_conn.execute(text("ALTER TABLE tournament_registrations ADD COLUMN payment_status VARCHAR(32) DEFAULT 'FREE'"))
-        if "check_in_status" not in cols:
-            sync_conn.execute(text("ALTER TABLE tournament_registrations ADD COLUMN check_in_status VARCHAR(32) DEFAULT 'PENDING'"))
-
-    if "matches" in tables:
-        cols = {c['name'] for c in insp.get_columns("matches")}
-        if "evidence_url" not in cols:
-            sync_conn.execute(text("ALTER TABLE matches ADD COLUMN evidence_url VARCHAR(512)"))
-        if "captain_notes" not in cols:
-            sync_conn.execute(text("ALTER TABLE matches ADD COLUMN captain_notes TEXT"))
-        if "dispute_notes" not in cols:
-            sync_conn.execute(text("ALTER TABLE matches ADD COLUMN dispute_notes TEXT"))
-
-    if "audit_logs" in tables:
-        cols = {c['name'] for c in insp.get_columns("audit_logs")}
-        if "prev_hash" not in cols:
-            sync_conn.execute(text("ALTER TABLE audit_logs ADD COLUMN prev_hash VARCHAR(64)"))
-        if "record_hash" not in cols:
-            sync_conn.execute(text("ALTER TABLE audit_logs ADD COLUMN record_hash VARCHAR(64)"))
-
-    if "teams" in tables:
-        cols = {c['name'] for c in insp.get_columns("teams")}
-        if "invite_code" not in cols:
-            sync_conn.execute(text("ALTER TABLE teams ADD COLUMN invite_code VARCHAR(6)"))
+from app.models import *
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Auto-create tables and reconcile schema on startup (SQLite and PostgreSQL)
+    # Auto-initialize MongoDB indexes and seed if empty
     try:
-        async with engine.begin() as conn:
-            await conn.run_sync(reconcile_schema_sync)
+        db = get_database()
+        await init_db_indexes(db)
         
         # Auto-seed database if empty
         from app.seed import seed_if_empty
@@ -85,7 +25,6 @@ async def lifespan(app: FastAPI):
         print(f"[AMETHEUS Lifespan Warning]: {e}")
     
     yield
-    await engine.dispose()
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
@@ -169,58 +108,49 @@ async def root():
     return {
         "engine": "AMETHEUS Tournament Engine",
         "version": "1.0.0",
+        "database": "MongoDB",
         "status": "operational",
         "docs": "/docs",
     }
 
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "service": "ametheus-backend"}
+    return {"status": "ok", "service": "ametheus-backend", "database": "mongodb"}
 
 @app.get("/health/db")
 async def db_health():
-    from app.core.database import AsyncSessionLocal
-    from sqlalchemy import select, func
-    from app.models.game import Game
-    from app.models.tournament import Tournament
-    from app.models.team import Team
-    from app.models.user import User
-    from app.models.match import Match
     try:
-        async with AsyncSessionLocal() as session:
-            g = (await session.execute(select(func.count(Game.id)))).scalar() or 0
-            t = (await session.execute(select(func.count(Tournament.id)))).scalar() or 0
-            tm = (await session.execute(select(func.count(Team.id)))).scalar() or 0
-            u = (await session.execute(select(func.count(User.id)))).scalar() or 0
-            m = (await session.execute(select(func.count(Match.id)))).scalar() or 0
-            return {
-                "status": "connected",
-                "counts": {
-                    "games": g,
-                    "tournaments": t,
-                    "teams": tm,
-                    "users": u,
-                    "matches": m,
-                }
+        db = get_database()
+        await db.command("ping")
+        u_count = await db.users.count_documents({})
+        g_count = await db.games.count_documents({})
+        t_count = await db.tournaments.count_documents({})
+        tm_count = await db.teams.count_documents({})
+        m_count = await db.matches.count_documents({})
+        return {
+            "status": "connected",
+            "database": "mongodb",
+            "counts": {
+                "users": u_count,
+                "games": g_count,
+                "tournaments": t_count,
+                "teams": tm_count,
+                "matches": m_count,
             }
+        }
     except Exception as e:
-        import traceback
         return {"status": "error", "error": str(e), "trace": traceback.format_exc()}
 
 @app.post("/health/seed")
 async def trigger_seed():
     from app.seed import populate_seed_data
-    from app.core.database import AsyncSessionLocal
     try:
-        async with engine.begin() as conn:
-            await conn.run_sync(reconcile_schema_sync)
-        async with AsyncSessionLocal() as session:
-            await populate_seed_data(session)
-            return {"status": "success", "message": "Database seeded successfully"}
+        db = get_database()
+        await init_db_indexes(db)
+        await populate_seed_data(db)
+        return {"status": "success", "message": "MongoDB seeded successfully"}
     except Exception as e:
-        import traceback
         return {"status": "error", "error": str(e), "trace": traceback.format_exc()}
-
 
 from fastapi import WebSocket, WebSocketDisconnect
 from app.core.ws import ws_manager
