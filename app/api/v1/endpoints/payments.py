@@ -18,7 +18,8 @@ router = APIRouter()
 
 class OrderCreateRequest(BaseModel):
     tournament_id: str
-    team_id: str
+    team_id: Optional[str] = None
+    player_id: Optional[str] = None
 
 class PaymentVerifyRequest(BaseModel):
     razorpay_order_id: str
@@ -33,6 +34,7 @@ async def create_escrow_order(
 ):
     """
     Creates an escrow order for tournament entry fee via Razorpay.
+    Supports both team registrations and solo player registrations.
     """
     tourn = await db.tournaments.find_one({"$or": [{"_id": payload.tournament_id}, {"id": payload.tournament_id}]})
     if not tourn:
@@ -41,18 +43,7 @@ async def create_escrow_order(
     if tourn.get("status") != "REGISTRATION_OPEN":
         raise HTTPException(status_code=400, detail="Tournament registration is not open")
 
-    team = await db.teams.find_one({"$or": [{"_id": payload.team_id}, {"id": payload.team_id}]})
-    if not team:
-        raise HTTPException(status_code=404, detail="Team not found")
-
-    if team.get("captain_id") != current_user.id and current_user.role != "SUPER_ADMIN":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only the squad captain can initiate payment for registration",
-        )
-
     tourn_id = str(tourn.get("_id", tourn.get("id")))
-    team_id = str(team.get("_id", team.get("id")))
 
     # Check capacity
     reg_count = await db.tournament_registrations.count_documents({
@@ -64,6 +55,67 @@ async def create_escrow_order(
 
     amount_inr = tourn.get("entry_fee_inr", 0)
     amount_paise = amount_inr * 100
+
+    # Handle Solo Registration Order (when no team_id is provided)
+    if not payload.team_id:
+        if amount_inr == 0:
+            reg = TournamentRegistration(
+                tournament_id=tourn_id,
+                player_id=current_user.id,
+                payment_status="FREE",
+                check_in_status="PENDING",
+            )
+            await db.tournament_registrations.insert_one(reg.to_mongo())
+            return {
+                "status": "free",
+                "message": "Free entry solo tournament. Registration confirmed.",
+                "order_id": None,
+                "amount_inr": 0,
+            }
+
+        rzp_order_id = f"order_{secrets.token_hex(8)}"
+        existing_reg = await db.tournament_registrations.find_one({
+            "tournament_id": tourn_id,
+            "player_id": current_user.id,
+        })
+        if existing_reg:
+            await db.tournament_registrations.update_one(
+                {"_id": existing_reg["_id"]},
+                {"$set": {"order_id": rzp_order_id, "payment_status": "PENDING"}}
+            )
+        else:
+            reg = TournamentRegistration(
+                tournament_id=tourn_id,
+                player_id=current_user.id,
+                payment_status="PENDING",
+                order_id=rzp_order_id,
+                check_in_status="PENDING",
+            )
+            await db.tournament_registrations.insert_one(reg.to_mongo())
+
+        return {
+            "status": "created",
+            "order_id": rzp_order_id,
+            "amount_paise": amount_paise,
+            "amount_inr": amount_inr,
+            "currency": "INR",
+            "key_id": settings.RAZORPAY_KEY_ID,
+            "tournament_title": tourn.get("title"),
+            "team_name": current_user.display_name or current_user.username,
+        }
+
+    # Handle Team Registration Order
+    team = await db.teams.find_one({"$or": [{"_id": payload.team_id}, {"id": payload.team_id}]})
+    if not team:
+        raise HTTPException(status_code=404, detail="Team not found")
+
+    if team.get("captain_id") != current_user.id and current_user.role != "SUPER_ADMIN":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the squad captain can initiate payment for registration",
+        )
+
+    team_id = str(team.get("_id", team.get("id")))
 
     # If free tournament, create immediate PAID registration
     if amount_inr == 0:

@@ -17,6 +17,8 @@ class Tournament(BaseModel):
     roster_lock_time: str
     server_region: str = "AWS Mumbai (ap-south-1)"
     max_teams: int = 16
+    min_team_size: int = 1
+    max_team_size: int = 5
     rank_requirement: str = "Open to All Ranks"
     format: str = "Single Elimination Bracket"
     banner_url: str

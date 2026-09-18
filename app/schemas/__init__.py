@@ -123,6 +123,8 @@ class TournamentResponse(BaseModel):
     server_region: Optional[str] = "AWS Mumbai (ap-south-1)"
     registered_teams: Optional[int] = 0
     max_teams: Optional[int] = 16
+    min_team_size: Optional[int] = 1
+    max_team_size: Optional[int] = 5
     rank_requirement: Optional[str] = "Open to All Ranks"
     format: Optional[str] = "Single Elimination Bracket"
     banner_url: Optional[str] = "https://images.unsplash.com/photo-1542751371-adc38448a05e?q=80&w=1200&auto=format&fit=crop"
@@ -136,7 +138,9 @@ class TournamentResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 class TournamentRegisterRequest(BaseModel):
-    team_id: str
+    team_id: Optional[str] = None
+    player_id: Optional[str] = None
+    player_handle: Optional[str] = None
 
 # Match
 class MatchResponse(BaseModel):

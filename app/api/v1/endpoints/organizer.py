@@ -41,12 +41,16 @@ class TournamentCreatePayload(BaseModel):
     roster_lock_time: str
     server_region: str = "AWS Mumbai (ap-south-1)"
     max_teams: int = 16
+    min_team_size: Optional[int] = 1
+    max_team_size: Optional[int] = 5
+    status: Optional[str] = "DRAFT"
     rank_requirement: str = "Open to All Ranks"
     format: str = "Single Elimination Bracket"
     banner_url: Optional[str] = None
     description: str
     rules: List[str] = []
     schedule: List[Dict[str, Any]] = []
+    prizes: Optional[List[Dict[str, Any]]] = None
 
 class TournamentUpdatePayload(BaseModel):
     title: Optional[str] = None
@@ -97,21 +101,23 @@ def serialize_tournament_response(t: dict, game_obj: Optional[dict], reg_count: 
 
     return TournamentResponse(
         id=tid,
-        slug=t["slug"],
+        slug=t.get("slug", tid),
         organizer_id=t.get("organizer_id"),
-        title=t["title"],
+        title=t.get("title", "Tournament"),
         game_slug=game_obj["slug"] if game_obj else "game",
         game_name=game_obj["name"] if game_obj else "Game",
         prize_pool=f"₹{prize_inr:,}",
         prize_pool_inr=prize_inr,
         entry_fee=f"₹{fee_inr} / Team" if fee_inr > 0 else "₹0 / Free",
         entry_fee_inr=fee_inr,
-        status=t.get("status", "DRAFT"),
+        status=t.get("status", "REGISTRATION_OPEN"),
         starts_at=t.get("starts_at", "TBD"),
         roster_lock_time=t.get("roster_lock_time", "TBD"),
         server_region=t.get("server_region", "AWS Mumbai (ap-south-1)"),
         registered_teams=reg_count,
         max_teams=t.get("max_teams", 16),
+        min_team_size=t.get("min_team_size", 1),
+        max_team_size=t.get("max_team_size", 5),
         rank_requirement=t.get("rank_requirement", "Open to All Ranks"),
         format=t.get("format", "Single Elimination Bracket"),
         banner_url=t.get("banner_url", ""),
@@ -131,7 +137,7 @@ async def create_tournament(
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """
-    Organizer creates a new tournament (Rule 9). Default state is DRAFT.
+    Organizer creates a new tournament (Rule 9). Default state is REGISTRATION_OPEN or payload.status.
     """
     game = await db.games.find_one({"$or": [{"_id": payload.game_id}, {"id": payload.game_id}, {"slug": payload.game_id}]})
     if not game:
@@ -144,6 +150,8 @@ async def create_tournament(
 
     banner = payload.banner_url or game.get("banner_url")
 
+    prizes = payload.prizes if payload.prizes else [{"place": "1st", "amount": f"₹{payload.prize_pool_inr}"}]
+
     tourn = Tournament(
         slug=slug,
         game_id=gid,
@@ -151,11 +159,13 @@ async def create_tournament(
         title=payload.title,
         prize_pool_inr=payload.prize_pool_inr,
         entry_fee_inr=payload.entry_fee_inr,
-        status="DRAFT",
+        status=payload.status or "DRAFT",
         starts_at=payload.starts_at,
         roster_lock_time=payload.roster_lock_time,
         server_region=payload.server_region,
         max_teams=payload.max_teams,
+        min_team_size=payload.min_team_size or 1,
+        max_team_size=payload.max_team_size or 5,
         rank_requirement=payload.rank_requirement,
         format=payload.format,
         banner_url=banner,
@@ -163,7 +173,7 @@ async def create_tournament(
         description=payload.description,
         rules=payload.rules,
         schedule=payload.schedule,
-        prizes=[{"place": "1st", "amount": f"₹{payload.prize_pool_inr}"}],
+        prizes=prizes,
         bracket_rounds=[],
     )
     tourn_doc = tourn.to_mongo()

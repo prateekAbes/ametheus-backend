@@ -56,9 +56,9 @@ async def list_tournaments(
         response.append(
             TournamentResponse(
                 id=tid,
-                slug=t["slug"],
+                slug=t.get("slug", tid),
                 organizer_id=t.get("organizer_id"),
-                title=t["title"],
+                title=t.get("title", "Championship Tournament"),
                 game_slug=game_obj["slug"] if game_obj else "valorant",
                 game_name=game_obj["name"] if game_obj else "Valorant",
                 prize_pool=f"₹{prize_inr:,}",
@@ -71,6 +71,8 @@ async def list_tournaments(
                 server_region=t.get("server_region", "AWS Mumbai (ap-south-1)"),
                 registered_teams=reg_count,
                 max_teams=t.get("max_teams", 16),
+                min_team_size=t.get("min_team_size", 1),
+                max_team_size=t.get("max_team_size", 5),
                 rank_requirement=t.get("rank_requirement", "Open to All Ranks"),
                 format=t.get("format", "Single Elimination Bracket"),
                 banner_url=t.get("banner_url") or "https://images.unsplash.com/photo-1542751371-adc38448a05e?q=80&w=1200",
@@ -111,9 +113,9 @@ async def get_tournament_by_slug(slug: str, db: AsyncIOMotorDatabase = Depends(g
 
     return TournamentResponse(
         id=tid,
-        slug=t["slug"],
+        slug=t.get("slug", tid),
         organizer_id=t.get("organizer_id"),
-        title=t["title"],
+        title=t.get("title", "Championship Tournament"),
         game_slug=game_obj["slug"] if game_obj else "valorant",
         game_name=game_obj["name"] if game_obj else "Valorant",
         prize_pool=f"₹{prize_inr:,}",
@@ -126,6 +128,8 @@ async def get_tournament_by_slug(slug: str, db: AsyncIOMotorDatabase = Depends(g
         server_region=t.get("server_region", "AWS Mumbai (ap-south-1)"),
         registered_teams=reg_count,
         max_teams=t.get("max_teams", 16),
+        min_team_size=t.get("min_team_size", 1),
+        max_team_size=t.get("max_team_size", 5),
         rank_requirement=t.get("rank_requirement", "Open to All Ranks"),
         format=t.get("format", "Single Elimination Bracket"),
         banner_url=t.get("banner_url") or "https://images.unsplash.com/photo-1542751371-adc38448a05e?q=80&w=1200",
@@ -180,6 +184,43 @@ async def register_team_for_tournament(
             detail=f"Tournament capacity of {max_teams} squads has been reached",
         )
 
+    fee_inr = tourn.get("entry_fee_inr", 0)
+
+    if not payload.team_id:
+        # Solo player registration without requiring a team
+        existing_reg = await db.tournament_registrations.find_one({
+            "tournament_id": tid,
+            "player_id": current_user.id,
+        })
+        if existing_reg:
+            raise HTTPException(status_code=400, detail="You are already registered for this tournament")
+
+        reg = TournamentRegistration(
+            tournament_id=tid,
+            player_id=current_user.id,
+            payment_status="PAID" if fee_inr > 0 else "FREE",
+            order_id="order_rzp_mock_solo" if fee_inr > 0 else None,
+            check_in_status="PENDING",
+        )
+        await db.tournament_registrations.insert_one(reg.to_mongo())
+
+        from app.services.notification import create_notification
+        await create_notification(
+            db=db,
+            user_id=current_user.id,
+            title="Tournament Registered",
+            message=f'You are confirmed as a solo contender for "{tourn.get("title", "Tournament")}". Check bracket schedule for match timings.',
+            notification_type="TOURNAMENT",
+            link=f"/tournaments/{tourn.get('slug', tid)}",
+        )
+
+        return {
+            "status": "success",
+            "message": f'Successfully registered as a solo contender for {tourn.get("title", "Tournament")}!',
+            "order_id": reg.order_id,
+            "entry_fee_inr": fee_inr,
+        }
+
     # 3. Team check
     team = await db.teams.find_one({"$or": [{"_id": payload.team_id}, {"id": payload.team_id}]})
     if not team:
@@ -210,8 +251,6 @@ async def register_team_for_tournament(
     if existing_reg:
         raise HTTPException(status_code=400, detail="Team is already registered for this tournament")
 
-    fee_inr = tourn.get("entry_fee_inr", 0)
-
     # 7. Create registration record
     reg = TournamentRegistration(
         tournament_id=tid,
@@ -227,14 +266,14 @@ async def register_team_for_tournament(
         db=db,
         user_id=current_user.id,
         title="Tournament Registered",
-        message=f'Squad "{team["name"]}" is confirmed for "{tourn["title"]}". Check bracket schedule for match timings.',
+        message=f'Squad "{team["name"]}" is confirmed for "{tourn.get("title", "Tournament")}". Check bracket schedule for match timings.',
         notification_type="TOURNAMENT",
-        link=f"/tournaments/{tourn['slug']}",
+        link=f"/tournaments/{tourn.get('slug', tid)}",
     )
 
     return {
         "status": "success",
-        "message": f'Squad "{team["name"]}" successfully registered for {tourn["title"]}!',
+        "message": f'Squad "{team["name"]}" successfully registered for {tourn.get("title", "Tournament")}!',
         "order_id": reg.order_id,
         "entry_fee_inr": fee_inr,
     }
