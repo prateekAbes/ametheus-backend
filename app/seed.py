@@ -446,14 +446,14 @@ async def populate_seed_data(db: AsyncIOMotorDatabase):
         tournament_id="tourn_val_open_01",
         team_id="team_solaris_x",
         payment_status="PAID",
-        order_id="order_rzp_demo_1",
+        order_id="order_escrow_demo_1",
         check_in_status="CHECKED_IN",
     )
     reg2 = TournamentRegistration(
         tournament_id="tourn_val_open_01",
         team_id="team_apex_strikers",
         payment_status="PAID",
-        order_id="order_rzp_demo_2",
+        order_id="order_escrow_demo_2",
         check_in_status="CHECKED_IN",
     )
     for r in [reg1, reg2]:

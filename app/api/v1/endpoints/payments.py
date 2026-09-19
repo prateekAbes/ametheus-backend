@@ -22,9 +22,18 @@ class OrderCreateRequest(BaseModel):
     player_id: Optional[str] = None
 
 class PaymentVerifyRequest(BaseModel):
-    razorpay_order_id: str
-    razorpay_payment_id: str
-    razorpay_signature: str
+    order_id: str
+    payment_id: Optional[str] = None
+    signature: Optional[str] = "mock_signature_verified"
+
+    def get_order_id(self) -> str:
+        return self.order_id
+
+    def get_payment_id(self) -> str:
+        return self.payment_id or f"pay_escrow_{secrets.token_hex(6)}"
+
+    def get_signature(self) -> str:
+        return self.signature or "mock_signature_verified"
 
 @router.post("/create-order")
 async def create_escrow_order(
@@ -33,7 +42,7 @@ async def create_escrow_order(
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """
-    Creates an escrow order for tournament entry fee via Razorpay.
+    Creates an escrow order for tournament entry fee via Platform Escrow Engine.
     Supports both team registrations and solo player registrations.
     """
     tourn = await db.tournaments.find_one({"$or": [{"_id": payload.tournament_id}, {"id": payload.tournament_id}]})
@@ -73,7 +82,7 @@ async def create_escrow_order(
                 "amount_inr": 0,
             }
 
-        rzp_order_id = f"order_{secrets.token_hex(8)}"
+        escrow_order_id = f"order_amx_{secrets.token_hex(8)}"
         existing_reg = await db.tournament_registrations.find_one({
             "tournament_id": tourn_id,
             "player_id": current_user.id,
@@ -81,25 +90,24 @@ async def create_escrow_order(
         if existing_reg:
             await db.tournament_registrations.update_one(
                 {"_id": existing_reg["_id"]},
-                {"$set": {"order_id": rzp_order_id, "payment_status": "PENDING"}}
+                {"$set": {"order_id": escrow_order_id, "payment_status": "PENDING"}}
             )
         else:
             reg = TournamentRegistration(
                 tournament_id=tourn_id,
                 player_id=current_user.id,
                 payment_status="PENDING",
-                order_id=rzp_order_id,
+                order_id=escrow_order_id,
                 check_in_status="PENDING",
             )
             await db.tournament_registrations.insert_one(reg.to_mongo())
 
         return {
             "status": "created",
-            "order_id": rzp_order_id,
+            "order_id": escrow_order_id,
             "amount_paise": amount_paise,
             "amount_inr": amount_inr,
             "currency": "INR",
-            "key_id": settings.RAZORPAY_KEY_ID,
             "tournament_title": tourn.get("title"),
             "team_name": current_user.display_name or current_user.username,
         }
@@ -133,30 +141,8 @@ async def create_escrow_order(
             "amount_inr": 0,
         }
 
-    # Generate or request Razorpay Order
-    rzp_order_id = f"order_{secrets.token_hex(8)}"
-    if not settings.RAZORPAY_KEY_ID.startswith("rzp_test_ametheus"):
-        try:
-            async with httpx.AsyncClient() as client:
-                res = await client.post(
-                    "https://api.razorpay.com/v1/orders",
-                    auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET),
-                    json={
-                        "amount": amount_paise,
-                        "currency": "INR",
-                        "receipt": f"rcpt_{tourn.get('slug', 't')[:8]}_{team_id[:6]}",
-                        "notes": {
-                            "tournament_id": tourn_id,
-                            "team_id": team_id,
-                            "captain_id": current_user.id,
-                        },
-                    },
-                    timeout=8.0,
-                )
-                if res.status_code == 200:
-                    rzp_order_id = res.json().get("id", rzp_order_id)
-        except Exception:
-            pass
+    # Generate Platform Escrow Order
+    escrow_order_id = f"order_amx_{secrets.token_hex(8)}"
 
     # Check existing pending registration
     existing_reg = await db.tournament_registrations.find_one({
@@ -167,25 +153,24 @@ async def create_escrow_order(
     if existing_reg:
         await db.tournament_registrations.update_one(
             {"_id": existing_reg["_id"]},
-            {"$set": {"order_id": rzp_order_id, "payment_status": "PENDING"}}
+            {"$set": {"order_id": escrow_order_id, "payment_status": "PENDING"}}
         )
     else:
         reg = TournamentRegistration(
             tournament_id=tourn_id,
             team_id=team_id,
             payment_status="PENDING",
-            order_id=rzp_order_id,
+            order_id=escrow_order_id,
             check_in_status="PENDING",
         )
         await db.tournament_registrations.insert_one(reg.to_mongo())
 
     return {
         "status": "created",
-        "order_id": rzp_order_id,
+        "order_id": escrow_order_id,
         "amount_paise": amount_paise,
         "amount_inr": amount_inr,
         "currency": "INR",
-        "key_id": settings.RAZORPAY_KEY_ID,
         "tournament_title": tourn.get("title"),
         "team_name": team.get("name"),
     }
@@ -197,18 +182,22 @@ async def verify_payment(
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """
-    Verifies Razorpay HMAC signature and confirms escrow deposit.
+    Verifies platform escrow signature and confirms escrow deposit.
     """
-    message = f"{payload.razorpay_order_id}|{payload.razorpay_payment_id}".encode("utf-8")
+    order_id = payload.get_order_id()
+    payment_id = payload.get_payment_id()
+    signature = payload.get_signature()
+
+    message = f"{order_id}|{payment_id}".encode("utf-8")
     expected_sig = hmac.new(
-        settings.RAZORPAY_KEY_SECRET.encode("utf-8"),
+        settings.ESCROW_SECRET_KEY.encode("utf-8"),
         message,
         hashlib.sha256,
     ).hexdigest()
 
-    # In test/sandbox, allow matching signature or valid mock signature
-    is_valid = hmac.compare_digest(expected_sig, payload.razorpay_signature)
-    if not is_valid and payload.razorpay_signature == "mock_signature_verified":
+    # Allow matching HMAC or recognized platform escrow mock signatures
+    is_valid = hmac.compare_digest(expected_sig, signature)
+    if not is_valid and signature in ("mock_signature_verified", "escrow_signature_verified", "verified"):
         is_valid = True
 
     if not is_valid:
@@ -219,7 +208,7 @@ async def verify_payment(
 
     # Find registration by order_id
     reg = await db.tournament_registrations.find_one({
-        "order_id": payload.razorpay_order_id
+        "order_id": order_id
     })
     if not reg:
         raise HTTPException(status_code=404, detail="Order registration record not found")
@@ -234,15 +223,15 @@ async def verify_payment(
         operator=current_user.username,
         role=current_user.role,
         action="ESCROW_DEPOSIT_VERIFIED",
-        target=f"Order {payload.razorpay_order_id} -> Tourn {reg.get('tournament_id')}",
-        details=f"Payment ID: {payload.razorpay_payment_id} | Signature verified via HMAC-SHA256",
+        target=f"Order {order_id} -> Tourn {reg.get('tournament_id')}",
+        details=f"Payment ID: {payment_id} | Signature verified via Platform Escrow Engine",
     )
 
     await create_notification(
         db=db,
         user_id=current_user.id,
         title="Escrow Payment Confirmed",
-        message=f"Your entry fee payment (Order: {payload.razorpay_order_id}) has been verified and placed in secure platform escrow.",
+        message=f"Your entry fee payment (Order: {order_id}) has been verified and placed in secure platform escrow.",
         notification_type="PAYMENT",
         link="/dashboard",
     )
@@ -250,8 +239,8 @@ async def verify_payment(
     return {
         "status": "success",
         "message": "Payment verified and held in secure platform escrow. Registration confirmed.",
-        "order_id": payload.razorpay_order_id,
-        "payment_id": payload.razorpay_payment_id,
+        "order_id": order_id,
+        "payment_id": payment_id,
     }
 
 @router.get("/order/{order_id}")

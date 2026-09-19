@@ -26,8 +26,7 @@ class Settings(BaseSettings):
     ]
     CLERK_ISSUER: str = "https://clerk.ametheus.gg"
     SUPER_ADMIN_EMAIL: str = "admin@ametheus.gg"
-    RAZORPAY_KEY_ID: str = "rzp_test_ametheus_escrow"
-    RAZORPAY_KEY_SECRET: str = "mock_secret_key_escrow_123"
+    ESCROW_SECRET_KEY: str = "ametheus_escrow_vault_secret_2026"
 
     @field_validator("DATABASE_URL", mode="before")
     @classmethod

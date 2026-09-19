@@ -62,9 +62,9 @@ async def test_escrow_payment_order_and_verification(client):
 
     # 3. Invalid signature verification -> 400
     bad_verify_payload = {
-        "razorpay_order_id": order_id,
-        "razorpay_payment_id": "pay_test_12345",
-        "razorpay_signature": "invalid_tampered_signature",
+        "order_id": order_id,
+        "payment_id": "pay_test_12345",
+        "signature": "invalid_tampered_signature",
     }
     bad_res = await client.post("/api/v1/payments/verify", json=bad_verify_payload, headers=headers_captain)
     assert bad_res.status_code == 400
@@ -72,12 +72,12 @@ async def test_escrow_payment_order_and_verification(client):
     # 4. Valid HMAC signature verification -> 200
     payment_id = "pay_valid_999888"
     message = f"{order_id}|{payment_id}".encode("utf-8")
-    valid_sig = hmac.new(settings.RAZORPAY_KEY_SECRET.encode("utf-8"), message, hashlib.sha256).hexdigest()
+    valid_sig = hmac.new(settings.ESCROW_SECRET_KEY.encode("utf-8"), message, hashlib.sha256).hexdigest()
 
     good_verify_payload = {
-        "razorpay_order_id": order_id,
-        "razorpay_payment_id": payment_id,
-        "razorpay_signature": valid_sig,
+        "order_id": order_id,
+        "payment_id": payment_id,
+        "signature": valid_sig,
     }
     good_res = await client.post("/api/v1/payments/verify", json=good_verify_payload, headers=headers_captain)
     assert good_res.status_code == 200

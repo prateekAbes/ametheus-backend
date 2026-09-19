@@ -285,7 +285,7 @@ async def deposit_funds(
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """
-    Adds funds to the user's wallet via Razorpay Sandbox/Test.
+    Adds funds to the user's wallet via Platform Escrow Deposit.
     """
     user_doc = await db.users.find_one({"$or": [{"_id": current_user.id}, {"id": current_user.id}]})
     if not user_doc:
@@ -305,7 +305,7 @@ async def deposit_funds(
         role=current_user.role,
         action="WALLET_DEPOSIT_COMPLETED",
         target=f"User {current_user.id} (+₹{payload.amount})",
-        details="Credited via Razorpay Sandbox",
+        details="Credited via Platform Escrow Deposit",
     )
 
     await create_notification(

@@ -225,7 +225,7 @@ async def register_team_for_tournament(
             tournament_id=tid,
             player_id=current_user.id,
             payment_status="PAID" if fee_inr > 0 else "FREE",
-            order_id="order_rzp_mock_solo" if fee_inr > 0 else None,
+            order_id="order_escrow_mock_solo" if fee_inr > 0 else None,
             check_in_status="PENDING",
         )
         await db.tournament_registrations.insert_one(reg.to_mongo())
@@ -282,7 +282,7 @@ async def register_team_for_tournament(
         tournament_id=tid,
         team_id=team_id,
         payment_status="PAID" if fee_inr > 0 else "FREE",
-        order_id="order_rzp_mock_123" if fee_inr > 0 else None,
+        order_id="order_escrow_mock_123" if fee_inr > 0 else None,
         check_in_status="PENDING",
     )
     await db.tournament_registrations.insert_one(reg.to_mongo())
