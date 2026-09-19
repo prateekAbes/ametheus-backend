@@ -1,5 +1,7 @@
 import json
+import re
 from typing import List, Optional
+from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, status
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from app.api.deps import get_db, get_current_user
@@ -18,6 +20,32 @@ def safe_json_loads(val, default):
         return json.loads(val)
     except Exception:
         return default
+
+async def find_tournament_by_id_or_slug(db: AsyncIOMotorDatabase, identifier: str):
+    if not identifier:
+        return None
+    or_clauses = [
+        {"slug": identifier},
+        {"id": identifier},
+        {"slug": identifier.lower()},
+        {"_id": identifier},
+    ]
+    if ObjectId.is_valid(identifier):
+        try:
+            or_clauses.append({"_id": ObjectId(identifier)})
+        except Exception:
+            pass
+    try:
+        slug_escaped = re.escape(identifier).replace(r"\-", "[-_ ]")
+        or_clauses.append({"slug": {"$regex": f"^{slug_escaped}$", "$options": "i"}})
+        # Also match title if the slug looks like a converted title
+        title_pattern = re.escape(identifier.replace("-", " "))
+        or_clauses.append({"title": {"$regex": f"^{title_pattern}$", "$options": "i"}})
+    except Exception:
+        pass
+
+    return await db.tournaments.find_one({"$or": or_clauses})
+
 
 @router.get("", response_model=List[TournamentResponse])
 async def list_tournaments(
@@ -89,9 +117,7 @@ async def list_tournaments(
 
 @router.get("/{slug}", response_model=TournamentResponse)
 async def get_tournament_by_slug(slug: str, db: AsyncIOMotorDatabase = Depends(get_db)):
-    t = await db.tournaments.find_one({
-        "$or": [{"slug": slug}, {"_id": slug}, {"id": slug}]
-    })
+    t = await find_tournament_by_id_or_slug(db, slug)
     if not t:
         raise HTTPException(status_code=404, detail="Tournament not found")
 
@@ -159,7 +185,7 @@ async def register_team_for_tournament(
     - Team belongs to correct game discipline
     - Team is not already registered
     """
-    tourn = await db.tournaments.find_one({"$or": [{"_id": id}, {"id": id}]})
+    tourn = await find_tournament_by_id_or_slug(db, id)
     if not tourn:
         raise HTTPException(status_code=404, detail="Tournament not found")
 
