@@ -9,7 +9,7 @@ _db: Optional[AsyncIOMotorDatabase] = None
 
 def get_client() -> AsyncIOMotorClient:
     global _client
-    if _client is None:
+    if _client is None or (hasattr(_client, "get_io_loop") and _client.get_io_loop().is_closed()):
         _client = AsyncIOMotorClient(
             settings.MONGODB_URI,
             serverSelectionTimeoutMS=5000,
@@ -17,8 +17,8 @@ def get_client() -> AsyncIOMotorClient:
     return _client
 
 def get_database() -> AsyncIOMotorDatabase:
-    global _db
-    if _db is None:
+    global _db, _client
+    if _db is None or _client is None or (hasattr(_client, "get_io_loop") and _client.get_io_loop().is_closed()):
         client = get_client()
         _db = client[settings.MONGODB_DB_NAME]
     return _db

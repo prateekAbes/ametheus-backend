@@ -14,7 +14,8 @@ from app.schemas import TournamentResponse
 router = APIRouter()
 
 VALID_TRANSITIONS = {
-    "DRAFT": ["REGISTRATION_OPEN", "CANCELLED"],
+    "DRAFT": ["COMING_SOON", "REGISTRATION_OPEN", "CANCELLED"],
+    "COMING_SOON": ["DRAFT", "REGISTRATION_OPEN", "CANCELLED"],
     "REGISTRATION_OPEN": ["REGISTRATION_CLOSED", "LIVE", "CANCELLED"],
     "REGISTRATION_CLOSED": ["UPCOMING", "LIVE", "REGISTRATION_OPEN", "CANCELLED"],
     "UPCOMING": ["LIVE", "CANCELLED"],
@@ -44,6 +45,9 @@ class TournamentCreatePayload(BaseModel):
     min_team_size: Optional[int] = 1
     max_team_size: Optional[int] = 5
     status: Optional[str] = "DRAFT"
+    expected_start_date: Optional[str] = None
+    registration_open_date: Optional[str] = None
+    announcement_text: Optional[str] = None
     rank_requirement: str = "Open to All Ranks"
     format: str = "Single Elimination Bracket"
     banner_url: Optional[str] = None
@@ -63,6 +67,9 @@ class TournamentUpdatePayload(BaseModel):
     max_teams: Optional[int] = None
     min_team_size: Optional[int] = None
     max_team_size: Optional[int] = None
+    expected_start_date: Optional[str] = None
+    registration_open_date: Optional[str] = None
+    announcement_text: Optional[str] = None
     rank_requirement: Optional[str] = None
     format: Optional[str] = None
     banner_url: Optional[str] = None
@@ -111,6 +118,9 @@ def serialize_tournament_response(t: dict, game_obj: Optional[dict], reg_count: 
         entry_fee=f"₹{fee_inr} / Team" if fee_inr > 0 else "₹0 / Free",
         entry_fee_inr=fee_inr,
         status=t.get("status", "REGISTRATION_OPEN"),
+        expected_start_date=t.get("expected_start_date"),
+        registration_open_date=t.get("registration_open_date"),
+        announcement_text=t.get("announcement_text"),
         starts_at=t.get("starts_at", "TBD"),
         roster_lock_time=t.get("roster_lock_time", "TBD"),
         server_region=t.get("server_region", "AWS Mumbai (ap-south-1)"),
@@ -160,6 +170,9 @@ async def create_tournament(
         prize_pool_inr=payload.prize_pool_inr,
         entry_fee_inr=payload.entry_fee_inr,
         status=payload.status or "DRAFT",
+        expected_start_date=payload.expected_start_date,
+        registration_open_date=payload.registration_open_date,
+        announcement_text=payload.announcement_text,
         starts_at=payload.starts_at,
         roster_lock_time=payload.roster_lock_time,
         server_region=payload.server_region,
@@ -236,6 +249,12 @@ async def update_tournament(
         update_fields["max_team_size"] = payload.max_team_size
     if payload.status is not None:
         update_fields["status"] = payload.status
+    if payload.expected_start_date is not None:
+        update_fields["expected_start_date"] = payload.expected_start_date
+    if payload.registration_open_date is not None:
+        update_fields["registration_open_date"] = payload.registration_open_date
+    if payload.announcement_text is not None:
+        update_fields["announcement_text"] = payload.announcement_text
 
     if update_fields:
         await db.tournaments.update_one({"_id": tourn["_id"]}, {"$set": update_fields})
@@ -247,6 +266,48 @@ async def update_tournament(
     reg_count = await db.tournament_registrations.count_documents({"$or": [{"tournament_id": tid}, {"tournament_id": updated_tourn.get("slug")}]})
 
     return serialize_tournament_response(updated_tourn, game, reg_count)
+
+@router.post("/tournaments/{id}/publish", response_model=TournamentResponse)
+async def publish_tournament(
+    id: str,
+    organizer: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Organizer or Super Admin privilege: One-click publish tournament from COMING_SOON/DRAFT to REGISTRATION_OPEN.
+    """
+    tourn = await db.tournaments.find_one({"$or": [{"_id": id}, {"id": id}, {"slug": id}]})
+    if not tourn:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+
+    if organizer.role != "SUPER_ADMIN" and tourn.get("organizer_id") != organizer.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only publish your own tournaments",
+        )
+
+    validate_tournament_transition(tourn.get("status", "DRAFT"), "REGISTRATION_OPEN")
+
+    await db.tournaments.update_one(
+        {"_id": tourn["_id"]},
+        {"$set": {"status": "REGISTRATION_OPEN"}}
+    )
+
+    await record_audit_log(
+        db=db,
+        operator=organizer.username,
+        role=organizer.role,
+        action="PUBLISH_TOURNAMENT",
+        target=f"Tournament {tourn.get('title')} ({id})",
+        details="Published tournament to REGISTRATION_OPEN",
+    )
+
+    updated = await db.tournaments.find_one({"_id": tourn["_id"]})
+    gid = updated.get("game_id")
+    game = await db.games.find_one({"$or": [{"_id": gid}, {"id": gid}, {"slug": gid}]})
+    tid = str(updated.get("_id", updated.get("id")))
+    reg_count = await db.tournament_registrations.count_documents({"$or": [{"tournament_id": tid}, {"tournament_id": updated.get("slug")}]})
+    return serialize_tournament_response(updated, game, reg_count)
 
 @router.delete("/tournaments/{id}")
 async def delete_tournament(

@@ -420,6 +420,8 @@ async def populate_seed_data(db: AsyncIOMotorDatabase):
             roster_lock_time="3:45 PM IST",
             server_region="Global Arbiter Node",
             max_teams=32,
+            min_team_size=1,
+            max_team_size=1,
             rank_requirement="FIDE / Chess.com 1500+",
             format="Swiss 5 Rounds + Knockout",
             banner_url="https://images.unsplash.com/photo-1529699211952-734e80c4d42b?q=80&w=1200",

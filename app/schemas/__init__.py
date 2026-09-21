@@ -38,6 +38,13 @@ class GameResponse(BaseModel):
     anti_cheat: str
     match_protocol: str
     accent_color: Optional[str] = "#E56A10"
+    status: str = "ACTIVE"
+    expected_release_date: Optional[str] = None
+    announcement_text: Optional[str] = None
+    hero_media_url: Optional[str] = None
+    hero_media_type: Optional[str] = "gif"
+    hero_media_enabled: bool = True
+    gallery: List[Dict[str, Any]] = []
     active_tournaments_count: int = 0
     model_config = ConfigDict(from_attributes=True)
 
@@ -57,6 +64,13 @@ class GameCreate(BaseModel):
     anti_cheat: str = "Standard Protocol"
     match_protocol: str = "Custom Lobby"
     accent_color: Optional[str] = "#E56A10"
+    status: Optional[str] = "ACTIVE"
+    expected_release_date: Optional[str] = None
+    announcement_text: Optional[str] = None
+    hero_media_url: Optional[str] = None
+    hero_media_type: Optional[str] = "gif"
+    hero_media_enabled: Optional[bool] = True
+    gallery: Optional[List[Dict[str, Any]]] = None
 
 class GameUpdate(BaseModel):
     name: Optional[str] = None
@@ -73,6 +87,13 @@ class GameUpdate(BaseModel):
     anti_cheat: Optional[str] = None
     match_protocol: Optional[str] = None
     accent_color: Optional[str] = None
+    status: Optional[str] = None
+    expected_release_date: Optional[str] = None
+    announcement_text: Optional[str] = None
+    hero_media_url: Optional[str] = None
+    hero_media_type: Optional[str] = None
+    hero_media_enabled: Optional[bool] = None
+    gallery: Optional[List[Dict[str, Any]]] = None
 
 # Team
 class TeamMemberResponse(BaseModel):
@@ -118,6 +139,9 @@ class TournamentResponse(BaseModel):
     entry_fee: Optional[str] = "₹0 / Free"
     entry_fee_inr: Optional[int] = 0
     status: Optional[str] = "REGISTRATION_OPEN"
+    expected_start_date: Optional[str] = None
+    registration_open_date: Optional[str] = None
+    announcement_text: Optional[str] = None
     starts_at: Optional[str] = "TBD"
     roster_lock_time: Optional[str] = "TBD"
     server_region: Optional[str] = "AWS Mumbai (ap-south-1)"

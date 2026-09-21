@@ -97,3 +97,55 @@ async def test_leaderboard_discovery(client):
     cat_resp = await client.get("/api/v1/leaderboard?category=pc")
     assert cat_resp.status_code == 200
     assert isinstance(cat_resp.json(), list)
+
+@pytest.mark.asyncio
+async def test_chess_solo_registration_and_squad_rejection(client):
+    headers_player = make_auth_headers("usr_chess_gm")
+    headers_captain = make_auth_headers("usr_chess_cap")
+
+    async with TestSessionLocal() as db:
+        u1 = User(id="usr_chess_gm", clerk_user_id="usr_chess_gm", email="gm@test.com", username="chess_gm", role="PLAYER")
+        u2 = User(id="usr_chess_cap", clerk_user_id="usr_chess_cap", email="cap@test.com", username="chess_cap", role="PLAYER")
+        fake_team = Team(
+            game_id="chess",
+            captain_id="usr_chess_cap",
+            name="Fake Squad",
+            tag="FAK",
+            invite_code="FAK123",
+            max_members=1,
+        )
+        db.add_all([u1, u2, fake_team])
+        await db.commit()
+        team_id = fake_team.id
+
+    t_res = await client.get("/api/v1/tournaments/ametheus-chess-blitz-01")
+    assert t_res.status_code == 200
+    t_id = t_res.json()["id"]
+
+    # 1. Attempt registering with a team for Chess -> 400 rejection
+    squad_res = await client.post(
+        f"/api/v1/tournaments/{t_id}/register",
+        json={"team_id": team_id},
+        headers=headers_captain,
+    )
+    assert squad_res.status_code == 400
+    assert "solo" in squad_res.json()["detail"].lower()
+
+    # 2. Individual solo registration without team_id -> 200 success
+    solo_res = await client.post(
+        f"/api/v1/tournaments/{t_id}/register",
+        json={},
+        headers=headers_player,
+    )
+    assert solo_res.status_code == 200
+    assert "solo contender" in solo_res.json()["message"].lower()
+
+    # 3. Duplicate solo registration -> 400
+    dup_res = await client.post(
+        f"/api/v1/tournaments/{t_id}/register",
+        json={},
+        headers=headers_player,
+    )
+    assert dup_res.status_code == 400
+    assert "already registered" in dup_res.json()["detail"].lower()
+

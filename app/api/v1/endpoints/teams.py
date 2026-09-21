@@ -73,8 +73,16 @@ async def create_team(
     if not game:
         raise HTTPException(status_code=404, detail="Game not found")
 
-    gid = str(game.get("_id", game.get("id")))
+    # Reject team creation for solo games (e.g. Chess)
+    is_team_game = game.get("is_team_game", True)
     max_size = game.get("max_team_size", 5)
+    if not is_team_game or max_size <= 1:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{game.get('name', 'This game')} is a solo title and does not support squad creation.",
+        )
+
+    gid = str(game.get("_id", game.get("id")))
 
     # Add captain as first member
     captain_member = TeamMember(
@@ -108,8 +116,17 @@ async def join_team(
     if not team:
         raise HTTPException(status_code=404, detail="Invalid invite code. No squad found.")
 
+    game_id = team.get("game_id")
+    game = await db.games.find_one({"$or": [{"_id": game_id}, {"id": game_id}, {"slug": game_id}]})
+    if game and (not game.get("is_team_game", True) or game.get("max_team_size", 5) <= 1):
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot join a squad for a solo discipline.",
+        )
+
     members = team.get("members", [])
-    if len(members) >= team.get("max_members", 5):
+    max_cap = team.get("max_members") or (game.get("max_team_size", 5) if game else 5)
+    if len(members) >= max_cap:
         raise HTTPException(status_code=400, detail="Team roster is already full.")
 
     if any((m.get("user_id") if isinstance(m, dict) else m.user_id) == current_user.id for m in members):

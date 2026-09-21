@@ -45,7 +45,9 @@ async def create_escrow_order(
     Creates an escrow order for tournament entry fee via Platform Escrow Engine.
     Supports both team registrations and solo player registrations.
     """
-    tourn = await db.tournaments.find_one({"$or": [{"_id": payload.tournament_id}, {"id": payload.tournament_id}]})
+    tourn = await db.tournaments.find_one({
+        "$or": [{"_id": payload.tournament_id}, {"id": payload.tournament_id}, {"slug": payload.tournament_id}]
+    })
     if not tourn:
         raise HTTPException(status_code=404, detail="Tournament not found")
 

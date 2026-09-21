@@ -1,5 +1,5 @@
-from typing import List
-from fastapi import APIRouter, Depends, HTTPException
+from typing import List, Optional
+from fastapi import APIRouter, Depends, HTTPException, Query
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from app.api.deps import get_db, get_current_user
@@ -12,8 +12,21 @@ from app.core.ws import ws_manager
 router = APIRouter()
 
 @router.get("", response_model=List[MatchResponse])
-async def list_matches(db: AsyncIOMotorDatabase = Depends(get_db)):
-    cursor = db.matches.find({})
+async def list_matches(
+    tournament_id: Optional[str] = Query(None, description="Filter matches by tournament ID or slug"),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    query = {}
+    if tournament_id:
+        tourn = await db.tournaments.find_one({"$or": [{"_id": tournament_id}, {"id": tournament_id}, {"slug": tournament_id}]})
+        if tourn:
+            tid = str(tourn.get("_id", tourn.get("id")))
+            tslug = tourn.get("slug")
+            query["$or"] = [{"tournament_id": tid}, {"tournament_id": tslug}]
+        else:
+            query["tournament_id"] = tournament_id
+
+    cursor = db.matches.find(query)
     matches = await cursor.to_list(length=200)
 
     response = []

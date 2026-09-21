@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, List, Dict, Any
 from datetime import datetime
 from pydantic import BaseModel, Field
 from app.models.base import generate_uuid, get_utc_now
@@ -20,6 +20,13 @@ class Game(BaseModel):
     anti_cheat: str = "Hardware TPM 2.0 Vanguard"
     match_protocol: str = "Competitive MR12"
     accent_color: str = "#E56A10"
+    status: str = "ACTIVE"  # ACTIVE, COMING_SOON, DRAFT
+    expected_release_date: Optional[str] = None
+    announcement_text: Optional[str] = None
+    hero_media_url: Optional[str] = None
+    hero_media_type: str = "gif"
+    hero_media_enabled: bool = True
+    gallery: List[Dict[str, Any]] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=get_utc_now)
     updated_at: datetime = Field(default_factory=get_utc_now)
 

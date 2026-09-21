@@ -12,7 +12,10 @@ class Tournament(BaseModel):
     title: str
     prize_pool_inr: int = 0
     entry_fee_inr: int = 0
-    status: str = "REGISTRATION_OPEN"  # DRAFT, REGISTRATION_OPEN, REGISTRATION_CLOSED, UPCOMING, LIVE, COMPLETED, CANCELLED
+    status: str = "REGISTRATION_OPEN"  # DRAFT, COMING_SOON, REGISTRATION_OPEN, REGISTRATION_CLOSED, UPCOMING, LIVE, COMPLETED, CANCELLED
+    expected_start_date: Optional[str] = None
+    registration_open_date: Optional[str] = None
+    announcement_text: Optional[str] = None
     starts_at: str
     roster_lock_time: str
     server_region: str = "AWS Mumbai (ap-south-1)"
