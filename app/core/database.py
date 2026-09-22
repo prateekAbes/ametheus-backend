@@ -55,43 +55,46 @@ async def init_db_indexes(db: AsyncIOMotorDatabase):
         await db.users.create_index("email", unique=True)
         await db.users.create_index("username", unique=True)
         await db.users.create_index("clerk_user_id", unique=True, sparse=True)
+        await db.users.create_index("is_dummy")
 
         # Games
         await db.games.create_index("slug", unique=True)
-
-        # Tournaments
-        await db.tournaments.create_index("slug", unique=True)
-        await db.tournaments.create_index("game_id")
-        await db.tournaments.create_index("organizer_id")
-        await db.tournaments.create_index("status")
+        await db.games.create_index("is_dummy")
 
         # Teams
         await db.teams.create_index("invite_code", unique=True)
         await db.teams.create_index("captain_id")
         await db.teams.create_index("game_id")
+        await db.teams.create_index("is_dummy")
 
-        # Tournament Registrations
-        await db.tournament_registrations.create_index("tournament_id")
-        await db.tournament_registrations.create_index("team_id")
-        await db.tournament_registrations.create_index("player_id")
+        # UPI Accounts
+        await db.upi_accounts.create_index("code", unique=True)
+        await db.upi_accounts.create_index("status")
+        await db.upi_accounts.create_index("is_dummy")
 
-        # Matches
-        await db.matches.create_index("tournament_id")
-        await db.matches.create_index("status")
+        # Game Payments
+        await db.game_payments.create_index([("utr", 1), ("payment_type", 1)], unique=True, sparse=True)
+        await db.game_payments.create_index("status")
+        await db.game_payments.create_index("user_id")
+        await db.game_payments.create_index("game_id")
+        await db.game_payments.create_index("team_id")
+        await db.game_payments.create_index("payment_account_code")
+        await db.game_payments.create_index("is_dummy")
 
-        # Admin Assignments
-        await db.tournament_admin_assignments.create_index([("admin_user_id", 1), ("tournament_id", 1)])
+        # Wallet Ledger
+        await db.wallet_ledger.create_index("user_id")
+        await db.wallet_ledger.create_index("created_at")
+        await db.wallet_ledger.create_index("is_dummy")
 
-        # Audit Logs
+        # Payouts
+        await db.payouts.create_index("user_id")
+        await db.payouts.create_index("status")
+        await db.payouts.create_index("game_id")
+        await db.payouts.create_index("is_dummy")
+
+        # Audit Logs & Notifications
         await db.audit_logs.create_index("created_at")
-
-        # Disputes
-        await db.disputes.create_index("tournament_id")
-        await db.disputes.create_index("match_id")
-
-        # Notifications
         await db.notifications.create_index("user_id")
         await db.notifications.create_index([("user_id", 1), ("is_read", 1)])
     except Exception as e:
         print(f"[AMETHEUS MongoDB Warning] Index initialization error: {e}")
-

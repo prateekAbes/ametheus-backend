@@ -18,6 +18,8 @@ class UserCreate(UserBase):
 class UserResponse(UserBase):
     id: str
     inr_balance: str = "0"
+    inr_balance_paise: int = 0
+    inr_reserved_paise: int = 0
     model_config = ConfigDict(from_attributes=True)
 
 # Game
@@ -31,6 +33,10 @@ class GameResponse(BaseModel):
     is_team_game: bool
     min_team_size: int
     max_team_size: int
+    max_substitutes: int = 1
+    entry_fee_inr: int = 0
+    prize_pool_inr: int = 0
+    play_url: Optional[str] = None
     banner_url: str
     logo_url: str
     description: str
@@ -45,7 +51,7 @@ class GameResponse(BaseModel):
     hero_media_type: Optional[str] = "gif"
     hero_media_enabled: bool = True
     gallery: List[Dict[str, Any]] = []
-    active_tournaments_count: int = 0
+    teams_count: int = 0
     model_config = ConfigDict(from_attributes=True)
 
 class GameCreate(BaseModel):
@@ -57,6 +63,10 @@ class GameCreate(BaseModel):
     is_team_game: bool = True
     min_team_size: int = 1
     max_team_size: int = 5
+    max_substitutes: int = 1
+    entry_fee_inr: int = 0
+    prize_pool_inr: int = 0
+    play_url: Optional[str] = None
     banner_url: str = "https://images.unsplash.com/photo-1542751371-adc38448a05e"
     logo_url: str = "https://images.unsplash.com/photo-1542751371-adc38448a05e"
     description: str = ""
@@ -80,6 +90,10 @@ class GameUpdate(BaseModel):
     is_team_game: Optional[bool] = None
     min_team_size: Optional[int] = None
     max_team_size: Optional[int] = None
+    max_substitutes: Optional[int] = None
+    entry_fee_inr: Optional[int] = None
+    prize_pool_inr: Optional[int] = None
+    play_url: Optional[str] = None
     banner_url: Optional[str] = None
     logo_url: Optional[str] = None
     description: Optional[str] = None
@@ -113,6 +127,7 @@ class TeamCreate(BaseModel):
 class TeamJoin(BaseModel):
     invite_code: str
     player_handle: str
+    is_substitute: bool = False
 
 class TeamResponse(BaseModel):
     id: str
@@ -123,8 +138,108 @@ class TeamResponse(BaseModel):
     captain_id: str
     captain_username: str
     max_members: int
+    max_substitutes: int = 1
+    payment_status: str = "UNPAID"
+    payment_id: Optional[str] = None
     members: List[TeamMemberResponse] = []
+    substitutes: List[TeamMemberResponse] = []
     model_config = ConfigDict(from_attributes=True)
+
+# Payment & UPI
+class UpiAccountCreate(BaseModel):
+    code: str
+    upi_id: str
+    payee_name: str
+    qr_url: Optional[str] = None
+    display_name: Optional[str] = None
+    status: str = "ACTIVE"
+
+class UpiAccountUpdate(BaseModel):
+    upi_id: Optional[str] = None
+    payee_name: Optional[str] = None
+    qr_url: Optional[str] = None
+    display_name: Optional[str] = None
+    status: Optional[str] = None
+
+class UpiAccountResponse(BaseModel):
+    id: str
+    code: str
+    upi_id: str
+    payee_name: str
+    qr_url: Optional[str] = None
+    display_name: Optional[str] = None
+    status: str
+    payment_count: int
+    created_at: Any
+    model_config = ConfigDict(from_attributes=True)
+
+class GamePaymentInitiateRequest(BaseModel):
+    game_slug: str
+    team_id: Optional[str] = None
+    payment_method: str = "UPI"  # UPI, WALLET
+
+class GamePaymentInitiateResponse(BaseModel):
+    payment_id: str
+    game_id: str
+    game_name: str
+    team_id: Optional[str] = None
+    amount_inr: float
+    amount_paise: int
+    payment_method: str
+    status: str
+    wallet_discount_inr: Optional[float] = None
+    # For UPI payment:
+    payment_account_code: Optional[str] = None
+    upi_id: Optional[str] = None
+    payee_name: Optional[str] = None
+    qr_url: Optional[str] = None
+    upi_uri: Optional[str] = None
+
+class SubmitUtrRequest(BaseModel):
+    utr: str
+    screenshot_url: Optional[str] = None
+
+class WalletTopupInitiateRequest(BaseModel):
+    amount_inr: float
+
+class WalletWithdrawRequest(BaseModel):
+    amount_inr: float
+    upi_id: str
+
+class WalletBalanceResponse(BaseModel):
+    available_paise: int
+    available_inr: float
+    reserved_paise: int
+    reserved_inr: float
+    total_paise: int
+    total_inr: float
+
+# Admin
+class AuditLogResponse(BaseModel):
+    id: str
+    timestamp: str
+    operator: str
+    role: str
+    action: str
+    target: str
+    ip_address: str
+    prev_hash: Optional[str] = None
+    record_hash: Optional[str] = None
+
+# Notification
+class NotificationResponse(BaseModel):
+    id: str
+    type: str
+    title: str
+    message: str
+    is_read: bool
+    link: Optional[str] = None
+    created_at: Optional[str] = None
+    model_config = ConfigDict(from_attributes=True)
+
+class NotificationListResponse(BaseModel):
+    items: List[NotificationResponse]
+    unread_count: int
 
 # Tournament
 class TournamentResponse(BaseModel):
@@ -159,7 +274,7 @@ class TournamentResponse(BaseModel):
     prizes: List[Dict[str, Any]] = []
     bracket_rounds: List[Dict[str, Any]] = []
     registered_rosters: List[Dict[str, Any]] = []
-    model_config = ConfigDict(from_attributes=True)
+    model_config = ConfigDict(from_attributes=True, extra="allow")
 
 class TournamentRegisterRequest(BaseModel):
     team_id: Optional[str] = None
@@ -184,7 +299,7 @@ class MatchResponse(BaseModel):
     team_b: Optional[Dict[str, Any]] = None
     evidence_url: Optional[str] = None
     dispute_notes: Optional[str] = None
-    model_config = ConfigDict(from_attributes=True)
+    model_config = ConfigDict(from_attributes=True, extra="allow")
 
 class MatchResultSubmit(BaseModel):
     score_a: int
@@ -198,70 +313,49 @@ class DisputeCreate(BaseModel):
     description: str
     evidence_url: Optional[str] = None
 
+# Admin Assignments & Disputes
+class AdminAssignmentCreate(BaseModel):
+    admin_user_id: str
+    tournament_id: Optional[str] = None
+
 class DisputeResolve(BaseModel):
-    resolution_notes: str
-    decision: str = "RESOLVED"  # RESOLVED or CLOSED
+    decision: str = "RESOLVED"
+    resolution_notes: Optional[str] = None
+
 
 class DisputeResponse(BaseModel):
     id: str
-    tournament_id: str
-    match_id: str
-    submitted_by: str
+    tournament_id: Optional[str] = None
+    match_id: Optional[str] = None
+    submitted_by: Optional[str] = None
+    raised_by: Optional[str] = None
     reason: str
-    description: str
+    description: Optional[str] = None
     evidence_url: Optional[str] = None
     status: str
-    created_at: str
-    model_config = ConfigDict(from_attributes=True)
+    resolution_notes: Optional[str] = None
+    created_at: Optional[str] = None
+    model_config = ConfigDict(from_attributes=True, extra="allow")
 
-# Leaderboard
+
 class LeaderboardEntryResponse(BaseModel):
-    rank: int
     id: str
     name: str
     tag: str
-    type: str
+    type: str = "SQUAD"
     game_slug: str
     game_name: str
-    captain: str
-    logo_url: str
-    win_rate: float
-    matches_played: int
-    wins: int
-    losses: int
-    rating: int
-    earnings: int
-    form: List[str]
-    is_verified: bool
-    category: str
-
-# Admin
-class AdminAssignmentCreate(BaseModel):
-    admin_user_id: str
-    tournament_id: str
-
-class AuditLogResponse(BaseModel):
-    id: str
-    timestamp: str
-    operator: str
-    role: str
-    action: str
-    target: str
-    ip_address: str
-    prev_hash: Optional[str] = None
-    record_hash: Optional[str] = None
-
-# Notification
-class NotificationResponse(BaseModel):
-    id: str
-    type: str
-    title: str
-    message: str
-    is_read: bool
-    link: Optional[str] = None
-    created_at: Optional[str] = None
-    model_config = ConfigDict(from_attributes=True)
-
-class NotificationListResponse(BaseModel):
-    items: List[NotificationResponse]
-    unread_count: int
+    captain: Optional[str] = None
+    logo_url: Optional[str] = None
+    win_rate: Optional[Any] = "0%"
+    matches_played: int = 0
+    wins: int = 0
+    losses: int = 0
+    rating: int = 1200
+    earnings: Optional[Any] = "₹0"
+    form: List[str] = []
+    is_verified: bool = False
+    category: str = "overall"
+    rank: int = 1
+    created_at: Optional[Any] = None
+    model_config = ConfigDict(from_attributes=True, extra="allow")

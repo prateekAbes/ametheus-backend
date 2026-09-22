@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional, Dict, Any
 from pydantic import BaseModel
 from fastapi import APIRouter, Depends, HTTPException, status
 from motor.motor_asyncio import AsyncIOMotorDatabase
@@ -637,5 +637,341 @@ async def remove_persona_avatar(
         target=f"Avatar ID: {avatar_id}",
     )
     return {"status": "success", "message": f"Removed avatar {avatar_id} from persona pool"}
+
+# ----------------- PAYMENT VERIFICATION & PAYOUTS -----------------
+
+class PaymentVerifyActionPayload(BaseModel):
+    rejection_reason: Optional[str] = None
+
+class PayoutCompletePayload(BaseModel):
+    outgoing_utr: str
+
+class PayoutRejectPayload(BaseModel):
+    rejection_reason: str
+
+class CreateWinningPayoutPayload(BaseModel):
+    user_id: str
+    game_id: str
+    rank_or_placement: str
+    amount_inr: float
+    destination: str = "WALLET"  # WALLET, UPI
+    upi_id: Optional[str] = None
+
+@router.get("/payments")
+async def list_admin_payments(
+    status_filter: Optional[str] = None,
+    game_id: Optional[str] = None,
+    admin_user: User = Depends(require_super_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    query = {"is_dummy": {"$ne": True}}
+    if status_filter and status_filter.upper() != "ALL":
+        query["status"] = status_filter.upper()
+    if game_id:
+        query["game_id"] = game_id
+
+    cursor = db.game_payments.find(query).sort("created_at", -1)
+    docs = await cursor.to_list(length=200)
+    for d in docs:
+        d["id"] = str(d.get("_id", d.get("id")))
+        d.pop("_id", None)
+    return docs
+
+@router.post("/payments/{payment_id}/approve")
+async def approve_payment(
+    payment_id: str,
+    admin_user: User = Depends(require_super_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    payment = await db.game_payments.find_one({"$or": [{"_id": payment_id}, {"id": payment_id}]})
+    if not payment:
+        raise HTTPException(status_code=404, detail="Payment record not found")
+
+    if payment.get("status") == "APPROVED":
+        return {"status": "success", "message": "Payment was already approved"}
+
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+
+    await db.game_payments.update_one(
+        {"_id": payment["_id"]},
+        {
+            "$set": {
+                "status": "APPROVED",
+                "verified_by": admin_user.username,
+                "verified_at": now,
+            }
+        }
+    )
+
+    # If it was a game entry payment, set team to PAID
+    if payment.get("payment_type") == "GAME_ENTRY" and payment.get("team_id"):
+        await db.teams.update_one(
+            {"$or": [{"_id": payment["team_id"]}, {"id": payment["team_id"]}]},
+            {"$set": {"payment_status": "PAID", "payment_id": payment_id}}
+        )
+
+    # If it was a wallet topup, credit the wallet
+    if payment.get("payment_type") == "WALLET_TOPUP":
+        from app.services.wallet_service import credit_wallet_funds
+        await credit_wallet_funds(
+            db=db,
+            user_id=payment["user_id"],
+            amount_paise=payment["amount_paise"],
+            txn_type="WALLET_TOPUP",
+            reference_id=payment_id,
+            description=f"UPI Top-up (Ref: {payment.get('utr', 'Manual Approval')})",
+            admin_id=admin_user.id,
+        )
+
+    await record_audit_log(
+        db=db,
+        operator=admin_user.username,
+        role="SUPER_ADMIN",
+        action="APPROVE_PAYMENT",
+        target=f"Payment {payment_id} (₹{payment.get('amount_inr')})",
+        details=f"Approved by {admin_user.username} (UTR: {payment.get('utr')})",
+    )
+
+    return {"status": "success", "message": "Payment verified and approved successfully."}
+
+@router.post("/payments/{payment_id}/reject")
+async def reject_payment(
+    payment_id: str,
+    payload: PaymentVerifyActionPayload,
+    admin_user: User = Depends(require_super_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    payment = await db.game_payments.find_one({"$or": [{"_id": payment_id}, {"id": payment_id}]})
+    if not payment:
+        raise HTTPException(status_code=404, detail="Payment record not found")
+
+    reason = payload.rejection_reason or "Invalid transaction details"
+
+    await db.game_payments.update_one(
+        {"_id": payment["_id"]},
+        {
+            "$set": {
+                "status": "REJECTED",
+                "rejection_reason": reason,
+                "verified_by": admin_user.username,
+            }
+        }
+    )
+
+    if payment.get("payment_type") == "GAME_ENTRY" and payment.get("team_id"):
+        await db.teams.update_one(
+            {"$or": [{"_id": payment["team_id"]}, {"id": payment["team_id"]}]},
+            {"$set": {"payment_status": "PAYMENT_REJECTED"}}
+        )
+
+    await record_audit_log(
+        db=db,
+        operator=admin_user.username,
+        role="SUPER_ADMIN",
+        action="REJECT_PAYMENT",
+        target=f"Payment {payment_id}",
+        details=f"Rejected: {reason}",
+    )
+
+    return {"status": "success", "message": "Payment rejected."}
+
+@router.get("/payouts")
+async def list_admin_payouts(
+    status_filter: Optional[str] = None,
+    admin_user: User = Depends(require_super_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    query = {"is_dummy": {"$ne": True}}
+    if status_filter and status_filter.upper() != "ALL":
+        query["status"] = status_filter.upper()
+
+    cursor = db.payouts.find(query).sort("created_at", -1)
+    docs = await cursor.to_list(length=200)
+    for d in docs:
+        d["id"] = str(d.get("_id", d.get("id")))
+        d.pop("_id", None)
+        d["amount_inr"] = d.get("amount_paise", 0) / 100
+    return docs
+
+@router.post("/payouts/create-winning")
+async def create_winning_payout(
+    payload: CreateWinningPayoutPayload,
+    admin_user: User = Depends(require_super_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    import uuid
+    game = await db.games.find_one({"$or": [{"_id": payload.game_id}, {"id": payload.game_id}, {"slug": payload.game_id}]})
+    game_name = game.get("name") if game else "Game"
+
+    user = await db.users.find_one({"$or": [{"_id": payload.user_id}, {"id": payload.user_id}]})
+    user_name = user.get("display_name") or user.get("username") if user else "Gamer"
+
+    amount_paise = int(round(payload.amount_inr * 100))
+
+    from app.models.payment import Payout
+    from app.services.wallet_service import credit_wallet_funds
+    from datetime import datetime, timezone
+
+    if payload.destination.upper() == "WALLET":
+        # Instant credit to wallet
+        await credit_wallet_funds(
+            db=db,
+            user_id=payload.user_id,
+            amount_paise=amount_paise,
+            txn_type="GAME_WINNING",
+            reference_id=f"win_{uuid.uuid4().hex[:8]}",
+            description=f"Prize for {payload.rank_or_placement} in {game_name}",
+            admin_id=admin_user.id,
+        )
+        payout = Payout(
+            payout_type="GAME_WINNING",
+            user_id=payload.user_id,
+            user_name=user_name,
+            amount_paise=amount_paise,
+            destination="WALLET",
+            game_id=payload.game_id,
+            game_name=game_name,
+            rank_or_placement=payload.rank_or_placement,
+            status="PAID",
+            admin_id=admin_user.id,
+            paid_at=datetime.now(timezone.utc),
+        )
+        await db.payouts.insert_one(payout.to_mongo())
+        return {"status": "success", "message": f"Prize of ₹{payload.amount_inr:.2f} credited to user wallet."}
+
+    # Destination is UPI
+    payout = Payout(
+        payout_type="GAME_WINNING",
+        user_id=payload.user_id,
+        user_name=user_name,
+        amount_paise=amount_paise,
+        destination="UPI",
+        upi_id=payload.upi_id,
+        game_id=payload.game_id,
+        game_name=game_name,
+        rank_or_placement=payload.rank_or_placement,
+        status="PENDING",
+    )
+    await db.payouts.insert_one(payout.to_mongo())
+    return {"status": "success", "message": "UPI winning payout created and waiting for disbursement."}
+
+@router.post("/payouts/{payout_id}/complete")
+async def complete_payout(
+    payout_id: str,
+    payload: PayoutCompletePayload,
+    admin_user: User = Depends(require_super_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    payout = await db.payouts.find_one({"$or": [{"_id": payout_id}, {"id": payout_id}]})
+    if not payout:
+        raise HTTPException(status_code=404, detail="Payout record not found")
+
+    if payout.get("status") == "PAID":
+        return {"status": "success", "message": "Payout was already marked as PAID"}
+
+    from datetime import datetime, timezone
+    from app.services.wallet_service import finalize_reserved_deduction
+
+    now = datetime.now(timezone.utc)
+    out_utr = payload.outgoing_utr.strip()
+
+    # If it was a withdrawal, permanently deduct the reserved balance
+    if payout.get("payout_type") == "WALLET_WITHDRAWAL":
+        await finalize_reserved_deduction(
+            db=db,
+            user_id=payout["user_id"],
+            amount_paise=payout["amount_paise"],
+            reference_id=payout_id,
+            admin_id=admin_user.id,
+            description=f"Withdrawal to {payout.get('upi_id')} (UTR: {out_utr})",
+        )
+
+    await db.payouts.update_one(
+        {"_id": payout["_id"]},
+        {
+            "$set": {
+                "status": "PAID",
+                "outgoing_utr": out_utr,
+                "admin_id": admin_user.id,
+                "paid_at": now,
+            }
+        }
+    )
+
+    await record_audit_log(
+        db=db,
+        operator=admin_user.username,
+        role="SUPER_ADMIN",
+        action="COMPLETE_PAYOUT",
+        target=f"Payout {payout_id}",
+        details=f"Marked PAID with Outgoing UTR: {out_utr}",
+    )
+
+    return {"status": "success", "message": "Payout completed and marked as PAID."}
+
+@router.post("/payouts/{payout_id}/reject")
+async def reject_payout(
+    payout_id: str,
+    payload: PayoutRejectPayload,
+    admin_user: User = Depends(require_super_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    payout = await db.payouts.find_one({"$or": [{"_id": payout_id}, {"id": payout_id}]})
+    if not payout:
+        raise HTTPException(status_code=404, detail="Payout record not found")
+
+    from app.services.wallet_service import release_reserved_funds
+
+    # Release reserved funds back to user's wallet
+    if payout.get("payout_type") == "WALLET_WITHDRAWAL":
+        await release_reserved_funds(
+            db=db,
+            user_id=payout["user_id"],
+            amount_paise=payout["amount_paise"],
+        )
+
+    await db.payouts.update_one(
+        {"_id": payout["_id"]},
+        {
+            "$set": {
+                "status": "REJECTED",
+                "rejection_reason": payload.rejection_reason,
+                "admin_id": admin_user.id,
+            }
+        }
+    )
+
+    await record_audit_log(
+        db=db,
+        operator=admin_user.username,
+        role="SUPER_ADMIN",
+        action="REJECT_PAYOUT",
+        target=f"Payout {payout_id}",
+        details=f"Reason: {payload.rejection_reason}",
+    )
+
+    return {"status": "success", "message": "Payout rejected and reserved funds returned to available balance."}
+
+# ----------------- DEVELOPMENT DUMMY DATA CONTROLS -----------------
+
+@router.post("/dev/seed-dummy")
+async def seed_dummy_data_endpoint(
+    admin_user: User = Depends(require_super_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    from app.seed_dummy import run_seed_dummy
+    result = await run_seed_dummy(db)
+    return {"status": "success", "message": "Dummy data generated successfully", "details": result}
+
+@router.post("/dev/remove-dummy")
+async def remove_dummy_data_endpoint(
+    admin_user: User = Depends(require_super_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    from app.remove_dummy import run_remove_dummy
+    result = await run_remove_dummy(db)
+    return {"status": "success", "message": "Dummy data removed successfully", "details": result}
+
 
 

@@ -26,25 +26,9 @@ GAME_FALLBACK_IMAGES = {
         "banner": "https://images.unsplash.com/photo-1529699211952-734e80c4d42b?q=80&w=1200&auto=format&fit=crop",
         "logo": "https://images.unsplash.com/photo-1586165368502-1bad197a6461?q=80&w=300&auto=format&fit=crop",
     },
-    "call-of-duty-mobile": {
-        "banner": "https://images.unsplash.com/photo-1542751110-97427bbecf20?q=80&w=1200&auto=format&fit=crop",
-        "logo": "https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?q=80&w=300&auto=format&fit=crop",
-    },
     "free-fire": {
         "banner": "https://images.unsplash.com/photo-1518709268805-4e9042af9f23?q=80&w=1200&auto=format&fit=crop",
         "logo": "https://images.unsplash.com/photo-1579783902614-a3fb3927b675?q=80&w=300&auto=format&fit=crop",
-    },
-    "rocket-league": {
-        "banner": "https://images.unsplash.com/photo-1511512578047-dfb367046420?q=80&w=1200&auto=format&fit=crop",
-        "logo": "https://images.unsplash.com/photo-1550745165-9bc0b252726f?q=80&w=300&auto=format&fit=crop",
-    },
-    "smash-karts": {
-        "banner": "https://images.unsplash.com/photo-1518709268805-4e9042af9f23?q=80&w=1200&auto=format&fit=crop",
-        "logo": "https://images.unsplash.com/photo-1563089145-599997674d42?q=80&w=300&auto=format&fit=crop",
-    },
-    "mini-militia": {
-        "banner": "https://images.unsplash.com/photo-1538481199705-c710c4e965fc?q=80&w=1200&auto=format&fit=crop",
-        "logo": "https://images.unsplash.com/photo-1579373903781-fd5c0c30c4cd?q=80&w=300&auto=format&fit=crop",
     },
 }
 
@@ -57,7 +41,7 @@ def sanitize_game_images(slug: str, banner: str, logo: str):
     l = logo if (logo and "aida-public" not in logo and "_Logo" not in logo) else fb["logo"]
     return b, l
 
-def serialize_game_doc(g: dict, count: int = 0) -> GameResponse:
+def serialize_game_doc(g: dict, teams_count: int = 0) -> GameResponse:
     gid = str(g.get("_id", g.get("id")))
     b_url, l_url = sanitize_game_images(g.get("slug", ""), g.get("banner_url", ""), g.get("logo_url", ""))
     return GameResponse(
@@ -70,6 +54,10 @@ def serialize_game_doc(g: dict, count: int = 0) -> GameResponse:
         is_team_game=g.get("is_team_game", True),
         min_team_size=g.get("min_team_size", 1),
         max_team_size=g.get("max_team_size", 5),
+        max_substitutes=g.get("max_substitutes", 1),
+        entry_fee_inr=g.get("entry_fee_inr", 0),
+        prize_pool_inr=g.get("prize_pool_inr", 0),
+        play_url=g.get("play_url"),
         banner_url=b_url,
         logo_url=l_url,
         description=g.get("description", ""),
@@ -84,7 +72,7 @@ def serialize_game_doc(g: dict, count: int = 0) -> GameResponse:
         hero_media_type=g.get("hero_media_type", "gif"),
         hero_media_enabled=g.get("hero_media_enabled", True),
         gallery=g.get("gallery", []),
-        active_tournaments_count=count,
+        teams_count=teams_count,
     )
 
 @router.get("", response_model=List[GameResponse])
@@ -92,7 +80,7 @@ async def list_games(
     status: Optional[str] = Query(None, description="Filter games by status e.g. ACTIVE, COMING_SOON"),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
-    query = {}
+    query = {"is_dummy": {"$ne": True}}
     if status:
         query["status"] = status.upper()
     cursor = db.games.find(query)
@@ -101,8 +89,8 @@ async def list_games(
     response = []
     for g in games_docs:
         gid = str(g.get("_id", g.get("id")))
-        count = await db.tournaments.count_documents({"$or": [{"game_id": gid}, {"game_slug": g.get("slug")}]})
-        response.append(serialize_game_doc(g, count))
+        t_count = await db.teams.count_documents({"$or": [{"game_id": gid}, {"game_slug": g.get("slug")}]})
+        response.append(serialize_game_doc(g, t_count))
     return response
 
 @router.get("/{slug}", response_model=GameResponse)
@@ -112,8 +100,8 @@ async def get_game_by_slug(slug: str, db: AsyncIOMotorDatabase = Depends(get_db)
         raise HTTPException(status_code=404, detail="Game not found")
     
     gid = str(g.get("_id", g.get("id")))
-    count = await db.tournaments.count_documents({"$or": [{"game_id": gid}, {"game_slug": g.get("slug")}]})
-    return serialize_game_doc(g, count)
+    t_count = await db.teams.count_documents({"$or": [{"game_id": gid}, {"game_slug": g.get("slug")}]})
+    return serialize_game_doc(g, t_count)
 
 @router.post("", response_model=GameResponse, status_code=status.HTTP_201_CREATED)
 async def create_game(
@@ -121,9 +109,6 @@ async def create_game(
     admin_user: User = Depends(require_super_admin),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
-    """
-    Super Admin privilege: Register a new sanctioned competitive title in MongoDB.
-    """
     existing = await db.games.find_one({"slug": payload.slug})
     if existing:
         raise HTTPException(
@@ -140,6 +125,10 @@ async def create_game(
         is_team_game=payload.is_team_game,
         min_team_size=payload.min_team_size,
         max_team_size=payload.max_team_size,
+        max_substitutes=payload.max_substitutes,
+        entry_fee_inr=payload.entry_fee_inr,
+        prize_pool_inr=payload.prize_pool_inr,
+        play_url=payload.play_url,
         banner_url=payload.banner_url,
         logo_url=payload.logo_url,
         description=payload.description,
@@ -164,7 +153,7 @@ async def create_game(
         role="SUPER_ADMIN",
         action="CREATE_GAME",
         target=f"Game {game.name} ({game.slug})",
-        details=f"Added new competitive game title {game.name}",
+        details=f"Created game with entry fee ₹{game.entry_fee_inr}",
     )
 
     return serialize_game_doc(doc, 0)
@@ -176,62 +165,28 @@ async def update_game(
     admin_user: User = Depends(require_super_admin),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
-    """
-    Super Admin privilege: Update game parameters.
-    """
-    game_doc = await db.games.find_one({"$or": [{"_id": id}, {"id": id}]})
-    if not game_doc:
+    game = await db.games.find_one({"$or": [{"_id": id}, {"id": id}, {"slug": id}]})
+    if not game:
         raise HTTPException(status_code=404, detail="Game not found")
 
-    update_data = payload.model_dump(exclude_unset=True)
+    update_data = {k: v for k, v in payload.model_dump(exclude_unset=True).items() if v is not None}
     if update_data:
-        await db.games.update_one({"_id": game_doc["_id"]}, {"$set": update_data})
+        await db.games.update_one({"_id": game["_id"]}, {"$set": update_data})
+
+    updated_game = await db.games.find_one({"_id": game["_id"]})
+    gid = str(updated_game.get("_id", updated_game.get("id")))
+    t_count = await db.teams.count_documents({"$or": [{"game_id": gid}, {"game_slug": updated_game.get("slug")}]})
 
     await record_audit_log(
         db=db,
         operator=admin_user.username,
         role="SUPER_ADMIN",
         action="UPDATE_GAME",
-        target=f"Game {game_doc['name']} ({id})",
+        target=f"Game {updated_game.get('name')}",
         details=f"Updated game fields: {list(update_data.keys())}",
     )
 
-    updated_doc = await db.games.find_one({"_id": game_doc["_id"]})
-    gid = str(updated_doc.get("_id", updated_doc.get("id")))
-    count = await db.tournaments.count_documents({"$or": [{"game_id": gid}, {"game_slug": updated_doc.get("slug")}]})
-    return serialize_game_doc(updated_doc, count)
-
-@router.post("/{id}/publish", response_model=GameResponse)
-async def publish_game(
-    id: str,
-    admin_user: User = Depends(require_super_admin),
-    db: AsyncIOMotorDatabase = Depends(get_db),
-):
-    """
-    Super Admin privilege: One-click publish game from COMING_SOON to ACTIVE.
-    """
-    game_doc = await db.games.find_one({"$or": [{"_id": id}, {"id": id}, {"slug": id}]})
-    if not game_doc:
-        raise HTTPException(status_code=404, detail="Game not found")
-
-    await db.games.update_one(
-        {"_id": game_doc["_id"]},
-        {"$set": {"status": "ACTIVE"}}
-    )
-
-    await record_audit_log(
-        db=db,
-        operator=admin_user.username,
-        role="SUPER_ADMIN",
-        action="PUBLISH_GAME",
-        target=f"Game {game_doc['name']} ({id})",
-        details=f"Published game {game_doc['name']} to ACTIVE status",
-    )
-
-    updated = await db.games.find_one({"_id": game_doc["_id"]})
-    gid = str(updated.get("_id", updated.get("id")))
-    count = await db.tournaments.count_documents({"$or": [{"game_id": gid}, {"game_slug": updated.get("slug")}]})
-    return serialize_game_doc(updated, count)
+    return serialize_game_doc(updated_game, t_count)
 
 @router.delete("/{id}")
 async def delete_game(
@@ -239,29 +194,49 @@ async def delete_game(
     admin_user: User = Depends(require_super_admin),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
-    """
-    Super Admin privilege: Delete game title if no tournaments depend on it.
-    """
-    game_doc = await db.games.find_one({"$or": [{"_id": id}, {"id": id}]})
-    if not game_doc:
+    game = await db.games.find_one({"$or": [{"_id": id}, {"id": id}, {"slug": id}]})
+    if not game:
         raise HTTPException(status_code=404, detail="Game not found")
 
-    gid = str(game_doc.get("_id", game_doc.get("id")))
-    count = await db.tournaments.count_documents({"$or": [{"game_id": gid}, {"game_slug": game_doc.get("slug")}]})
-    if count > 0:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Cannot delete game '{game_doc['name']}': {count} tournament(s) are linked to it",
-        )
+    await db.games.delete_one({"_id": game["_id"]})
 
-    await db.games.delete_one({"_id": game_doc["_id"]})
     await record_audit_log(
         db=db,
         operator=admin_user.username,
         role="SUPER_ADMIN",
         action="DELETE_GAME",
-        target=f"Game {game_doc['name']} ({id})",
-        details=f"Deleted game title {game_doc['name']}",
+        target=f"Game {game.get('name')}",
+        details="Removed game catalog entry",
     )
-    return {"status": "success", "message": f"Game '{game_doc['name']}' deleted"}
 
+    return {"status": "success", "message": f"Game '{game.get('name')}' successfully deleted"}
+
+@router.post("/{id}/publish", response_model=GameResponse)
+async def publish_game(
+    id: str,
+    admin_user: User = Depends(require_super_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    game = await db.games.find_one({"$or": [{"_id": id}, {"id": id}, {"slug": id}]})
+    if not game:
+        raise HTTPException(status_code=404, detail="Game not found")
+
+    await db.games.update_one(
+        {"_id": game["_id"]},
+        {"$set": {"status": "ACTIVE"}}
+    )
+
+    updated_game = await db.games.find_one({"_id": game["_id"]})
+    gid = str(updated_game.get("_id", updated_game.get("id")))
+    t_count = await db.teams.count_documents({"$or": [{"game_id": gid}, {"game_slug": updated_game.get("slug")}]})
+
+    await record_audit_log(
+        db=db,
+        operator=admin_user.username,
+        role="SUPER_ADMIN",
+        action="PUBLISH_GAME",
+        target=f"Game {updated_game.get('name')}",
+        details="Transitioned status to ACTIVE",
+    )
+
+    return serialize_game_doc(updated_game, t_count)

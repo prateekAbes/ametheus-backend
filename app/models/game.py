@@ -13,20 +13,25 @@ class Game(BaseModel):
     is_team_game: bool = True
     min_team_size: int = 1
     max_team_size: int = 5
+    max_substitutes: int = 1
+    entry_fee_inr: int = 0
+    prize_pool_inr: int = 0
+    play_url: Optional[str] = None
     banner_url: str
     logo_url: str
     description: str = ""
     server_region: str = "AWS Mumbai (ap-south-1)"
     anti_cheat: str = "Hardware TPM 2.0 Vanguard"
-    match_protocol: str = "Competitive MR12"
+    match_protocol: str = "Competitive Protocol"
     accent_color: str = "#E56A10"
-    status: str = "ACTIVE"  # ACTIVE, COMING_SOON, DRAFT
+    status: str = "ACTIVE"  # ACTIVE, COMING_SOON, ARCHIVED
     expected_release_date: Optional[str] = None
     announcement_text: Optional[str] = None
     hero_media_url: Optional[str] = None
     hero_media_type: str = "gif"
     hero_media_enabled: bool = True
     gallery: List[Dict[str, Any]] = Field(default_factory=list)
+    is_dummy: bool = False
     created_at: datetime = Field(default_factory=get_utc_now)
     updated_at: datetime = Field(default_factory=get_utc_now)
 
@@ -43,4 +48,3 @@ class Game(BaseModel):
         if "_id" in d and "id" not in d:
             d["id"] = str(d.pop("_id"))
         return cls(**d)
-
