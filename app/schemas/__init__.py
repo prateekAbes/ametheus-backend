@@ -241,102 +241,22 @@ class NotificationListResponse(BaseModel):
     items: List[NotificationResponse]
     unread_count: int
 
-# Tournament
-class TournamentResponse(BaseModel):
-    id: str
-    slug: str
-    organizer_id: Optional[str] = None
-    title: Optional[str] = "Championship"
-    game_slug: Optional[str] = "valorant"
-    game_name: Optional[str] = "Valorant"
-    prize_pool: Optional[str] = "₹0"
-    prize_pool_inr: Optional[int] = 0
-    entry_fee: Optional[str] = "₹0 / Free"
-    entry_fee_inr: Optional[int] = 0
-    status: Optional[str] = "REGISTRATION_OPEN"
-    expected_start_date: Optional[str] = None
-    registration_open_date: Optional[str] = None
-    announcement_text: Optional[str] = None
-    starts_at: Optional[str] = "TBD"
-    roster_lock_time: Optional[str] = "TBD"
-    server_region: Optional[str] = "AWS Mumbai (ap-south-1)"
-    registered_teams: Optional[int] = 0
-    max_teams: Optional[int] = 16
-    min_team_size: Optional[int] = 1
-    max_team_size: Optional[int] = 5
-    rank_requirement: Optional[str] = "Open to All Ranks"
-    format: Optional[str] = "Single Elimination Bracket"
-    banner_url: Optional[str] = "https://images.unsplash.com/photo-1542751371-adc38448a05e?q=80&w=1200&auto=format&fit=crop"
-    badge_color: Optional[str] = "#E56A10"
-    description: Optional[str] = ""
-    rules: List[str] = []
-    schedule: List[Dict[str, Any]] = []
-    prizes: List[Dict[str, Any]] = []
-    bracket_rounds: List[Dict[str, Any]] = []
-    registered_rosters: List[Dict[str, Any]] = []
-    model_config = ConfigDict(from_attributes=True, extra="allow")
-
-class TournamentRegisterRequest(BaseModel):
-    team_id: Optional[str] = None
-    player_id: Optional[str] = None
-    player_handle: Optional[str] = None
-
-# Match
-class MatchResponse(BaseModel):
-    id: str
-    tournament_id: str
-    tournament_title: str
-    game_slug: str
-    game_name: str
-    stage: str
-    format: str
-    scheduled_time: str
-    status: str
-    server_region: str
-    lobby_code: str
-    lobby_password: str
-    team_a: Optional[Dict[str, Any]] = None
-    team_b: Optional[Dict[str, Any]] = None
-    evidence_url: Optional[str] = None
-    dispute_notes: Optional[str] = None
-    model_config = ConfigDict(from_attributes=True, extra="allow")
-
-class MatchResultSubmit(BaseModel):
-    score_a: int
-    score_b: int
-    evidence_url: Optional[str] = "https://r2.ametheus.gg/proof.png"
-    captain_notes: Optional[str] = None
-
-# Dispute
-class DisputeCreate(BaseModel):
-    reason: str
-    description: str
-    evidence_url: Optional[str] = None
-
 # Admin Assignments & Disputes
 class AdminAssignmentCreate(BaseModel):
     admin_user_id: str
-    tournament_id: Optional[str] = None
 
 class DisputeResolve(BaseModel):
-    decision: str = "RESOLVED"
+    decision: str
     resolution_notes: Optional[str] = None
-
 
 class DisputeResponse(BaseModel):
     id: str
-    tournament_id: Optional[str] = None
     match_id: Optional[str] = None
-    submitted_by: Optional[str] = None
-    raised_by: Optional[str] = None
+    raised_by: str
     reason: str
-    description: Optional[str] = None
-    evidence_url: Optional[str] = None
     status: str
     resolution_notes: Optional[str] = None
     created_at: Optional[str] = None
-    model_config = ConfigDict(from_attributes=True, extra="allow")
-
 
 class LeaderboardEntryResponse(BaseModel):
     id: str
