@@ -10,6 +10,9 @@ from app.api.v1.endpoints import (
     notifications,
     media,
     leaderboard,
+    organizer,
+    tournaments,
+    matches,
 )
 
 api_router = APIRouter()
@@ -23,3 +26,6 @@ api_router.include_router(admin.router, prefix="/admin", tags=["Admin Operations
 api_router.include_router(leaderboard.router, prefix="/leaderboard", tags=["Leaderboard"])
 api_router.include_router(notifications.router, prefix="/notifications", tags=["Notifications"])
 api_router.include_router(media.router, prefix="/media", tags=["Media & Image Uploads"])
+api_router.include_router(organizer.router, prefix="/organizer", tags=["Tournament Organizer"])
+api_router.include_router(tournaments.router, prefix="/tournaments", tags=["Tournaments"])
+api_router.include_router(matches.router, prefix="/matches", tags=["Matches"])

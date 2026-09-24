@@ -241,38 +241,137 @@ class NotificationListResponse(BaseModel):
     items: List[NotificationResponse]
     unread_count: int
 
+# Tournament
+class TournamentResponse(BaseModel):
+    id: str
+    slug: str
+    organizer_id: Optional[str] = None
+    title: Optional[str] = "Championship"
+    game_slug: Optional[str] = "valorant"
+    game_name: Optional[str] = "Valorant"
+    prize_pool: Optional[str] = "₹0"
+    prize_pool_inr: Optional[int] = 0
+    entry_fee: Optional[str] = "₹0 / Free"
+    entry_fee_inr: Optional[int] = 0
+    status: Optional[str] = "REGISTRATION_OPEN"
+    expected_start_date: Optional[str] = None
+    registration_open_date: Optional[str] = None
+    announcement_text: Optional[str] = None
+    starts_at: Optional[str] = "TBD"
+    roster_lock_time: Optional[str] = "TBD"
+    server_region: Optional[str] = "AWS Mumbai (ap-south-1)"
+    registered_teams: Optional[int] = 0
+    max_teams: Optional[int] = 16
+    min_team_size: Optional[int] = 1
+    max_team_size: Optional[int] = 5
+    rank_requirement: Optional[str] = "Open to All Ranks"
+    format: Optional[str] = "Single Elimination Bracket"
+    banner_url: Optional[str] = ""
+    badge_color: Optional[str] = "#E56A10"
+    description: Optional[str] = ""
+    rules: List[str] = []
+    schedule: List[Dict[str, Any]] = []
+    prizes: List[Dict[str, Any]] = []
+    bracket_rounds: List[Dict[str, Any]] = []
+    registered_rosters: List[Dict[str, Any]] = []
+    model_config = ConfigDict(from_attributes=True, extra="allow")
+
+class TournamentRegisterRequest(BaseModel):
+    team_id: Optional[str] = None
+    player_id: Optional[str] = None
+    player_handle: Optional[str] = None
+
+# Match
+class MatchResponse(BaseModel):
+    id: str
+    tournament_id: str
+    tournament_title: str
+    game_slug: str
+    game_name: str
+    stage: str
+    format: str
+    scheduled_time: str
+    status: str
+    server_region: str
+    lobby_code: str
+    lobby_password: str
+    team_a: Optional[Dict[str, Any]] = None
+    team_b: Optional[Dict[str, Any]] = None
+    evidence_url: Optional[str] = None
+    dispute_notes: Optional[str] = None
+    model_config = ConfigDict(from_attributes=True, extra="allow")
+
+class MatchResultSubmit(BaseModel):
+    score_a: int
+    score_b: int
+    evidence_url: Optional[str] = None
+    captain_notes: Optional[str] = None
+
+# Dispute
+class DisputeCreate(BaseModel):
+    reason: str
+    description: str
+    evidence_url: Optional[str] = None
+
+class OrderCreateRequest(BaseModel):
+    tournament_id: str
+    team_id: Optional[str] = None
+
+class PaymentVerifyRequest(BaseModel):
+    order_id: Optional[str] = None
+    payment_id: Optional[str] = None
+    signature: Optional[str] = None
+    razorpay_order_id: Optional[str] = None
+    razorpay_payment_id: Optional[str] = None
+    razorpay_signature: Optional[str] = None
+
+    def get_order_id(self) -> str:
+        return self.order_id or self.razorpay_order_id or ""
+
+    def get_payment_id(self) -> str:
+        return self.payment_id or self.razorpay_payment_id or ""
+
+    def get_signature(self) -> str:
+        return self.signature or self.razorpay_signature or ""
+
 # Admin Assignments & Disputes
 class AdminAssignmentCreate(BaseModel):
     admin_user_id: str
+    tournament_id: Optional[str] = None
 
 class DisputeResolve(BaseModel):
-    decision: str
+    decision: str = "RESOLVED"
     resolution_notes: Optional[str] = None
 
 class DisputeResponse(BaseModel):
     id: str
+    tournament_id: Optional[str] = None
     match_id: Optional[str] = None
-    raised_by: str
+    submitted_by: Optional[str] = None
+    raised_by: Optional[str] = None
     reason: str
+    description: Optional[str] = None
+    evidence_url: Optional[str] = None
     status: str
     resolution_notes: Optional[str] = None
     created_at: Optional[str] = None
+    model_config = ConfigDict(from_attributes=True, extra="allow")
 
 class LeaderboardEntryResponse(BaseModel):
     id: str
     name: str
     tag: str
     type: str = "SQUAD"
-    game_slug: str
-    game_name: str
+    game_slug: Optional[str] = None
+    game_name: Optional[str] = None
     captain: Optional[str] = None
     logo_url: Optional[str] = None
-    win_rate: Optional[Any] = "0%"
+    win_rate: Optional[Any] = 0.0
     matches_played: int = 0
     wins: int = 0
     losses: int = 0
-    rating: int = 1200
-    earnings: Optional[Any] = "₹0"
+    rating: int = 1500
+    earnings: Optional[Any] = 0
     form: List[str] = []
     is_verified: bool = False
     category: str = "overall"

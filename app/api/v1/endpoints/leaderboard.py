@@ -13,11 +13,11 @@ from app.schemas import LeaderboardEntryResponse
 router = APIRouter()
 
 class LeaderboardStatsSchema(BaseModel):
-    total_awarded_prizes: str = "₹14,50,000+"
-    active_contenders: str = "24,800+"
-    verified_squads: str = "1,120+"
-    top_team_earnings: str = "₹1,85,000"
-    top_team_name: str = "Team Solaris X"
+    total_awarded_prizes: str = "₹0"
+    active_contenders: str = "0"
+    verified_squads: str = "0"
+    top_team_earnings: str = "₹0"
+    top_team_name: str = ""
 
 class LeaderboardStatsUpdate(BaseModel):
     total_awarded_prizes: Optional[str] = None
@@ -124,68 +124,7 @@ DEFAULT_CATEGORIES = [
     },
 ]
 
-MOCK_LEADERBOARD = [
-    {
-        "rank": 1,
-        "id": "lb-solaris-x",
-        "name": "Solaris X",
-        "tag": "SLX",
-        "type": "team",
-        "game_slug": "valorant",
-        "game_name": "Valorant",
-        "captain": "@vortex_lead",
-        "logo_url": "https://images.unsplash.com/photo-1566492031773-4f4e44671857?q=80&w=200&auto=format&fit=crop",
-        "win_rate": 94.2,
-        "matches_played": 45,
-        "wins": 42,
-        "losses": 3,
-        "rating": 4890,
-        "earnings": 185000,
-        "form": ["W", "W", "W", "W", "W"],
-        "is_verified": True,
-        "category": "pc",
-    },
-    {
-        "rank": 2,
-        "id": "lb-titan-clash",
-        "name": "Titan Clash",
-        "tag": "TC-ELITE",
-        "type": "team",
-        "game_slug": "counter-strike-2",
-        "game_name": "Counter-Strike 2",
-        "captain": "@reaper_cs",
-        "logo_url": "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?q=80&w=200&auto=format&fit=crop",
-        "win_rate": 89.1,
-        "matches_played": 43,
-        "wins": 38,
-        "losses": 5,
-        "rating": 3420,
-        "earnings": 120000,
-        "form": ["W", "W", "L", "W", "W"],
-        "is_verified": True,
-        "category": "pc",
-    },
-    {
-        "rank": 3,
-        "id": "lb-soul-cadets",
-        "name": "Soul Cadets",
-        "tag": "SOUL",
-        "type": "team",
-        "game_slug": "bgmi",
-        "game_name": "BGMI",
-        "captain": "@ronin_bgmi",
-        "logo_url": "https://images.unsplash.com/photo-1570295999919-56ceb5ecca61?q=80&w=200&auto=format&fit=crop",
-        "win_rate": 86.4,
-        "matches_played": 37,
-        "wins": 32,
-        "losses": 5,
-        "rating": 2980,
-        "earnings": 95000,
-        "form": ["W", "L", "W", "W", "W"],
-        "is_verified": True,
-        "category": "mobile",
-    },
-]
+
 
 async def ensure_default_categories(db: AsyncIOMotorDatabase):
     count = await db.leaderboard_categories.count_documents({})
@@ -202,11 +141,11 @@ async def get_leaderboard_stats(db: AsyncIOMotorDatabase = Depends(get_db)):
     if not doc:
         return LeaderboardStatsSchema()
     return LeaderboardStatsSchema(
-        total_awarded_prizes=doc.get("total_awarded_prizes", "₹14,50,000+"),
-        active_contenders=doc.get("active_contenders", "24,800+"),
-        verified_squads=doc.get("verified_squads", "1,120+"),
-        top_team_earnings=doc.get("top_team_earnings", "₹1,85,000"),
-        top_team_name=doc.get("top_team_name", "Team Solaris X"),
+        total_awarded_prizes=doc.get("total_awarded_prizes", "₹0"),
+        active_contenders=doc.get("active_contenders", "0"),
+        verified_squads=doc.get("verified_squads", "0"),
+        top_team_earnings=doc.get("top_team_earnings", "₹0"),
+        top_team_name=doc.get("top_team_name", ""),
     )
 
 @router.patch("/stats", response_model=LeaderboardStatsSchema)
@@ -236,11 +175,11 @@ async def update_leaderboard_stats(
         )
     current = await db.platform_settings.find_one({"_id": "leaderboard_stats"}) or {}
     return LeaderboardStatsSchema(
-        total_awarded_prizes=current.get("total_awarded_prizes", "₹14,50,000+"),
-        active_contenders=current.get("active_contenders", "24,800+"),
-        verified_squads=current.get("verified_squads", "1,120+"),
-        top_team_earnings=current.get("top_team_earnings", "₹1,85,000"),
-        top_team_name=current.get("top_team_name", "Team Solaris X"),
+        total_awarded_prizes=current.get("total_awarded_prizes", "₹0"),
+        active_contenders=current.get("active_contenders", "0"),
+        verified_squads=current.get("verified_squads", "0"),
+        top_team_earnings=current.get("top_team_earnings", "₹0"),
+        top_team_name=current.get("top_team_name", ""),
     )
 
 @router.post("/entries", response_model=LeaderboardEntryResponse)
@@ -487,8 +426,8 @@ async def get_leaderboard(
             team_id = str(team.get("_id", team.get("id")))
             gid = team.get("game_id")
             game_obj = await db.games.find_one({"$or": [{"_id": gid}, {"id": gid}, {"slug": gid}]}) if gid else None
-            game_slug = game_obj["slug"] if game_obj else "valorant"
-            game_name = game_obj["name"] if game_obj else "Valorant"
+            game_slug = game_obj["slug"] if game_obj else None
+            game_name = game_obj["name"] if game_obj else None
             game_cat = game_obj.get("category", "pc") if game_obj else "pc"
 
             cap_id = team.get("captain_id")
@@ -507,7 +446,12 @@ async def get_leaderboard(
             matches_played = len(completed_matches)
             wins = sum(1 for m in completed_matches if m.get("winner_team_id") == team_id)
             losses = matches_played - wins
-            win_rate = round((wins / matches_played * 100), 1) if matches_played > 0 else 75.0
+            # Real win rate — 0.0 if no matches played (no fabricated defaults)
+            win_rate = round((wins / matches_played * 100), 1) if matches_played > 0 else 0.0
+
+            # Compute recent form from last 5 completed matches (most recent first)
+            recent = sorted(completed_matches, key=lambda m: m.get("completed_at", m.get("updated_at", "")), reverse=True)[:5]
+            form = ["W" if m.get("winner_team_id") == team_id else "L" for m in recent]
 
             entries.append({
                 "rank": idx + 1,
@@ -518,19 +462,19 @@ async def get_leaderboard(
                 "game_slug": game_slug,
                 "game_name": game_name,
                 "captain": captain_user,
-                "logo_url": team.get("logo_url") or "https://images.unsplash.com/photo-1566492031773-4f4e44671857?q=80&w=200&auto=format&fit=crop",
+                "logo_url": team.get("logo_url") or None,
                 "win_rate": win_rate,
-                "matches_played": max(matches_played, 5),
-                "wins": max(wins, 4),
-                "losses": max(losses, 1),
+                "matches_played": matches_played,
+                "wins": wins,
+                "losses": losses,
                 "rating": 1500 + (wins * 25),
                 "earnings": wins * 15000,
-                "form": ["W", "W", "W", "W", "W"],
+                "form": form,
                 "is_verified": True,
                 "category": game_cat,
             })
 
-        # Also query custom leaderboard entries
+        # Also query custom leaderboard entries (admin-created entries only)
         custom_cursor = db.custom_leaderboard_entries.find({})
         custom_docs = await custom_cursor.to_list(length=100)
         for c in custom_docs:
@@ -541,28 +485,24 @@ async def get_leaderboard(
                 "name": c.get("name", "Team"),
                 "tag": c.get("tag", "TM"),
                 "type": c.get("type", "team"),
-                "game_slug": c.get("game_slug", "valorant"),
-                "game_name": c.get("game_name", "Valorant"),
+                "game_slug": c.get("game_slug"),
+                "game_name": c.get("game_name"),
                 "captain": c.get("captain", "@captain"),
-                "logo_url": c.get("logo_url") or "https://images.unsplash.com/photo-1542751371-adc38448a05e?q=80&w=300",
-                "win_rate": float(c.get("win_rate", 75.0)),
-                "matches_played": int(c.get("matches_played", 10)),
-                "wins": int(c.get("wins", 8)),
-                "losses": int(c.get("losses", 2)),
-                "rating": int(c.get("rating", 2000)),
-                "earnings": int(c.get("earnings", 25000)),
-                "form": c.get("form", ["W", "W", "W", "W", "W"]),
-                "is_verified": bool(c.get("is_verified", True)),
+                "logo_url": c.get("logo_url"),
+                "win_rate": float(c.get("win_rate", 0.0)),
+                "matches_played": int(c.get("matches_played", 0)),
+                "wins": int(c.get("wins", 0)),
+                "losses": int(c.get("losses", 0)),
+                "rating": int(c.get("rating", 1500)),
+                "earnings": int(c.get("earnings", 0)),
+                "form": c.get("form", []),
+                "is_verified": bool(c.get("is_verified", False)),
                 "category": c.get("category", "pc"),
             })
     except Exception as e:
         print(f"[Leaderboard DB Query Notice]: {e}")
 
-    # Augment with benchmark mock teams if needed
-    existing_tags = {e["tag"] for e in entries}
-    for m in MOCK_LEADERBOARD:
-        if m["tag"] not in existing_tags:
-            entries.append(dict(m))
+    # NOTE: No mock/fallback data augmentation. Empty DB = empty leaderboard.
 
     # Apply game filter if specified
     if target_game and target_game != "all":

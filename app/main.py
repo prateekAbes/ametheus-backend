@@ -13,17 +13,14 @@ from app.models import *
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Auto-initialize MongoDB indexes and seed if empty
+    # Initialize MongoDB indexes only — NO auto-seeding on startup
+    # Empty database = empty UI. Use admin panel or CLI to seed explicitly.
     try:
         db = get_database()
         await init_db_indexes(db)
-        
-        # Auto-seed database if empty
-        from app.seed import seed_if_empty
-        await seed_if_empty()
     except Exception as e:
         print(f"[AMETHEUS Lifespan Warning]: {e}")
-    
+
     yield
 
 app = FastAPI(

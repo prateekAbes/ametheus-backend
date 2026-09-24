@@ -1,5 +1,6 @@
 import json
 import re
+import uuid
 from typing import List, Optional
 from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -348,7 +349,7 @@ async def register_team_for_tournament(
             tournament_id=tid,
             player_id=current_user.id,
             payment_status="PAID" if fee_inr > 0 else "FREE",
-            order_id="order_escrow_mock_solo" if fee_inr > 0 else None,
+            order_id=f"order_{uuid.uuid4().hex[:12]}" if fee_inr > 0 else None,
             check_in_status="PENDING",
         )
         await db.tournament_registrations.insert_one(reg.to_mongo())

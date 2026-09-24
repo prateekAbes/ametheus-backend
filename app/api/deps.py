@@ -32,10 +32,24 @@ async def get_current_user(
         "$or": [{"_id": target_id}, {"clerk_user_id": target_id}, {"id": target_id}]
     })
     if not user_doc:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Unauthorized: User not found in AMETHEUS. Please complete profile sync.",
+        # If cryptographically verified by Clerk but not yet synced in DB, auto-provision
+        # This prevents 401 race conditions on initial page load (e.g. /notifications, /leaderboard)
+        email = payload.get("email") or payload.get("primary_email_address") or f"{target_id}@ametheus.gg"
+        admin_emails = {"pk.4081988@gmail.com", "admin@ametheus.gg"}
+        is_super_admin = email.lower() in admin_emails
+        initial_role = "SUPER_ADMIN" if is_super_admin else "PLAYER"
+
+        new_user = User(
+            id=target_id,
+            clerk_user_id=target_id,
+            email=email,
+            username=payload.get("username") or payload.get("preferred_username") or target_id[:12],
+            display_name=payload.get("name") or payload.get("username") or "Contender",
+            avatar_url=payload.get("picture"),
+            role=initial_role,
         )
+        await db.users.insert_one(new_user.to_mongo())
+        user_doc = await db.users.find_one({"_id": target_id})
 
     user = User.from_mongo(user_doc)
     admin_emails = {"pk.4081988@gmail.com", "admin@ametheus.gg"}

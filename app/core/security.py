@@ -30,7 +30,7 @@ def decode_token(token: str) -> Optional[Dict[str, Any]]:
         alg = unverified_header.get("alg", "HS256")
 
         if alg == "HS256":
-            return jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"])
+            return jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"], leeway=60)
 
         if alg == "RS256":
             kid = unverified_header.get("kid")
@@ -71,7 +71,8 @@ def decode_token(token: str) -> Optional[Dict[str, Any]]:
                     token,
                     public_key,
                     algorithms=["RS256"],
-                    options={"verify_aud": False}
+                    options={"verify_aud": False},
+                    leeway=60,
                 )
 
             # Key not found in JWKS - reject!

@@ -454,6 +454,15 @@ async def get_admin_stats(
         "status": {"$in": ["LIVE", "CHECK_IN_OPEN", "PENDING_VERIFICATION", "DISPUTED"]}
     })
 
+    # Compute real escrow vault: sum of all approved game entry payments (in paise → INR)
+    pipeline = [
+        {"$match": {"status": "APPROVED", "payment_type": "GAME_ENTRY"}},
+        {"$group": {"_id": None, "total": {"$sum": "$amount_paise"}}},
+    ]
+    agg = await db.game_payments.aggregate(pipeline).to_list(1)
+    platform_escrow_paise = agg[0]["total"] if agg else 0
+    platform_escrow_vault = platform_escrow_paise // 100  # convert paise to INR
+
     return {
         "total_users": total_users,
         "total_tournaments": total_tournaments,
@@ -462,7 +471,7 @@ async def get_admin_stats(
         "total_games": total_games,
         "pending_disputes": pending_disputes,
         "active_matches": active_matches,
-        "platform_escrow_vault": 1245000,
+        "platform_escrow_vault": platform_escrow_vault,
     }
 
 @router.post("/seed-catalog")
