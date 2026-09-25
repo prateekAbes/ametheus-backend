@@ -81,7 +81,7 @@ async def create_team(
     if not is_team_game or max_size <= 1:
         raise HTTPException(
             status_code=400,
-            detail=f"{game.get('name', 'This game')} is a solo title and does not support squad creation.",
+            detail=f"{game.get('name', 'This game')} is a solo title and does not support team creation.",
         )
 
     gid = str(game.get("_id", game.get("id")))
@@ -99,7 +99,7 @@ async def create_team(
     if existing_team:
         raise HTTPException(
             status_code=400,
-            detail=f"You already belong to squad '{existing_team.get('name')}' for {game.get('name', 'this game')}. Each contender can only lead or join one squad per game discipline.",
+            detail=f"You already belong to team '{existing_team.get('name')}' for {game.get('name', 'this game')}. Each contender can only lead or join one team per game discipline.",
         )
 
     captain_member = TeamMember(
@@ -108,6 +108,7 @@ async def create_team(
         game_handle=payload.captain_handle,
     )
 
+    initial_payment_status = "UNPAID" if game.get("entry_fee_inr", 0) > 0 else "PAID"
     team = Team(
         game_id=gid,
         captain_id=current_user.id,
@@ -117,7 +118,7 @@ async def create_team(
         max_substitutes=max_subs,
         members=[captain_member],
         substitutes=[],
-        payment_status="UNPAID",
+        payment_status=initial_payment_status,
     )
     team_doc = team.to_mongo()
     await db.teams.insert_one(team_doc)
@@ -133,14 +134,14 @@ async def join_team(
     clean_code = payload.invite_code.strip().upper()
     team = await db.teams.find_one({"invite_code": clean_code})
     if not team:
-        raise HTTPException(status_code=404, detail="Invalid invite code. No squad found.")
+        raise HTTPException(status_code=404, detail="Invalid invite code. No team found.")
 
     game_id = team.get("game_id")
     game = await db.games.find_one({"$or": [{"_id": game_id}, {"id": game_id}, {"slug": game_id}]})
     if game and (not game.get("is_team_game", True) or game.get("max_team_size", 5) <= 1):
         raise HTTPException(
             status_code=400,
-            detail="Cannot join a squad for a solo discipline.",
+            detail="Cannot join a team for a solo discipline.",
         )
 
     # Enforce one-team-per-game rule (Requirement 19)
@@ -156,7 +157,7 @@ async def join_team(
     if existing_team:
         raise HTTPException(
             status_code=400,
-            detail=f"You already belong to squad '{existing_team.get('name')}' for this game discipline. Each contender can only lead or join one squad per game.",
+            detail=f"You already belong to team '{existing_team.get('name')}' for this game discipline. Each contender can only lead or join one team per game.",
         )
 
     members = team.get("members", [])

@@ -324,9 +324,6 @@ async def set_user_role(
         "PLAYER",
         "ORGANIZER",
         "SUPER_ADMIN",
-        "TOURNAMENT_ADMIN",
-        "MATCH_ARBITER",
-        "COMMUNITY_MODERATOR",
     ]
     if payload.role not in valid_roles:
         raise HTTPException(status_code=400, detail=f"Invalid role. Must be one of: {valid_roles}")
@@ -974,6 +971,21 @@ async def complete_payout(
     now = datetime.now(timezone.utc)
     out_utr = payload.outgoing_utr.strip()
 
+    # Atomically transition status from PENDING to PAID
+    res = await db.payouts.update_one(
+        {"_id": payout["_id"], "status": "PENDING"},
+        {
+            "$set": {
+                "status": "PAID",
+                "outgoing_utr": out_utr,
+                "admin_id": admin_user.id,
+                "paid_at": now,
+            }
+        }
+    )
+    if res.modified_count == 0:
+        return {"status": "success", "message": "Payout was already processed."}
+
     # If it was a withdrawal, permanently deduct the reserved balance
     if payout.get("payout_type") == "WALLET_WITHDRAWAL":
         await finalize_reserved_deduction(
@@ -984,18 +996,6 @@ async def complete_payout(
             admin_id=admin_user.id,
             description=f"Withdrawal to {payout.get('upi_id')} (UTR: {out_utr})",
         )
-
-    await db.payouts.update_one(
-        {"_id": payout["_id"]},
-        {
-            "$set": {
-                "status": "PAID",
-                "outgoing_utr": out_utr,
-                "admin_id": admin_user.id,
-                "paid_at": now,
-            }
-        }
-    )
 
     await record_audit_log(
         db=db,
@@ -1021,16 +1021,9 @@ async def reject_payout(
 
     from app.services.wallet_service import release_reserved_funds
 
-    # Release reserved funds back to user's wallet
-    if payout.get("payout_type") == "WALLET_WITHDRAWAL":
-        await release_reserved_funds(
-            db=db,
-            user_id=payout["user_id"],
-            amount_paise=payout["amount_paise"],
-        )
-
-    await db.payouts.update_one(
-        {"_id": payout["_id"]},
+    # Atomically transition status from PENDING to REJECTED
+    res = await db.payouts.update_one(
+        {"_id": payout["_id"], "status": "PENDING"},
         {
             "$set": {
                 "status": "REJECTED",
@@ -1039,6 +1032,16 @@ async def reject_payout(
             }
         }
     )
+    if res.modified_count == 0:
+        return {"status": "success", "message": "Payout was already processed."}
+
+    # Release reserved funds back to user's wallet
+    if payout.get("payout_type") == "WALLET_WITHDRAWAL":
+        await release_reserved_funds(
+            db=db,
+            user_id=payout["user_id"],
+            amount_paise=payout["amount_paise"],
+        )
 
     await record_audit_log(
         db=db,

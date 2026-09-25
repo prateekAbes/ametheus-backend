@@ -14,8 +14,14 @@ router = APIRouter()
 RESERVED_USERNAMES = {"admin", "administrator", "ametheus", "superadmin", "super_admin", "mod", "moderator", "support", "staff", "system", "root", "owner"}
 
 def _is_reserved_username(username: str) -> bool:
-    """Returns True if the username is a reserved/forbidden name (case-insensitive)."""
-    return username.strip().lower() in RESERVED_USERNAMES
+    """Returns True if the username is a reserved/forbidden name in any casing variant or formatting."""
+    clean = username.strip().lower()
+    if clean in RESERVED_USERNAMES:
+        return True
+    normalized = clean.replace(" ", "").replace("_", "").replace("-", "").replace(".", "")
+    if normalized in {"admin", "administrator", "ametheus", "superadmin", "system", "support", "staff", "root"}:
+        return True
+    return False
 
 class UserSyncRequest(BaseModel):
     clerk_user_id: str

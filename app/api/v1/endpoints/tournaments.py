@@ -394,7 +394,7 @@ async def register_team_for_tournament(
     if reg_count >= max_teams:
         raise HTTPException(
             status_code=400,
-            detail=f"Tournament capacity of {max_teams} squads has been reached",
+            detail=f"Tournament capacity of {max_teams} teams has been reached",
         )
 
     fee_inr = tourn.get("entry_fee_inr", 0)
@@ -456,7 +456,7 @@ async def register_team_for_tournament(
     if is_solo_game:
         raise HTTPException(
             status_code=400,
-            detail=f"{game_obj.get('name', 'Chess')} is a solo 1v1 discipline. Squad registration is not permitted. Please register as an individual contender.",
+            detail=f"{game_obj.get('name', 'Chess')} is a solo 1v1 discipline. Team registration is not permitted. Please register as an individual contender.",
         )
 
     # 3. Team check
@@ -470,14 +470,14 @@ async def register_team_for_tournament(
     if team.get("captain_id") != current_user.id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only the verified squad captain can register this team",
+            detail="Only the verified team captain can register this team",
         )
 
     # 5. Game discipline match
     if team.get("game_id") != tourn.get("game_id"):
         raise HTTPException(
             status_code=400,
-            detail="Your squad is registered for a different competitive title than this tournament",
+            detail="Your team is registered for a different competitive title than this tournament",
         )
 
     # 5b. Roster bounds check
@@ -493,12 +493,12 @@ async def register_team_for_tournament(
     if members_count < min_size:
         raise HTTPException(
             status_code=400,
-            detail=f"Your squad has {members_count} member(s), but this tournament requires a minimum of {min_size} players. Please recruit {min_size - members_count} more player(s) before registering.",
+            detail=f"Your team has {members_count} member(s), but this tournament requires a minimum of {min_size} players. Please recruit {min_size - members_count} more player(s) before registering.",
         )
     if members_count > max_size:
         raise HTTPException(
             status_code=400,
-            detail=f"Your squad has {members_count} member(s), but this tournament allows a maximum of {max_size} players.",
+            detail=f"Your team has {members_count} member(s), but this tournament allows a maximum of {max_size} players.",
         )
 
     # 6. Duplicate registration check
@@ -521,7 +521,7 @@ async def register_team_for_tournament(
             amount_paise=fee_paise,
             txn_type="TOURNAMENT_ENTRY",
             reference_id=tid,
-            description=f"Squad entry fee: {tourn.get('title', 'Tournament')} ({team.get('name')})",
+            description=f"Team entry fee: {tourn.get('title', 'Tournament')} ({team.get('name')})",
         )
 
     # 8. Create registration record
@@ -540,14 +540,14 @@ async def register_team_for_tournament(
         db=db,
         user_id=current_user.id,
         title="Tournament Registered",
-        message=f'Squad "{team["name"]}" is confirmed for "{tourn.get("title", "Tournament")}". Check bracket schedule for match timings.',
+        message=f'Team "{team["name"]}" is confirmed for "{tourn.get("title", "Tournament")}". Check bracket schedule for match timings.',
         notification_type="TOURNAMENT",
         link=f"/tournaments/{tourn.get('slug', tid)}",
     )
 
     return {
         "status": "success",
-        "message": f'Squad "{team["name"]}" successfully registered for {tourn.get("title", "Tournament")}!',
+        "message": f'Team "{team["name"]}" successfully registered for {tourn.get("title", "Tournament")}!',
         "registration_id": reg.id,
         "payment_status": reg.payment_status,
         "wallet_txn_id": reg.wallet_txn_id,
