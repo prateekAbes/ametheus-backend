@@ -20,6 +20,7 @@ from app.services.notification import create_notification
 router = APIRouter()
 
 @router.get("", response_model=WalletBalanceResponse)
+@router.get("/balance", response_model=WalletBalanceResponse)
 async def get_wallet(
     current_user: User = Depends(get_current_user),
     db: AsyncIOMotorDatabase = Depends(get_db),

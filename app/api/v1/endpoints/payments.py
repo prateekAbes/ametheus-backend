@@ -1,6 +1,3 @@
-import secrets
-import hmac
-import hashlib
 from typing import Optional, List
 from fastapi import APIRouter, Depends, HTTPException, status
 from motor.motor_asyncio import AsyncIOMotorDatabase
@@ -15,8 +12,6 @@ from app.schemas import (
     GamePaymentInitiateResponse,
     SubmitUtrRequest,
     WalletTopupInitiateRequest,
-    OrderCreateRequest,
-    PaymentVerifyRequest,
 )
 from app.services.upi_service import get_next_active_upi_account, build_upi_payment_uri
 from app.services.wallet_service import debit_wallet_funds, get_user_wallet_balances
@@ -55,29 +50,15 @@ async def initiate_game_payment(
         if team.get("captain_id") != current_user.id and current_user.role != "SUPER_ADMIN":
             raise HTTPException(status_code=403, detail="Only team captain can pay entry fee for the team")
 
-    # FREE GAME
+    # FREE GAME - Zero-rupee records must NOT exist as financial transaction records
     if entry_fee_inr <= 0:
-        payment = GamePayment(
-            payment_type="GAME_ENTRY",
-            user_id=current_user.id,
-            game_id=gid,
-            game_name=game.get("name"),
-            team_id=payload.team_id,
-            team_name=team_name,
-            amount_paise=0,
-            amount_inr=0.0,
-            payment_method="FREE",
-            status="APPROVED",
-        )
-        p_doc = payment.to_mongo()
-        await db.game_payments.insert_one(p_doc)
         if team:
             await db.teams.update_one(
                 {"_id": team["_id"]},
-                {"$set": {"payment_status": "PAID", "payment_id": payment.id}}
+                {"$set": {"payment_status": "PAID"}}
             )
         return GamePaymentInitiateResponse(
-            payment_id=payment.id,
+            payment_id="FREE",
             game_id=gid,
             game_name=game.get("name"),
             team_id=payload.team_id,
@@ -212,6 +193,9 @@ async def submit_payment_utr(
     if not payment:
         raise HTTPException(status_code=404, detail="Payment record not found")
 
+    if payment.get("status") == "APPROVED":
+        raise HTTPException(status_code=400, detail="This payment has already been approved.")
+
     if payment.get("user_id") != current_user.id and current_user.role != "SUPER_ADMIN":
         raise HTTPException(status_code=403, detail="Not authorized to submit UTR for this payment")
 
@@ -306,7 +290,7 @@ async def initiate_wallet_topup(
         payee_name=payee_name,
         qr_url=qr_url,
         upi_uri=upi_uri,
-        status="PENDING",
+        status="INITIATED",
     )
     p_doc = payment.to_mongo()
     await db.game_payments.insert_one(p_doc)
@@ -353,224 +337,4 @@ async def get_payment_status(
     payment["id"] = str(payment.get("_id", payment.get("id")))
     payment.pop("_id", None)
     return payment
-
-@router.post("/create-order")
-async def create_escrow_order(
-    payload: OrderCreateRequest,
-    current_user: User = Depends(get_current_user),
-    db: AsyncIOMotorDatabase = Depends(get_db),
-):
-    """
-    Creates an escrow order for tournament entry fee via Platform Escrow Engine.
-    Supports both team registrations and solo player registrations.
-    """
-    tourn = await db.tournaments.find_one({
-        "$or": [{"_id": payload.tournament_id}, {"id": payload.tournament_id}, {"slug": payload.tournament_id}]
-    })
-    if not tourn:
-        raise HTTPException(status_code=404, detail="Tournament not found")
-
-    if tourn.get("status") != "REGISTRATION_OPEN":
-        raise HTTPException(status_code=400, detail="Tournament registration is not open")
-
-    tourn_id = str(tourn.get("_id", tourn.get("id")))
-
-    # Check capacity
-    reg_count = await db.tournament_registrations.count_documents({
-        "$or": [{"tournament_id": tourn_id}, {"tournament_id": tourn.get("slug")}]
-    })
-
-    if reg_count >= tourn.get("max_teams", 16):
-        raise HTTPException(status_code=400, detail="Tournament is at maximum capacity")
-
-    amount_inr = tourn.get("entry_fee_inr", 0)
-    amount_paise = amount_inr * 100
-
-    # Handle Solo Registration Order (when no team_id is provided)
-    if not payload.team_id:
-        if amount_inr == 0:
-            reg = TournamentRegistration(
-                tournament_id=tourn_id,
-                player_id=current_user.id,
-                payment_status="FREE",
-                check_in_status="PENDING",
-            )
-            await db.tournament_registrations.insert_one(reg.to_mongo())
-            return {
-                "status": "free",
-                "message": "Free entry solo tournament. Registration confirmed.",
-                "order_id": None,
-                "amount_inr": 0,
-            }
-
-        escrow_order_id = f"order_amx_{secrets.token_hex(8)}"
-        existing_reg = await db.tournament_registrations.find_one({
-            "tournament_id": tourn_id,
-            "player_id": current_user.id,
-        })
-        if existing_reg:
-            await db.tournament_registrations.update_one(
-                {"_id": existing_reg["_id"]},
-                {"$set": {"order_id": escrow_order_id, "payment_status": "PENDING"}}
-            )
-        else:
-            reg = TournamentRegistration(
-                tournament_id=tourn_id,
-                player_id=current_user.id,
-                payment_status="PENDING",
-                order_id=escrow_order_id,
-                check_in_status="PENDING",
-            )
-            await db.tournament_registrations.insert_one(reg.to_mongo())
-
-        return {
-            "status": "created",
-            "order_id": escrow_order_id,
-            "amount_paise": amount_paise,
-            "amount_inr": amount_inr,
-            "currency": "INR",
-            "tournament_title": tourn.get("title"),
-            "team_name": current_user.display_name or current_user.username,
-        }
-
-    # Handle Team Registration Order
-    team = await db.teams.find_one({"$or": [{"_id": payload.team_id}, {"id": payload.team_id}]})
-    if not team:
-        raise HTTPException(status_code=404, detail="Team not found")
-
-    if team.get("captain_id") != current_user.id and current_user.role != "SUPER_ADMIN":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only the squad captain can initiate payment for registration",
-        )
-
-    team_id = str(team.get("_id", team.get("id")))
-
-    # If free tournament, create immediate PAID registration
-    if amount_inr == 0:
-        reg = TournamentRegistration(
-            tournament_id=tourn_id,
-            team_id=team_id,
-            payment_status="FREE",
-            check_in_status="PENDING",
-        )
-        await db.tournament_registrations.insert_one(reg.to_mongo())
-        return {
-            "status": "free",
-            "message": "Free entry tournament. Registration confirmed.",
-            "order_id": None,
-            "amount_inr": 0,
-        }
-
-    # Generate Platform Escrow Order
-    escrow_order_id = f"order_amx_{secrets.token_hex(8)}"
-
-    # Check existing pending registration
-    existing_reg = await db.tournament_registrations.find_one({
-        "tournament_id": tourn_id,
-        "team_id": team_id,
-    })
-
-    if existing_reg:
-        await db.tournament_registrations.update_one(
-            {"_id": existing_reg["_id"]},
-            {"$set": {"order_id": escrow_order_id, "payment_status": "PENDING"}}
-        )
-    else:
-        reg = TournamentRegistration(
-            tournament_id=tourn_id,
-            team_id=team_id,
-            payment_status="PENDING",
-            order_id=escrow_order_id,
-            check_in_status="PENDING",
-        )
-        await db.tournament_registrations.insert_one(reg.to_mongo())
-
-    return {
-        "status": "created",
-        "order_id": escrow_order_id,
-        "amount_paise": amount_paise,
-        "amount_inr": amount_inr,
-        "currency": "INR",
-        "tournament_title": tourn.get("title"),
-        "team_name": team.get("name"),
-    }
-
-@router.post("/verify")
-async def verify_payment(
-    payload: PaymentVerifyRequest,
-    current_user: User = Depends(get_current_user),
-    db: AsyncIOMotorDatabase = Depends(get_db),
-):
-    """
-    Verifies platform escrow signature and confirms escrow deposit.
-    """
-    order_id = payload.get_order_id()
-    payment_id = payload.get_payment_id()
-    signature = payload.get_signature()
-
-    message = f"{order_id}|{payment_id}".encode("utf-8")
-    expected_sig = hmac.new(
-        settings.ESCROW_SECRET_KEY.encode("utf-8"),
-        message,
-        hashlib.sha256,
-    ).hexdigest()
-
-    is_valid = hmac.compare_digest(expected_sig, signature)
-
-    if not is_valid:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Payment signature verification failed. Tampered or invalid callback.",
-        )
-
-    # Find registration by order_id
-    reg = await db.tournament_registrations.find_one({
-        "order_id": order_id
-    })
-    if not reg:
-        raise HTTPException(status_code=404, detail="Order registration record not found")
-
-    await db.tournament_registrations.update_one(
-        {"_id": reg["_id"]},
-        {"$set": {"payment_status": "PAID"}}
-    )
-
-    await record_audit_log(
-        db=db,
-        operator=current_user.username,
-        role=current_user.role,
-        action="ESCROW_DEPOSIT_VERIFIED",
-        target=f"Order {order_id} -> Tourn {reg.get('tournament_id')}",
-        details=f"Payment ID: {payment_id} | Signature verified via Platform Escrow Engine",
-    )
-
-    await create_notification(
-        db=db,
-        user_id=current_user.id,
-        title="Escrow Payment Confirmed",
-        message=f"Your entry fee payment (Order: {order_id}) has been verified and placed in secure platform escrow.",
-        notification_type="PAYMENT",
-        link="/dashboard",
-    )
-
-    return {
-        "status": "success",
-        "message": "Payment verified and held in secure platform escrow. Registration confirmed.",
-        "order_id": order_id,
-        "payment_id": payment_id,
-    }
-
-@router.get("/order/{order_id}")
-async def get_order_status(order_id: str, db: AsyncIOMotorDatabase = Depends(get_db)):
-    reg = await db.tournament_registrations.find_one({"order_id": order_id})
-    if not reg:
-        raise HTTPException(status_code=404, detail="Order not found")
-
-    return {
-        "order_id": reg.get("order_id"),
-        "payment_status": reg.get("payment_status"),
-        "tournament_id": reg.get("tournament_id"),
-        "team_id": reg.get("team_id"),
-    }
 

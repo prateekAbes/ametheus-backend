@@ -61,8 +61,8 @@ async def test_team_create_and_join_flow(client):
 
 @pytest.mark.asyncio
 async def test_team_leave_kick_and_disband(client):
-    headers_captain = make_auth_headers("usr_test_captain")
-    headers_member = make_auth_headers("usr_test_teammate")
+    headers_captain = make_auth_headers("usr_test_captain_disband")
+    headers_member = make_auth_headers("usr_test_teammate_disband")
 
     # 1. Create a fresh team
     payload = {
@@ -183,3 +183,32 @@ async def test_solo_game_rejects_team_creation_and_capacity_enforced(client):
     join3_res = await client.post("/api/v1/teams/join", json={"invite_code": code, "player_handle": "Extra#3"}, headers=headers_p3)
     assert join3_res.status_code == 400
     assert "full" in join3_res.json()["detail"].lower()
+
+@pytest.mark.asyncio
+async def test_one_team_per_game_enforcement(client):
+    headers_user = make_auth_headers("usr_unique_per_game")
+
+    # 1. Create Team A for Valorant -> 201
+    res1 = await client.post(
+        "/api/v1/teams",
+        json={"game_slug": "valorant", "name": "Team One", "tag": "ONE", "captain_handle": "Captain#1"},
+        headers=headers_user,
+    )
+    assert res1.status_code == 201
+
+    # 2. Attempt to create Team B for Valorant -> 400 (Already belongs to a team for this game)
+    res2 = await client.post(
+        "/api/v1/teams",
+        json={"game_slug": "valorant", "name": "Team Two", "tag": "TWO", "captain_handle": "Captain#1"},
+        headers=headers_user,
+    )
+    assert res2.status_code == 400
+    assert "already belong" in res2.json()["detail"].lower()
+
+    # 3. Create Team for a different game (mini-militia) -> 201
+    res3 = await client.post(
+        "/api/v1/teams",
+        json={"game_slug": "mini-militia", "name": "Militia Team", "tag": "MIL", "captain_handle": "Captain#1"},
+        headers=headers_user,
+    )
+    assert res3.status_code == 201

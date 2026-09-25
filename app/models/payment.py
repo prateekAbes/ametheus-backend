@@ -53,7 +53,7 @@ class GamePayment(BaseModel):
     # Player submission
     utr: Optional[str] = None  # Actual transaction reference from player's UPI app
     screenshot_url: Optional[str] = None
-    status: str = "PENDING"  # PENDING, APPROVED, REJECTED
+    status: str = "INITIATED"  # INITIATED, PENDING, APPROVED, REJECTED
     rejection_reason: Optional[str] = None
     verified_by: Optional[str] = None
     verified_at: Optional[datetime] = None

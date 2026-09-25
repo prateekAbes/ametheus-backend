@@ -10,7 +10,7 @@ async def test_tournament_discovery_and_registration(client):
     headers_captain = make_auth_headers("usr_tourn_captain")
 
     async with TestSessionLocal() as db:
-        u = User(id="usr_tourn_captain", clerk_user_id="usr_tourn_captain", email="tc@test.com", username="tourn_captain", role="PLAYER")
+        u = User(id="usr_tourn_captain", clerk_user_id="usr_tourn_captain", email="tc@test.com", username="tourn_captain", role="PLAYER", inr_balance_paise=10000)
         db.add(u)
         g = Game(
             slug="valorant-tourn-test",
@@ -39,11 +39,14 @@ async def test_tournament_discovery_and_registration(client):
             server_region="AWS Mumbai",
             banner_url="http://banner",
             description="Test tournament",
+            min_team_size=1,
+            max_team_size=5,
         )
         db.add(t)
         await db.commit()
         await db.refresh(t)
 
+        from app.models.team import TeamMember
         team = Team(
             game_id=g.id,
             captain_id="usr_tourn_captain",
@@ -51,6 +54,9 @@ async def test_tournament_discovery_and_registration(client):
             tag="ALP",
             invite_code="ALP123",
             max_members=5,
+            members=[
+                TeamMember(user_id="usr_tourn_captain", username="tourn_captain", role="CAPTAIN", game_handle="cap#123")
+            ],
         )
         db.add(team)
         await db.commit()

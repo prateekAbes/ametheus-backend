@@ -8,6 +8,7 @@ class User(BaseModel):
     clerk_user_id: Optional[str] = None
     email: str
     username: str
+    username_lower: Optional[str] = None
     display_name: Optional[str] = None
     avatar_url: Optional[str] = None
     role: str = "PLAYER"
@@ -23,6 +24,7 @@ class User(BaseModel):
     def to_mongo(self) -> dict:
         d = self.model_dump()
         d["_id"] = d.pop("id")
+        d["username_lower"] = (self.username or "").strip().lower()
         if d.get("clerk_user_id") is None:
             d.pop("clerk_user_id", None)
         return d

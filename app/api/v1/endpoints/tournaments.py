@@ -9,6 +9,7 @@ from app.api.deps import get_db, get_current_user
 from app.models.user import User
 from app.models.tournament import Tournament, TournamentRegistration
 from app.schemas import TournamentResponse, TournamentRegisterRequest, MatchResponse
+from app.services.wallet_service import debit_wallet_funds
 
 router = APIRouter()
 
@@ -115,6 +116,72 @@ async def list_tournaments(
             )
         )
     return response
+
+@router.get("/my-registrations")
+async def get_my_tournament_registrations(
+    current_user: User = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Returns all tournaments the current authenticated user is registered for,
+    either as an individual contender or through their squad rosters.
+    """
+    # 1. Fetch user's squads
+    my_teams_cursor = db.teams.find({
+        "$or": [
+            {"captain_id": current_user.id},
+            {"members.user_id": current_user.id},
+            {"substitutes.user_id": current_user.id},
+        ],
+        "is_dummy": {"$ne": True},
+    })
+    my_teams = await my_teams_cursor.to_list(length=100)
+    my_team_ids = [str(t.get("_id", t.get("id"))) for t in my_teams]
+
+    # 2. Query registrations matching player_id or team_id
+    reg_or = [{"player_id": current_user.id}]
+    if my_team_ids:
+        reg_or.append({"team_id": {"$in": my_team_ids}})
+
+    regs = await db.tournament_registrations.find({"$or": reg_or}).to_list(length=100)
+
+    results = []
+    for r in regs:
+        t_id = r.get("tournament_id")
+        tourn = await db.tournaments.find_one({"$or": [{"_id": t_id}, {"id": t_id}, {"slug": t_id}]})
+        if not tourn:
+            continue
+
+        gid = tourn.get("game_id")
+        game = await db.games.find_one({"$or": [{"_id": gid}, {"id": gid}, {"slug": gid}]}) if gid else None
+
+        reg_team = None
+        if r.get("team_id"):
+            reg_team = next((t for t in my_teams if str(t.get("_id", t.get("id"))) == r.get("team_id")), None)
+            if not reg_team:
+                reg_team = await db.teams.find_one({"$or": [{"_id": r["team_id"]}, {"id": r["team_id"]}]})
+
+        results.append({
+            "registration_id": str(r.get("_id", r.get("id"))),
+            "tournament_id": str(tourn.get("_id", tourn.get("id"))),
+            "tournament_title": tourn.get("title", "Tournament"),
+            "tournament_slug": tourn.get("slug", ""),
+            "tournament_status": tourn.get("status", "REGISTRATION_OPEN"),
+            "starts_at": tourn.get("starts_at", "TBD"),
+            "game_slug": game["slug"] if game else "game",
+            "game_name": game["name"] if game else "Competitive Title",
+            "banner_url": tourn.get("banner_url") or "",
+            "prize_pool_inr": tourn.get("prize_pool_inr", 0),
+            "entry_fee_inr": tourn.get("entry_fee_inr", 0),
+            "payment_status": r.get("payment_status", "FREE"),
+            "check_in_status": r.get("check_in_status", "PENDING"),
+            "registered_at": r.get("created_at").isoformat() if r.get("created_at") else "",
+            "team_id": r.get("team_id"),
+            "team_name": reg_team.get("name") if reg_team else None,
+            "team_tag": reg_team.get("tag") if reg_team else None,
+        })
+
+    return results
 
 @router.get("/{slug}", response_model=TournamentResponse)
 async def get_tournament_by_slug(slug: str, db: AsyncIOMotorDatabase = Depends(get_db)):
@@ -345,11 +412,25 @@ async def register_team_for_tournament(
         if existing_reg:
             raise HTTPException(status_code=400, detail="You are already registered for this tournament")
 
+        wallet_txn_id = None
+        if fee_inr > 0:
+            fee_paise = int(round(fee_inr * 100))
+            wallet_txn_id = f"txn_tourn_{uuid.uuid4().hex[:12]}"
+            await debit_wallet_funds(
+                db=db,
+                user_id=current_user.id,
+                amount_paise=fee_paise,
+                txn_type="TOURNAMENT_ENTRY",
+                reference_id=tid,
+                description=f"Solo entry fee: {tourn.get('title', 'Tournament')}",
+            )
+
         reg = TournamentRegistration(
             tournament_id=tid,
             player_id=current_user.id,
             payment_status="PAID" if fee_inr > 0 else "FREE",
-            order_id=f"order_{uuid.uuid4().hex[:12]}" if fee_inr > 0 else None,
+            wallet_txn_id=wallet_txn_id,
+            order_id=wallet_txn_id or f"reg_{uuid.uuid4().hex[:10]}",
             check_in_status="PENDING",
         )
         await db.tournament_registrations.insert_one(reg.to_mongo())
@@ -412,7 +493,7 @@ async def register_team_for_tournament(
     if members_count < min_size:
         raise HTTPException(
             status_code=400,
-            detail=f"Your squad has {members_count} member(s), but this tournament requires a minimum of {min_size} players.",
+            detail=f"Your squad has {members_count} member(s), but this tournament requires a minimum of {min_size} players. Please recruit {min_size - members_count} more player(s) before registering.",
         )
     if members_count > max_size:
         raise HTTPException(
@@ -429,12 +510,27 @@ async def register_team_for_tournament(
     if existing_reg:
         raise HTTPException(status_code=400, detail="Team is already registered for this tournament")
 
-    # 7. Create registration record
+    # 7. Debit entry fee from captain wallet if paid tournament (Requirement 24, 25, 40)
+    wallet_txn_id = None
+    if fee_inr > 0:
+        fee_paise = int(round(fee_inr * 100))
+        wallet_txn_id = f"txn_tourn_{uuid.uuid4().hex[:12]}"
+        await debit_wallet_funds(
+            db=db,
+            user_id=current_user.id,
+            amount_paise=fee_paise,
+            txn_type="TOURNAMENT_ENTRY",
+            reference_id=tid,
+            description=f"Squad entry fee: {tourn.get('title', 'Tournament')} ({team.get('name')})",
+        )
+
+    # 8. Create registration record
     reg = TournamentRegistration(
         tournament_id=tid,
         team_id=team_id,
         payment_status="PAID" if fee_inr > 0 else "FREE",
-        order_id="order_escrow_mock_123" if fee_inr > 0 else None,
+        wallet_txn_id=wallet_txn_id,
+        order_id=wallet_txn_id or f"reg_{uuid.uuid4().hex[:10]}",
         check_in_status="PENDING",
     )
     await db.tournament_registrations.insert_one(reg.to_mongo())
@@ -452,6 +548,9 @@ async def register_team_for_tournament(
     return {
         "status": "success",
         "message": f'Squad "{team["name"]}" successfully registered for {tourn.get("title", "Tournament")}!',
+        "registration_id": reg.id,
+        "payment_status": reg.payment_status,
+        "wallet_txn_id": reg.wallet_txn_id,
         "order_id": reg.order_id,
         "entry_fee_inr": fee_inr,
     }

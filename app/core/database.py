@@ -67,7 +67,27 @@ async def init_db_indexes(db: AsyncIOMotorDatabase):
         await db.teams.create_index("invite_code", unique=True)
         await db.teams.create_index("captain_id")
         await db.teams.create_index("game_id")
+        await db.teams.create_index([("game_id", 1), ("captain_id", 1)])
+        await db.teams.create_index([("game_id", 1), ("members.user_id", 1)])
+        await db.teams.create_index([("game_id", 1), ("substitutes.user_id", 1)])
         await db.teams.create_index("is_dummy")
+
+        # Tournament Registrations
+        await db.tournament_registrations.create_index(
+            [("tournament_id", 1), ("team_id", 1)],
+            unique=True,
+            partialFilterExpression={"team_id": {"$type": "string"}},
+            name="tournament_team_unique",
+        )
+        await db.tournament_registrations.create_index(
+            [("tournament_id", 1), ("player_id", 1)],
+            unique=True,
+            partialFilterExpression={"player_id": {"$type": "string"}},
+            name="tournament_player_unique",
+        )
+        await db.tournament_registrations.create_index("player_id")
+        await db.tournament_registrations.create_index("team_id")
+        await db.tournament_registrations.create_index("tournament_id")
 
         # UPI Accounts
         await db.upi_accounts.create_index("code", unique=True)
@@ -77,6 +97,11 @@ async def init_db_indexes(db: AsyncIOMotorDatabase):
         # Game Payments
         try:
             await db.game_payments.drop_index("utr_1_payment_type_1")
+        except Exception:
+            pass
+        # Clean any legacy 0-rupee payment records
+        try:
+            await db.game_payments.delete_many({"amount_paise": 0})
         except Exception:
             pass
         await db.game_payments.create_index(
@@ -95,6 +120,7 @@ async def init_db_indexes(db: AsyncIOMotorDatabase):
         # Wallet Ledger
         await db.wallet_ledger.create_index("user_id")
         await db.wallet_ledger.create_index("created_at")
+        await db.wallet_ledger.create_index([("user_id", 1), ("created_at", -1)])
         await db.wallet_ledger.create_index("is_dummy")
 
         # Payouts

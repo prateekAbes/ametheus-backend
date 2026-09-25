@@ -361,11 +361,76 @@ async def list_platform_users(
             "display_name": u.get("display_name"),
             "email": u["email"],
             "role": u.get("role", "PLAYER"),
-            "inr_balance": u.get("inr_balance", "0"),
+            "inr_balance": str(round(u.get("inr_balance_paise", 0) / 100, 2)) if "inr_balance_paise" in u else str(u.get("inr_balance", "0")),
             "created_at": str(u.get("created_at")),
         }
         for u in users
     ]
+
+@router.get("/users/{user_id}/wallet-summary")
+async def get_user_wallet_summary(
+    user_id: str,
+    admin_user: User = Depends(require_super_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Returns full wallet accounting for a specific user:
+    available balance, reserved balance, total deposited, total withdrawn, total spent,
+    and the chronological ledger transactions.
+    """
+    user_doc = await db.users.find_one({"$or": [{"_id": user_id}, {"id": user_id}, {"clerk_user_id": user_id}]})
+    if not user_doc:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    target_id = str(user_doc.get("_id", user_doc.get("id")))
+    from app.services.wallet_service import get_user_wallet_balances
+    balances = await get_user_wallet_balances(db, target_id)
+
+    # Fetch all ledger entries for this user
+    cursor = db.wallet_ledger.find({"user_id": target_id}).sort("created_at", -1)
+    ledger_docs = await cursor.to_list(length=200)
+
+    total_deposited_paise = 0
+    total_withdrawn_paise = 0
+    total_spent_paise = 0
+
+    ledger_entries = []
+    for entry in ledger_docs:
+        amt = entry.get("amount_paise", 0)
+        direction = entry.get("direction", "")
+        tt = entry.get("txn_type", "")
+
+        if direction == "CREDIT" or tt in ["WALLET_TOPUP", "PRIZE_PAYOUT", "ADMIN_CREDIT"]:
+            total_deposited_paise += amt
+        elif tt in ["WITHDRAWAL_FINALIZE", "WITHDRAWAL"]:
+            total_withdrawn_paise += amt
+        elif direction == "DEBIT" or tt in ["GAME_ENTRY_PAYMENT", "TOURNAMENT_ENTRY", "PLATFORM_FEE"]:
+            total_spent_paise += amt
+
+        ledger_entries.append({
+            "id": str(entry.get("_id", entry.get("id"))),
+            "txn_type": tt,
+            "direction": direction,
+            "amount_inr": round(amt / 100, 2),
+            "amount_paise": amt,
+            "balance_after_inr": round(entry.get("balance_after_paise", 0) / 100, 2),
+            "reference_id": entry.get("reference_id"),
+            "description": entry.get("description", ""),
+            "created_at": str(entry.get("created_at")),
+        })
+
+    return {
+        "user_id": target_id,
+        "username": user_doc.get("username"),
+        "email": user_doc.get("email"),
+        "available_balance_inr": balances["available_balance"],
+        "reserved_balance_inr": balances["reserved_balance"],
+        "total_balance_inr": balances["inr_balance"],
+        "total_deposited_inr": round(total_deposited_paise / 100, 2),
+        "total_withdrawn_inr": round(total_withdrawn_paise / 100, 2),
+        "total_spent_inr": round(total_spent_paise / 100, 2),
+        "ledger": ledger_entries,
+    }
 
 @router.get("/disputes", response_model=List[DisputeResponse])
 async def list_disputes(
@@ -675,7 +740,10 @@ async def list_admin_payments(
 ):
     query = {"is_dummy": {"$ne": True}}
     if status_filter and status_filter.upper() != "ALL":
-        query["status"] = status_filter.upper()
+        sf = status_filter.upper()
+        query["status"] = sf
+        if sf == "PENDING":
+            query["utr"] = {"$exists": True, "$type": "string", "$ne": ""}
     if game_id:
         query["game_id"] = game_id
 
@@ -699,12 +767,18 @@ async def approve_payment(
     if payment.get("status") == "APPROVED":
         return {"status": "success", "message": "Payment was already approved"}
 
+    if not payment.get("utr") or not str(payment.get("utr")).strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot approve payment without a valid submitted UTR reference.",
+        )
+
     from datetime import datetime, timezone
     now = datetime.now(timezone.utc)
 
-    # Atomic condition: only transition if status is NOT already APPROVED
+    # Atomic condition: only transition if status is PENDING
     update_res = await db.game_payments.update_one(
-        {"_id": payment["_id"], "status": {"$ne": "APPROVED"}},
+        {"_id": payment["_id"], "status": "PENDING"},
         {
             "$set": {
                 "status": "APPROVED",
@@ -715,7 +789,7 @@ async def approve_payment(
     )
 
     if update_res.modified_count == 0:
-        return {"status": "success", "message": "Payment was already approved"}
+        return {"status": "success", "message": "Payment was already approved or is not in PENDING status"}
 
     # If it was a game entry payment, set team to PAID
     if payment.get("payment_type") == "GAME_ENTRY" and payment.get("team_id"):

@@ -79,6 +79,7 @@ class TournamentRegistration(BaseModel):
     player_id: Optional[str] = None
     payment_status: str = "FREE"  # FREE, PENDING, PAID, REFUNDED
     order_id: Optional[str] = None
+    wallet_txn_id: Optional[str] = None
     check_in_status: str = "PENDING"  # PENDING, CHECKED_IN
     created_at: datetime = Field(default_factory=get_utc_now)
     updated_at: datetime = Field(default_factory=get_utc_now)

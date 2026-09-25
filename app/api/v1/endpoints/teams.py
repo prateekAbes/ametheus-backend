@@ -86,6 +86,22 @@ async def create_team(
 
     gid = str(game.get("_id", game.get("id")))
 
+    # Enforce one-team-per-game rule (Requirement 19)
+    existing_team = await db.teams.find_one({
+        "game_id": gid,
+        "is_dummy": {"$ne": True},
+        "$or": [
+            {"captain_id": current_user.id},
+            {"members.user_id": current_user.id},
+            {"substitutes.user_id": current_user.id},
+        ],
+    })
+    if existing_team:
+        raise HTTPException(
+            status_code=400,
+            detail=f"You already belong to squad '{existing_team.get('name')}' for {game.get('name', 'this game')}. Each contender can only lead or join one squad per game discipline.",
+        )
+
     captain_member = TeamMember(
         user_id=current_user.id,
         role="CAPTAIN",
@@ -125,6 +141,22 @@ async def join_team(
         raise HTTPException(
             status_code=400,
             detail="Cannot join a squad for a solo discipline.",
+        )
+
+    # Enforce one-team-per-game rule (Requirement 19)
+    existing_team = await db.teams.find_one({
+        "game_id": game_id,
+        "is_dummy": {"$ne": True},
+        "$or": [
+            {"captain_id": current_user.id},
+            {"members.user_id": current_user.id},
+            {"substitutes.user_id": current_user.id},
+        ],
+    })
+    if existing_team:
+        raise HTTPException(
+            status_code=400,
+            detail=f"You already belong to squad '{existing_team.get('name')}' for this game discipline. Each contender can only lead or join one squad per game.",
         )
 
     members = team.get("members", [])

@@ -38,22 +38,28 @@ async def credit_wallet_funds(
     """
     Credits funds to user's available wallet balance atomically and inserts ledger entry.
     """
+    if amount_paise <= 0:
+        raise HTTPException(status_code=400, detail="Credit amount must be greater than zero")
+
     user = await db.users.find_one({"$or": [{"_id": user_id}, {"id": user_id}]})
     if not user:
         raise HTTPException(status_code=404, detail="User account not found")
 
     current_avail = int(user.get("inr_balance_paise", 0))
-    new_avail = current_avail + amount_paise
+    if current_avail == 0 and user.get("inr_balance"):
+        try:
+            current_avail = int(float(user["inr_balance"]) * 100)
+            await db.users.update_one({"_id": user["_id"]}, {"$set": {"inr_balance_paise": current_avail}})
+        except Exception:
+            current_avail = 0
 
-    await db.users.update_one(
+    updated = await db.users.find_one_and_update(
         {"_id": user["_id"]},
-        {
-            "$set": {
-                "inr_balance_paise": new_avail,
-                "inr_balance": str(new_avail / 100),
-            }
-        }
+        {"$inc": {"inr_balance_paise": amount_paise}},
+        return_document=True,
     )
+    new_avail = int(updated.get("inr_balance_paise", current_avail + amount_paise))
+    await db.users.update_one({"_id": user["_id"]}, {"$set": {"inr_balance": f"{new_avail / 100:.2f}"}})
 
     ledger = WalletLedger(
         user_id=user_id,
@@ -80,28 +86,35 @@ async def debit_wallet_funds(
     Debits funds from user's available balance atomically.
     Raises 400 if insufficient funds.
     """
+    if amount_paise <= 0:
+        raise HTTPException(status_code=400, detail="Debit amount must be greater than zero")
+
     user = await db.users.find_one({"$or": [{"_id": user_id}, {"id": user_id}]})
     if not user:
         raise HTTPException(status_code=404, detail="User account not found")
 
     current_avail = int(user.get("inr_balance_paise", 0))
-    if current_avail < amount_paise:
+    if current_avail == 0 and user.get("inr_balance"):
+        try:
+            current_avail = int(float(user["inr_balance"]) * 100)
+            await db.users.update_one({"_id": user["_id"]}, {"$set": {"inr_balance_paise": current_avail}})
+        except Exception:
+            current_avail = 0
+
+    # Atomic condition: only decrement if inr_balance_paise >= amount_paise
+    updated = await db.users.find_one_and_update(
+        {"_id": user["_id"], "inr_balance_paise": {"$gte": amount_paise}},
+        {"$inc": {"inr_balance_paise": -amount_paise}},
+        return_document=True,
+    )
+    if not updated:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Insufficient wallet balance. Required: ₹{amount_paise/100:.2f}, Available: ₹{current_avail/100:.2f}"
+            detail=f"Insufficient wallet balance. Required: ₹{amount_paise/100:.2f}, Available: ₹{current_avail/100:.2f}",
         )
 
-    new_avail = current_avail - amount_paise
-
-    await db.users.update_one(
-        {"_id": user["_id"]},
-        {
-            "$set": {
-                "inr_balance_paise": new_avail,
-                "inr_balance": str(new_avail / 100),
-            }
-        }
-    )
+    new_avail = int(updated.get("inr_balance_paise", 0))
+    await db.users.update_one({"_id": user["_id"]}, {"$set": {"inr_balance": f"{new_avail / 100:.2f}"}})
 
     ledger = WalletLedger(
         user_id=user_id,
@@ -121,34 +134,43 @@ async def reserve_wallet_funds(
     amount_paise: int,
 ) -> Dict[str, Any]:
     """
-    Moves funds from available to reserved balance for pending withdrawal.
+    Moves funds from available to reserved balance for pending withdrawal atomically.
     """
+    if amount_paise <= 0:
+        raise HTTPException(status_code=400, detail="Reservation amount must be greater than zero")
+
     user = await db.users.find_one({"$or": [{"_id": user_id}, {"id": user_id}]})
     if not user:
         raise HTTPException(status_code=404, detail="User account not found")
 
     current_avail = int(user.get("inr_balance_paise", 0))
-    current_reserved = int(user.get("inr_reserved_paise", 0))
+    if current_avail == 0 and user.get("inr_balance"):
+        try:
+            current_avail = int(float(user["inr_balance"]) * 100)
+            await db.users.update_one({"_id": user["_id"]}, {"$set": {"inr_balance_paise": current_avail}})
+        except Exception:
+            current_avail = 0
 
-    if current_avail < amount_paise:
+    # Atomic condition: only reserve if inr_balance_paise >= amount_paise
+    updated = await db.users.find_one_and_update(
+        {"_id": user["_id"], "inr_balance_paise": {"$gte": amount_paise}},
+        {
+            "$inc": {
+                "inr_balance_paise": -amount_paise,
+                "inr_reserved_paise": amount_paise,
+            }
+        },
+        return_document=True,
+    )
+    if not updated:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Insufficient available balance to reserve ₹{amount_paise/100:.2f}. Available: ₹{current_avail/100:.2f}"
+            detail=f"Insufficient available balance to reserve ₹{amount_paise/100:.2f}. Available: ₹{current_avail/100:.2f}",
         )
 
-    new_avail = current_avail - amount_paise
-    new_reserved = current_reserved + amount_paise
-
-    await db.users.update_one(
-        {"_id": user["_id"]},
-        {
-            "$set": {
-                "inr_balance_paise": new_avail,
-                "inr_reserved_paise": new_reserved,
-                "inr_balance": str(new_avail / 100),
-            }
-        }
-    )
+    new_avail = int(updated.get("inr_balance_paise", 0))
+    new_reserved = int(updated.get("inr_reserved_paise", 0))
+    await db.users.update_one({"_id": user["_id"]}, {"$set": {"inr_balance": f"{new_avail / 100:.2f}"}})
 
     return {
         "available_paise": new_avail,
@@ -161,28 +183,27 @@ async def release_reserved_funds(
     amount_paise: int,
 ) -> None:
     """
-    Returns reserved funds back to available balance upon payout/withdrawal rejection.
+    Returns reserved funds back to available balance upon payout/withdrawal rejection atomically.
     """
     user = await db.users.find_one({"$or": [{"_id": user_id}, {"id": user_id}]})
     if not user:
         return
 
-    current_avail = int(user.get("inr_balance_paise", 0))
-    current_reserved = int(user.get("inr_reserved_paise", 0))
+    current_res = int(user.get("inr_reserved_paise", 0))
+    deduct_res = min(current_res, amount_paise)
 
-    new_avail = current_avail + amount_paise
-    new_reserved = max(0, current_reserved - amount_paise)
-
-    await db.users.update_one(
+    updated = await db.users.find_one_and_update(
         {"_id": user["_id"]},
         {
-            "$set": {
-                "inr_balance_paise": new_avail,
-                "inr_reserved_paise": new_reserved,
-                "inr_balance": str(new_avail / 100),
+            "$inc": {
+                "inr_balance_paise": amount_paise,
+                "inr_reserved_paise": -deduct_res,
             }
-        }
+        },
+        return_document=True,
     )
+    new_avail = int(updated.get("inr_balance_paise", 0))
+    await db.users.update_one({"_id": user["_id"]}, {"$set": {"inr_balance": f"{new_avail / 100:.2f}"}})
 
 async def finalize_reserved_deduction(
     db: AsyncIOMotorDatabase,
@@ -200,14 +221,16 @@ async def finalize_reserved_deduction(
     if not user:
         return
 
-    current_reserved = int(user.get("inr_reserved_paise", 0))
     current_avail = int(user.get("inr_balance_paise", 0))
-    new_reserved = max(0, current_reserved - amount_paise)
+    current_reserved = int(user.get("inr_reserved_paise", 0))
+    deduct_res = min(current_reserved, amount_paise)
 
-    await db.users.update_one(
+    updated = await db.users.find_one_and_update(
         {"_id": user["_id"]},
-        {"$set": {"inr_reserved_paise": new_reserved}}
+        {"$inc": {"inr_reserved_paise": -deduct_res}},
+        return_document=True,
     )
+    new_reserved = int(updated.get("inr_reserved_paise", 0))
 
     ledger = WalletLedger(
         user_id=user_id,
