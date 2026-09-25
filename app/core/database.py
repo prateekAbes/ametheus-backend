@@ -75,7 +75,16 @@ async def init_db_indexes(db: AsyncIOMotorDatabase):
         await db.upi_accounts.create_index("is_dummy")
 
         # Game Payments
-        await db.game_payments.create_index([("utr", 1), ("payment_type", 1)], unique=True, sparse=True)
+        try:
+            await db.game_payments.drop_index("utr_1_payment_type_1")
+        except Exception:
+            pass
+        await db.game_payments.create_index(
+            "utr",
+            unique=True,
+            partialFilterExpression={"utr": {"$type": "string"}},
+            name="utr_unique_string",
+        )
         await db.game_payments.create_index("status")
         await db.game_payments.create_index("user_id")
         await db.game_payments.create_index("game_id")

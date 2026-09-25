@@ -64,6 +64,9 @@ class GamePayment(BaseModel):
     def to_mongo(self) -> dict:
         d = self.model_dump()
         d["_id"] = d.pop("id")
+        # Do not persist null utr so unsubmitted payments don't conflict in indexes
+        if d.get("utr") is None:
+            d.pop("utr", None)
         return d
 
     @classmethod

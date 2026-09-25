@@ -135,3 +135,19 @@ async def test_upi_account_crud_and_rotation(client):
     # 10. Mark payout complete
     r = await client.post(f"/api/v1/admin/payouts/{p_id}/complete", json={"outgoing_utr": "OUT_UTR_998877"}, headers=admin_headers)
     assert r.status_code == 200
+
+@pytest.mark.asyncio
+async def test_multiple_payments_without_utr_do_not_conflict(client):
+    player_headers = make_auth_headers("usr_vortex_lead")
+
+    # Initiate first wallet top-up (utr is None)
+    r1 = await client.post("/api/v1/payments/wallet/topup/initiate", json={"amount_inr": 100}, headers=player_headers)
+    assert r1.status_code == 200
+    p1 = r1.json()
+
+    # Initiate second wallet top-up (utr is None) — must NOT fail with DuplicateKeyError
+    r2 = await client.post("/api/v1/payments/wallet/topup/initiate", json={"amount_inr": 200}, headers=player_headers)
+    assert r2.status_code == 200
+    p2 = r2.json()
+
+    assert p1["payment_id"] != p2["payment_id"]
