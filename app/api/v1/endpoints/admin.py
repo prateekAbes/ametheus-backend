@@ -702,8 +702,9 @@ async def approve_payment(
     from datetime import datetime, timezone
     now = datetime.now(timezone.utc)
 
-    await db.game_payments.update_one(
-        {"_id": payment["_id"]},
+    # Atomic condition: only transition if status is NOT already APPROVED
+    update_res = await db.game_payments.update_one(
+        {"_id": payment["_id"], "status": {"$ne": "APPROVED"}},
         {
             "$set": {
                 "status": "APPROVED",
@@ -712,6 +713,9 @@ async def approve_payment(
             }
         }
     )
+
+    if update_res.modified_count == 0:
+        return {"status": "success", "message": "Payment was already approved"}
 
     # If it was a game entry payment, set team to PAID
     if payment.get("payment_type") == "GAME_ENTRY" and payment.get("team_id"):
@@ -732,6 +736,17 @@ async def approve_payment(
             description=f"UPI Top-up (Ref: {payment.get('utr', 'Manual Approval')})",
             admin_id=admin_user.id,
         )
+
+    # Notify the user that their payment was approved
+    from app.services.notification import create_notification
+    await create_notification(
+        db=db,
+        user_id=payment["user_id"],
+        title="Payment Approved",
+        message=f"Your payment of ₹{payment.get('amount_inr', 0)} has been verified and approved.",
+        notification_type="PAYMENT",
+        link="/dashboard",
+    )
 
     await record_audit_log(
         db=db,

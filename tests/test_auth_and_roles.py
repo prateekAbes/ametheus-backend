@@ -86,3 +86,33 @@ async def test_update_user_profile(client):
     assert me_res.status_code == 200
     assert me_res.json()["display_name"] == "VORTEX ACE"
 
+@pytest.mark.asyncio
+async def test_reserved_admin_username_rejected(client):
+    headers = make_auth_headers("usr_vortex_lead")
+    for reserved in ["admin", "ADMIN", "Admin", "Administrator", "support", "root"]:
+        res = await client.put("/api/v1/auth/profile", json={"username": reserved}, headers=headers)
+        assert res.status_code == 400, f"Expected 400 for reserved username '{reserved}', got {res.status_code}"
+        assert "reserved" in res.json()["detail"].lower()
+
+@pytest.mark.asyncio
+async def test_username_case_insensitive_uniqueness(client):
+    # Sync first user
+    headers1 = make_auth_headers("clerk_unique_1")
+    res1 = await client.post("/api/v1/auth/sync", json={
+        "clerk_user_id": "clerk_unique_1",
+        "email": "user1@example.com",
+        "username": "shadow_ninja",
+    }, headers=headers1)
+    assert res1.status_code == 200
+
+    # User 2 tries to take "SHADOW_NINJA" (conflict)
+    headers2 = make_auth_headers("usr_vortex_lead")
+    res2 = await client.put("/api/v1/auth/profile", json={"username": "SHADOW_NINJA"}, headers=headers2)
+    assert res2.status_code == 409
+    assert "already taken" in res2.json()["detail"].lower()
+
+    # User 2 sets a unique valid username
+    res3 = await client.put("/api/v1/auth/profile", json={"username": "unique_gamer_99"}, headers=headers2)
+    assert res3.status_code == 200
+    assert res3.json()["username"] == "unique_gamer_99"
+

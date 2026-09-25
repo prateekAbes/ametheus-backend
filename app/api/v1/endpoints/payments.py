@@ -200,6 +200,8 @@ async def initiate_game_payment(
     )
 
 @router.post("/game/{payment_id}/submit-utr")
+@router.post("/wallet/{payment_id}/submit-utr")
+@router.post("/{payment_id}/submit-utr")
 async def submit_payment_utr(
     payment_id: str,
     payload: SubmitUtrRequest,
@@ -249,6 +251,15 @@ async def submit_payment_utr(
         action="SUBMIT_UTR",
         target=f"Payment {payment_id}",
         details=f"Submitted UTR {clean_utr}",
+    )
+
+    await create_notification(
+        db=db,
+        user_id=current_user.id,
+        title="Payment Submitted",
+        message=f"UTR reference {clean_utr} submitted successfully. Wallet will be credited upon admin verification.",
+        notification_type="PAYMENT",
+        link="/dashboard",
     )
 
     return {

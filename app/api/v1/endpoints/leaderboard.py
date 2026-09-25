@@ -136,16 +136,29 @@ async def ensure_default_categories(db: AsyncIOMotorDatabase):
 
 @router.get("/stats", response_model=LeaderboardStatsSchema)
 async def get_leaderboard_stats(db: AsyncIOMotorDatabase = Depends(get_db)):
-    """Retrieve platform overview statistics for leaderboard header."""
-    doc = await db.platform_settings.find_one({"_id": "leaderboard_stats"})
-    if not doc:
-        return LeaderboardStatsSchema()
+    """Retrieve platform overview statistics for leaderboard header (calculated dynamically from real DB data)."""
+    doc = await db.platform_settings.find_one({"_id": "leaderboard_stats"}) or {}
+
+    # Real counts from database
+    real_contenders = await db.users.count_documents({"is_dummy": {"$ne": True}})
+    real_squads = await db.teams.count_documents({"is_dummy": {"$ne": True}})
+
+    # Real total awarded prizes from completed payouts
+    paid_payouts = await db.payouts.find({"status": "PAID", "is_dummy": {"$ne": True}}).to_list(500)
+    total_prizes = sum(int(p.get("amount_paise", 0)) // 100 for p in paid_payouts)
+
+    total_awarded_str = doc.get("total_awarded_prizes") or (f"₹{total_prizes:,}" if total_prizes > 0 else "₹0")
+    active_contenders_str = doc.get("active_contenders") or str(real_contenders)
+    verified_squads_str = doc.get("verified_squads") or str(real_squads)
+    top_team_earnings_str = doc.get("top_team_earnings") or "₹0"
+    top_team_name_str = doc.get("top_team_name") or ""
+
     return LeaderboardStatsSchema(
-        total_awarded_prizes=doc.get("total_awarded_prizes", "₹0"),
-        active_contenders=doc.get("active_contenders", "0"),
-        verified_squads=doc.get("verified_squads", "0"),
-        top_team_earnings=doc.get("top_team_earnings", "₹0"),
-        top_team_name=doc.get("top_team_name", ""),
+        total_awarded_prizes=total_awarded_str,
+        active_contenders=active_contenders_str,
+        verified_squads=verified_squads_str,
+        top_team_earnings=top_team_earnings_str,
+        top_team_name=top_team_name_str,
     )
 
 @router.patch("/stats", response_model=LeaderboardStatsSchema)
@@ -419,11 +432,17 @@ async def get_leaderboard(
         target_game = game
 
     try:
-        cursor = db.teams.find({})
+        cursor = db.teams.find({"is_dummy": {"$ne": True}})
         db_teams = await cursor.to_list(length=100)
 
         for idx, team in enumerate(db_teams):
             team_id = str(team.get("_id", team.get("id")))
+            team_ids = [team_id]
+            if "id" in team and str(team["id"]) not in team_ids:
+                team_ids.append(str(team["id"]))
+            if "_id" in team and str(team["_id"]) not in team_ids:
+                team_ids.append(str(team["_id"]))
+
             gid = team.get("game_id")
             game_obj = await db.games.find_one({"$or": [{"_id": gid}, {"id": gid}, {"slug": gid}]}) if gid else None
             game_slug = game_obj["slug"] if game_obj else None
@@ -434,24 +453,39 @@ async def get_leaderboard(
             captain = await db.users.find_one({"$or": [{"_id": cap_id}, {"id": cap_id}]}) if cap_id else None
             captain_user = f"@{captain['username']}" if captain and captain.get("username") else "@captain"
 
-            # Query completed matches
+            # Query completed matches for this team across both team_a and team_b positions
             completed_cursor = db.matches.find({
                 "$and": [
-                    {"$or": [{"team_a_id": team_id}, {"team_b_id": team_id}]},
+                    {"$or": [
+                        {"team_a_id": {"$in": team_ids}},
+                        {"team_b_id": {"$in": team_ids}},
+                    ]},
                     {"status": "COMPLETED"},
+                    {"is_dummy": {"$ne": True}},
                 ]
             })
             completed_matches = await completed_cursor.to_list(length=100)
 
             matches_played = len(completed_matches)
-            wins = sum(1 for m in completed_matches if m.get("winner_team_id") == team_id)
+            wins = sum(1 for m in completed_matches if m.get("winner_team_id") in team_ids)
             losses = matches_played - wins
-            # Real win rate — 0.0 if no matches played (no fabricated defaults)
+            # Real win rate — 0.0 if no matches played
             win_rate = round((wins / matches_played * 100), 1) if matches_played > 0 else 0.0
 
-            # Compute recent form from last 5 completed matches (most recent first)
-            recent = sorted(completed_matches, key=lambda m: m.get("completed_at", m.get("updated_at", "")), reverse=True)[:5]
-            form = ["W" if m.get("winner_team_id") == team_id else "L" for m in recent]
+            # Compute recent form from last 5 completed matches
+            recent = sorted(completed_matches, key=lambda m: str(m.get("completed_at", m.get("updated_at", ""))), reverse=True)[:5]
+            form = ["W" if m.get("winner_team_id") in team_ids else "L" for m in recent]
+
+            # Query real earnings from verified payouts
+            payout_docs = await db.payouts.find({
+                "$or": [
+                    {"user_id": cap_id},
+                    {"team_id": {"$in": team_ids}},
+                ],
+                "status": "PAID",
+                "is_dummy": {"$ne": True},
+            }).to_list(length=100)
+            real_earnings = sum(int(p.get("amount_paise", 0)) // 100 for p in payout_docs)
 
             entries.append({
                 "rank": idx + 1,
@@ -467,15 +501,15 @@ async def get_leaderboard(
                 "matches_played": matches_played,
                 "wins": wins,
                 "losses": losses,
-                "rating": 1500 + (wins * 25),
-                "earnings": wins * 15000,
-                "form": form,
+                "rating": max(1000, 1500 + (wins * 25) - (losses * 10)),
+                "earnings": real_earnings,
+                "form": form if form else ["-"],
                 "is_verified": True,
                 "category": game_cat,
             })
 
         # Also query custom leaderboard entries (admin-created entries only)
-        custom_cursor = db.custom_leaderboard_entries.find({})
+        custom_cursor = db.custom_leaderboard_entries.find({"is_dummy": {"$ne": True}})
         custom_docs = await custom_cursor.to_list(length=100)
         for c in custom_docs:
             c_id = str(c.get("_id", c.get("id")))

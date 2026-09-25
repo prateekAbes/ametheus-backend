@@ -54,6 +54,8 @@ async def init_db_indexes(db: AsyncIOMotorDatabase):
         # Users
         await db.users.create_index("email", unique=True)
         await db.users.create_index("username", unique=True)
+        # Case-insensitive username uniqueness — used for admin reservation and deduplication
+        await db.users.create_index("username_lower", unique=True, sparse=True)
         await db.users.create_index("clerk_user_id", unique=True, sparse=True)
         await db.users.create_index("is_dummy")
 

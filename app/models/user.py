@@ -34,12 +34,24 @@ class User(BaseModel):
         d = dict(doc)
         if "_id" in d and "id" not in d:
             d["id"] = str(d.pop("_id"))
-        # Sync inr_balance string from inr_balance_paise if present
-        if "inr_balance_paise" in d and ("inr_balance" not in d or d["inr_balance"] == "0"):
-            d["inr_balance"] = str(d["inr_balance_paise"] / 100)
-        elif "inr_balance" in d and "inr_balance_paise" not in d:
+        # Sync inr_balance string from inr_balance_paise (authoritative integer paise)
+        if "inr_balance_paise" in d:
             try:
-                d["inr_balance_paise"] = int(float(d.get("inr_balance", "0")) * 100)
+                paise = int(d.get("inr_balance_paise", 0))
+                d["inr_balance_paise"] = paise
+                d["inr_balance"] = f"{paise / 100:.2f}"
             except Exception:
                 d["inr_balance_paise"] = 0
+                d["inr_balance"] = "0.00"
+        elif "inr_balance" in d:
+            try:
+                import math
+                val = float(d.get("inr_balance", "0"))
+                if math.isnan(val) or math.isinf(val):
+                    val = 0.0
+                d["inr_balance_paise"] = int(round(val * 100))
+                d["inr_balance"] = f"{val:.2f}"
+            except Exception:
+                d["inr_balance_paise"] = 0
+                d["inr_balance"] = "0.00"
         return cls(**d)

@@ -10,6 +10,13 @@ from typing import Optional
 
 router = APIRouter()
 
+# Usernames that are permanently reserved — case-insensitive
+RESERVED_USERNAMES = {"admin", "administrator", "ametheus", "superadmin", "super_admin", "mod", "moderator", "support", "staff", "system", "root", "owner"}
+
+def _is_reserved_username(username: str) -> bool:
+    """Returns True if the username is a reserved/forbidden name (case-insensitive)."""
+    return username.strip().lower() in RESERVED_USERNAMES
+
 class UserSyncRequest(BaseModel):
     clerk_user_id: str
     email: str
@@ -62,6 +69,12 @@ async def sync_clerk_user(
     admin_emails = {settings.SUPER_ADMIN_EMAIL.lower(), "admin@ametheus.gg", "pk.4081988@gmail.com"}
     is_super_admin = payload.email.lower() in admin_emails
 
+    # Validate username — reserved names are only allowed for super-admin emails
+    clean_username = payload.username.strip().lower().replace(" ", "_")
+    if _is_reserved_username(clean_username) and not is_super_admin:
+        # Assign a safe username instead of failing sync (Clerk may pass 'admin' as username)
+        clean_username = f"player_{payload.clerk_user_id[-6:].lower()}"
+
     if user_doc:
         # Update metadata and ensure super admin role if designated email
         update_fields = {"clerk_user_id": payload.clerk_user_id}
@@ -71,6 +84,9 @@ async def sync_clerk_user(
             update_fields["avatar_url"] = payload.avatar_url
         if is_super_admin:
             update_fields["role"] = "SUPER_ADMIN"
+        # Keep username_lower in sync
+        existing_username = user_doc.get("username", "")
+        update_fields["username_lower"] = existing_username.lower()
         await db.users.update_one({"_id": user_doc["_id"]}, {"$set": update_fields})
         updated_doc = await db.users.find_one({"_id": user_doc["_id"]})
         return User.from_mongo(updated_doc)
@@ -81,12 +97,14 @@ async def sync_clerk_user(
             id=payload.clerk_user_id,
             clerk_user_id=payload.clerk_user_id,
             email=payload.email,
-            username=payload.username,
-            display_name=payload.display_name or payload.username,
+            username=clean_username,
+            display_name=payload.display_name or clean_username,
             avatar_url=payload.avatar_url,
             role=initial_role,
         )
-        await db.users.insert_one(user.to_mongo())
+        user_dict = user.to_mongo()
+        user_dict["username_lower"] = clean_username.lower()
+        await db.users.insert_one(user_dict)
         await record_audit_log(
             db=db,
             operator=user.id,
@@ -123,6 +141,7 @@ async def get_current_user_profile(
 
 class UserProfileUpdateRequest(BaseModel):
     display_name: Optional[str] = None
+    username: Optional[str] = None
     riot_id: Optional[str] = None
     steam_id: Optional[str] = None
     avatar_url: Optional[str] = None
@@ -134,9 +153,41 @@ async def update_user_profile(
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """
-    Update competitive player profile handles (Riot ID, Steam ID, Display Name, Avatar).
+    Update competitive player profile handles (Username, Display Name, Riot ID, Steam ID, Avatar).
+    Username changes are validated for case-insensitive uniqueness and reserved name restrictions.
     """
     update_data = {}
+
+    if payload.username is not None:
+        new_username = payload.username.strip()
+        new_username_lower = new_username.lower()
+
+        if len(new_username) < 3:
+            raise HTTPException(status_code=400, detail="Username must be at least 3 characters.")
+        if len(new_username) > 30:
+            raise HTTPException(status_code=400, detail="Username must be 30 characters or fewer.")
+        import re
+        if not re.match(r'^[a-zA-Z0-9_\-\.]+$', new_username):
+            raise HTTPException(status_code=400, detail="Username can only contain letters, numbers, underscores, hyphens, and dots.")
+
+        # Enforce admin username reservation — non-admins cannot claim reserved names
+        admin_emails_set = {"admin@ametheus.gg", "pk.4081988@gmail.com"}
+        is_admin = current_user.email and current_user.email.lower() in admin_emails_set or current_user.role == "SUPER_ADMIN"
+        if _is_reserved_username(new_username_lower) and not is_admin:
+            raise HTTPException(status_code=400, detail=f"The username '{new_username}' is reserved and cannot be used.")
+
+        # Case-insensitive uniqueness check
+        existing = await db.users.find_one({
+            "username_lower": new_username_lower,
+            "_id": {"$ne": current_user.id},
+        })
+        if existing:
+            raise HTTPException(status_code=409, detail=f"Username '{new_username}' is already taken. Please choose a different one.")
+
+        update_data["username"] = new_username
+        update_data["username_lower"] = new_username_lower
+        current_user.username = new_username
+
     if payload.display_name is not None:
         update_data["display_name"] = payload.display_name.strip()
         current_user.display_name = update_data["display_name"]
