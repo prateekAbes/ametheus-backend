@@ -124,9 +124,9 @@ async def get_my_tournament_registrations(
 ):
     """
     Returns all tournaments the current authenticated user is registered for,
-    either as an individual contender or through their squad rosters.
+    either as an individual contender or through their team rosters.
     """
-    # 1. Fetch user's squads
+    # 1. Fetch user's teams
     my_teams_cursor = db.teams.find({
         "$or": [
             {"captain_id": current_user.id},

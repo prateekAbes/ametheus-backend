@@ -2,14 +2,14 @@ import time
 import traceback
 from collections import defaultdict
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.core.config import settings
 from app.core.database import get_database, init_db_indexes
+from app.core.ws import ws_manager
 from app.api.v1.api import api_router
-from app.models import *
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -149,8 +149,6 @@ async def trigger_seed():
     except Exception as e:
         return {"status": "error", "error": str(e), "trace": traceback.format_exc()}
 
-from fastapi import WebSocket, WebSocketDisconnect
-from app.core.ws import ws_manager
 
 @app.websocket("/ws/ticker")
 async def websocket_match_ticker(websocket: WebSocket):

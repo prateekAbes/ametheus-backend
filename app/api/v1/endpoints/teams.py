@@ -232,7 +232,7 @@ async def get_team_by_code(code: str, db: AsyncIOMotorDatabase = Depends(get_db)
     clean_code = code.strip().upper()
     team = await db.teams.find_one({"invite_code": clean_code})
     if not team:
-        raise HTTPException(status_code=404, detail="Invalid invite code. No squad found.")
+        raise HTTPException(status_code=404, detail="Invalid invite code. No team found.")
     return await serialize_team(team, db)
 
 @router.get("/{id}", response_model=TeamResponse)

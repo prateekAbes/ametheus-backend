@@ -201,7 +201,7 @@ async def create_leaderboard_entry(
     admin_user: User = Depends(require_organizer),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
-    """Admin endpoint to add a contender or squad directly onto the leaderboard."""
+    """Admin endpoint to add a contender or team directly onto the leaderboard."""
     entry_id = f"custom_lb_{uuid.uuid4().hex[:8]}"
     doc = {
         "_id": entry_id,

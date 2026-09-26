@@ -100,7 +100,7 @@ async def verify_match_result(
     match = Match.from_mongo(match_doc)
 
     # Verify authorization for this tournament
-    privileged_roles = ["SUPER_ADMIN", "TOURNAMENT_ADMIN", "MATCH_ARBITER", "ORGANIZER"]
+    privileged_roles = ["SUPER_ADMIN", "ORGANIZER"]
     if current_user.role not in privileged_roles:
         assign_check = await db.tournament_admin_assignments.find_one({
             "admin_user_id": current_user.id,
@@ -158,9 +158,9 @@ async def force_match_forfeit(
     current_user: User = Depends(get_current_user),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
-    privileged_roles = ["SUPER_ADMIN", "TOURNAMENT_ADMIN", "MATCH_ARBITER", "ORGANIZER"]
+    privileged_roles = ["SUPER_ADMIN", "ORGANIZER"]
     if current_user.role not in privileged_roles:
-        raise HTTPException(status_code=403, detail="Forbidden: Match arbiter authority required")
+        raise HTTPException(status_code=403, detail="Forbidden: Organizer or Super Admin authority required")
 
     match_doc = await db.matches.find_one({"$or": [{"_id": id}, {"id": id}]})
     if not match_doc:
@@ -209,9 +209,9 @@ async def override_match_score(
     current_user: User = Depends(get_current_user),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
-    privileged_roles = ["SUPER_ADMIN", "TOURNAMENT_ADMIN", "MATCH_ARBITER", "ORGANIZER"]
+    privileged_roles = ["SUPER_ADMIN", "ORGANIZER"]
     if current_user.role not in privileged_roles:
-        raise HTTPException(status_code=403, detail="Forbidden: Match arbiter authority required")
+        raise HTTPException(status_code=403, detail="Forbidden: Organizer or Super Admin authority required")
 
     match_doc = await db.matches.find_one({"$or": [{"_id": id}, {"id": id}]})
     if not match_doc:
@@ -259,9 +259,9 @@ async def reject_match_proof(
     current_user: User = Depends(get_current_user),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
-    privileged_roles = ["SUPER_ADMIN", "TOURNAMENT_ADMIN", "MATCH_ARBITER", "ORGANIZER"]
+    privileged_roles = ["SUPER_ADMIN", "ORGANIZER"]
     if current_user.role not in privileged_roles:
-        raise HTTPException(status_code=403, detail="Forbidden: Match arbiter authority required")
+        raise HTTPException(status_code=403, detail="Forbidden: Organizer or Super Admin authority required")
 
     match_doc = await db.matches.find_one({"$or": [{"_id": id}, {"id": id}]})
     if not match_doc:
@@ -516,7 +516,7 @@ async def get_admin_stats(
         "status": {"$in": ["LIVE", "CHECK_IN_OPEN", "PENDING_VERIFICATION", "DISPUTED"]}
     })
 
-    # Compute real escrow vault: sum of all approved game entry payments (in paise → INR)
+    # Compute platform escrow vault: sum of all approved entry payments (in paise → INR)
     pipeline = [
         {"$match": {"status": "APPROVED", "payment_type": "GAME_ENTRY"}},
         {"$group": {"_id": None, "total": {"$sum": "$amount_paise"}}},

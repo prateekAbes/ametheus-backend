@@ -80,9 +80,6 @@ async def require_organizer(
         )
     return current_user
 
-# Alias legacy helper references to require_organizer for clean backward-compatibility
-require_match_arbiter = require_organizer
-require_community_moderator = require_organizer
 
 async def require_super_admin(
     current_user: User = Depends(get_current_user),
