@@ -265,9 +265,13 @@ class TournamentResponse(BaseModel):
     min_team_size: Optional[int] = 1
     max_team_size: Optional[int] = 5
     rank_requirement: Optional[str] = "Open to All Ranks"
-    format: Optional[str] = "Single Elimination Bracket"
+    format: Optional[str] = "Single Elimination"
     tournament_type: Optional[str] = "Single Elimination"
-    match_format: Optional[str] = "Best of 1"
+    match_format: Optional[str] = "Single Elimination"
+    series_format: Optional[str] = "BO1"
+    has_live_matches: bool = False
+    live_matches_count: int = 0
+    live_matches: List[Dict[str, Any]] = []
     stage_formats: Dict[str, str] = Field(default_factory=dict)
     registration_deadline: Optional[str] = None
     check_in_window_minutes: Optional[int] = 15
@@ -324,10 +328,13 @@ class MatchResponse(BaseModel):
     game_slug: str
     game_name: str
     stage: str
-    format: str
+    match_type: Optional[str] = "QUARTER_FINAL"
+    format: str = "BO1"
+    series_format: Optional[str] = "BO1"
     scheduled_time: str
     scheduled_at: Optional[str] = None
     live_link: Optional[str] = None
+    youtube_live_url: Optional[str] = None
     order: Optional[int] = 0
     status: str
     server_region: str
@@ -346,19 +353,64 @@ class AdminMatchPairRequest(BaseModel):
     team_a_id: str
     team_b_id: str
     stage: str = "Quarterfinals"
-    match_format: str = "Best of 1"
+    match_type: Optional[str] = "QUARTER_FINAL"
+    series_format: Optional[str] = "BO1"
+    match_format: Optional[str] = "BO1"
     scheduled_at: Optional[str] = None
+    scheduled_date: Optional[str] = None
+    scheduled_time: Optional[str] = None
     live_link: Optional[str] = None
+    youtube_live_url: Optional[str] = None
+
+class AdminMatchCreatePayload(BaseModel):
+    tournament_id: str
+    team_a_id: str
+    team_b_id: str
+    match_type: str = "QUARTER_FINAL"
+    stage: Optional[str] = None
+    series_format: str = "BO1"
+    match_format: Optional[str] = None
+    scheduled_date: Optional[str] = None
+    scheduled_time: Optional[str] = None
+    scheduled_at: Optional[str] = None
+    youtube_live_url: Optional[str] = None
+
+class AdminMatchUpdatePayload(BaseModel):
+    team_a_id: Optional[str] = None
+    team_b_id: Optional[str] = None
+    match_type: Optional[str] = None
+    stage: Optional[str] = None
+    series_format: Optional[str] = None
+    match_format: Optional[str] = None
+    scheduled_date: Optional[str] = None
+    scheduled_time: Optional[str] = None
+    scheduled_at: Optional[str] = None
+    youtube_live_url: Optional[str] = None
+    live_link: Optional[str] = None
+    status: Optional[str] = None
+
+class AdminMarkMatchLivePayload(BaseModel):
+    youtube_live_url: str
+
+class AdminCompleteMatchPayload(BaseModel):
+    winner_team_id: str
+    score_a: int = 0
+    score_b: int = 0
+    captain_notes: Optional[str] = None
 
 class AdminMatchScheduleUpdate(BaseModel):
     scheduled_at: Optional[str] = None
     scheduled_time: Optional[str] = None
     live_link: Optional[str] = None
+    youtube_live_url: Optional[str] = None
     match_format: Optional[str] = None
+    series_format: Optional[str] = None
+    match_type: Optional[str] = None
     stage: Optional[str] = None
 
 class AdminMatchStatusUpdate(BaseModel):
     status: str  # SCHEDULED, CHECK_IN_OPEN, LIVE, COMPLETED, CANCELLED
+    youtube_live_url: Optional[str] = None
 
 class AdminMatchScoreUpdate(BaseModel):
     score_a: int

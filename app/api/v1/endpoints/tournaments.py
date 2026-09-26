@@ -105,6 +105,26 @@ async def list_tournaments(
         prize_inr = t.get("prize_pool_inr") or 0
         fee_inr = t.get("entry_fee_inr") or 0
 
+        # Check for live matches belonging to this tournament
+        live_m = await db.matches.find({
+            "$or": [{"tournament_id": tid}, {"tournament_id": t.get("slug")}],
+            "status": "LIVE"
+        }).to_list(length=20)
+        has_live = len(live_m) > 0
+        live_matches_list = [{
+            "id": str(m.get("_id", m.get("id"))),
+            "stage": m.get("stage", "Live Match"),
+            "match_type": m.get("match_type", "QUARTER_FINAL"),
+            "format": m.get("format", "BO1"),
+            "series_format": m.get("series_format", "BO1"),
+            "youtube_live_url": m.get("youtube_live_url") or m.get("live_link"),
+            "live_link": m.get("youtube_live_url") or m.get("live_link"),
+            "status": "LIVE",
+        } for m in live_m]
+
+        raw_stat = str(t.get("status", "REGISTRATION_OPEN")).upper()
+        norm_status = "REGISTRATION_CLOSED" if raw_stat in ["LIVE", "ONGOING", "IN_PROGRESS"] else ("COMING_SOON" if raw_stat in ["DRAFT", "UPCOMING"] else raw_stat)
+
         response.append(
             TournamentResponse(
                 id=tid,
@@ -117,7 +137,10 @@ async def list_tournaments(
                 prize_pool_inr=prize_inr,
                 entry_fee=f"₹{fee_inr} / Team" if fee_inr > 0 else "₹0 / Free",
                 entry_fee_inr=fee_inr,
-                status=t.get("status", "REGISTRATION_OPEN"),
+                status=norm_status,
+                has_live_matches=has_live,
+                live_matches_count=len(live_matches_list),
+                live_matches=live_matches_list,
                 starts_at=t.get("starts_at", "TBD"),
                 roster_lock_time=t.get("roster_lock_time", "TBD"),
                 server_region=t.get("server_region", "AWS Mumbai (ap-south-1)"),
@@ -126,9 +149,10 @@ async def list_tournaments(
                 min_team_size=t.get("min_team_size", 1),
                 max_team_size=t.get("max_team_size", 5),
                 rank_requirement=t.get("rank_requirement", "Open to All Ranks"),
-                format=t.get("format", "Single Elimination Bracket"),
+                format=t.get("format", "Single Elimination"),
                 tournament_type=t.get("tournament_type", "Single Elimination"),
-                match_format=t.get("match_format", "Best of 1"),
+                match_format=t.get("match_format", "Single Elimination"),
+                series_format=t.get("series_format", "BO1"),
                 stage_formats=safe_json_loads(t.get("stage_formats"), {}),
                 registration_deadline=t.get("registration_deadline").isoformat() if isinstance(t.get("registration_deadline"), datetime) else t.get("registration_deadline"),
                 check_in_window_minutes=t.get("check_in_window_minutes", 15),
@@ -303,6 +327,26 @@ async def get_tournament_by_slug(slug: str, db: AsyncIOMotorDatabase = Depends(g
                 "members": [p_name],
             })
 
+    # Check for live matches belonging to this tournament
+    live_m = await db.matches.find({
+        "$or": [{"tournament_id": tid}, {"tournament_id": t.get("slug")}],
+        "status": "LIVE"
+    }).to_list(length=20)
+    has_live = len(live_m) > 0
+    live_matches_list = [{
+        "id": str(m.get("_id", m.get("id"))),
+        "stage": m.get("stage", "Live Match"),
+        "match_type": m.get("match_type", "QUARTER_FINAL"),
+        "format": m.get("format", "BO1"),
+        "series_format": m.get("series_format", "BO1"),
+        "youtube_live_url": m.get("youtube_live_url") or m.get("live_link"),
+        "live_link": m.get("youtube_live_url") or m.get("live_link"),
+        "status": "LIVE",
+    } for m in live_m]
+
+    raw_stat = str(t.get("status", "REGISTRATION_OPEN")).upper()
+    norm_status = "REGISTRATION_CLOSED" if raw_stat in ["LIVE", "ONGOING", "IN_PROGRESS"] else ("COMING_SOON" if raw_stat in ["DRAFT", "UPCOMING"] else raw_stat)
+
     return TournamentResponse(
         id=tid,
         slug=t.get("slug", tid),
@@ -314,7 +358,10 @@ async def get_tournament_by_slug(slug: str, db: AsyncIOMotorDatabase = Depends(g
         prize_pool_inr=prize_inr,
         entry_fee=f"₹{fee_inr} / Team" if fee_inr > 0 else "₹0 / Free",
         entry_fee_inr=fee_inr,
-        status=t.get("status", "REGISTRATION_OPEN"),
+        status=norm_status,
+        has_live_matches=has_live,
+        live_matches_count=len(live_matches_list),
+        live_matches=live_matches_list,
         expected_start_date=t.get("expected_start_date"),
         registration_open_date=t.get("registration_open_date"),
         announcement_text=t.get("announcement_text"),
@@ -326,9 +373,10 @@ async def get_tournament_by_slug(slug: str, db: AsyncIOMotorDatabase = Depends(g
         min_team_size=min_team_size,
         max_team_size=max_team_size,
         rank_requirement=t.get("rank_requirement", "Open to All Ranks"),
-        format=t.get("format", "Single Elimination Bracket"),
+        format=t.get("format", "Single Elimination"),
         tournament_type=t.get("tournament_type", "Single Elimination"),
-        match_format=t.get("match_format", "Best of 1"),
+        match_format=t.get("match_format", "Single Elimination"),
+        series_format=t.get("series_format", "BO1"),
         stage_formats=safe_json_loads(t.get("stage_formats"), {}),
         registration_deadline=t.get("registration_deadline").isoformat() if isinstance(t.get("registration_deadline"), datetime) else t.get("registration_deadline"),
         check_in_window_minutes=t.get("check_in_window_minutes", 15),

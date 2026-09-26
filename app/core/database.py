@@ -141,5 +141,18 @@ async def init_db_indexes(db: AsyncIOMotorDatabase):
         await db.audit_logs.create_index("created_at")
         await db.notifications.create_index("user_id")
         await db.notifications.create_index([("user_id", 1), ("is_read", 1)])
+
+        # Data Migration: Rule 5 & 11 - Normalize tournament status and match live links
+        try:
+            await db.tournaments.update_many(
+                {"status": {"$in": ["LIVE", "ONGOING", "IN_PROGRESS"]}},
+                {"$set": {"status": "REGISTRATION_CLOSED"}}
+            )
+            await db.matches.update_many(
+                {"youtube_live_url": {"$exists": False}, "live_link": {"$ne": None}},
+                [{"$set": {"youtube_live_url": "$live_link"}}]
+            )
+        except Exception:
+            pass
     except Exception as e:
         print(f"[AMETHEUS MongoDB Warning] Index initialization error: {e}")

@@ -6,6 +6,7 @@ from app.api.deps import get_db, get_current_user, require_super_admin, require_
 from app.models.user import User
 from app.models.admin import TournamentAdminAssignment, AuditLog
 from app.models.match import Match
+from app.models.tournament import Tournament
 from app.models.dispute import Dispute
 from app.schemas import (
     AdminAssignmentCreate,
@@ -13,6 +14,10 @@ from app.schemas import (
     DisputeResolve,
     DisputeResponse,
     AdminMatchPairRequest,
+    AdminMatchCreatePayload,
+    AdminMatchUpdatePayload,
+    AdminMarkMatchLivePayload,
+    AdminCompleteMatchPayload,
     AdminMatchScheduleUpdate,
     AdminMatchStatusUpdate,
     AdminMatchScoreUpdate,
@@ -1142,7 +1147,9 @@ async def get_live_matches_dashboard(
     """
     from datetime import datetime
 
-    tournaments = await db.tournaments.find({}).to_list(length=100)
+    tournaments = await db.tournaments.find({
+        "status": {"$in": ["REGISTRATION_CLOSED", "LIVE", "ONGOING", "IN_PROGRESS"]}
+    }).to_list(length=100)
     ready_tournaments = []
 
     for t in tournaments:
@@ -1197,9 +1204,10 @@ async def get_live_matches_dashboard(
             "id": tid,
             "slug": tslug,
             "title": t.get("title", "Tournament"),
-            "status": t.get("status", "REGISTRATION_OPEN"),
+            "status": "REGISTRATION_CLOSED",
             "max_teams": t.get("max_teams", 16),
-            "match_format": t.get("match_format", "Best of 1"),
+            "match_format": t.get("match_format") or t.get("tournament_type") or "Single Elimination",
+            "series_format": t.get("series_format") or "BO1",
             "stage_formats": t.get("stage_formats") or {},
             "teams": registered_teams_list,
             "unpaired_count": len([x for x in registered_teams_list if not x["is_paired"]]),
@@ -1234,12 +1242,15 @@ async def get_live_matches_dashboard(
             "tournament_id": tourn_id,
             "tournament_title": tourn.get("title") if tourn else "Tournament",
             "stage": m.get("stage", "Quarterfinals"),
-            "format": m.get("format") or m.get("match_format") or "Best of 1",
+            "match_type": m.get("match_type", "QUARTER_FINAL"),
+            "format": m.get("series_format") or m.get("format") or "BO1",
+            "series_format": m.get("series_format") or m.get("format") or "BO1",
             "order": m.get("order", 0),
             "status": m.get("status", "SCHEDULED"),
             "scheduled_time": m.get("scheduled_time", "TBD"),
             "scheduled_at": scheduled_at_iso,
-            "live_link": m.get("live_link"),
+            "live_link": m.get("youtube_live_url") or m.get("live_link"),
+            "youtube_live_url": m.get("youtube_live_url") or m.get("live_link"),
             "team_a": {"id": team_a_id, "name": team_a["name"], "tag": team_a.get("tag", "TEAM"), "score": m.get("score_a", 0)} if team_a else None,
             "team_b": {"id": team_b_id, "name": team_b["name"], "tag": team_b.get("tag", "TEAM"), "score": m.get("score_b", 0)} if team_b else None,
             "winner_team_id": m.get("winner_team_id"),
@@ -1561,8 +1572,520 @@ async def update_match_score_admin(
         "message": f"Scores updated to {payload.score_a}-{payload.score_b}. Match {'completed' if payload.complete_match else 'in progress'}.",
     }
 
-# ----------------- DEVELOPMENT DUMMY DATA CONTROLS -----------------
-# Removed: Production database contains only authorized competitive entities.
+# ----------------- TOURNAMENT & LIVE MATCHES REDESIGN ENDPOINTS -----------------
+
+@router.post("/tournaments/{id}/close-registration")
+async def close_tournament_registration_admin(
+    id: str,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Rule 6: Admin manually closes registration for a tournament.
+    Tournament status becomes REGISTRATION_CLOSED and becomes available in Live Matches.
+    """
+    tourn = await db.tournaments.find_one({"$or": [{"_id": id}, {"id": id}, {"slug": id}]})
+    if not tourn:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+
+    await db.tournaments.update_one(
+        {"_id": tourn["_id"]},
+        {"$set": {"status": "REGISTRATION_CLOSED"}}
+    )
+
+    await record_audit_log(
+        db=db,
+        operator=admin_user.username,
+        role=admin_user.role,
+        action="CLOSE_REGISTRATION",
+        target=f"Tournament {tourn.get('title')}",
+        details="Registration manually closed by admin. Tournament now available in Live Matches.",
+    )
+
+    return {
+        "status": "success",
+        "message": f'Tournament "{tourn.get("title")}" registration is now CLOSED. It is now active in Live Matches!',
+    }
+
+@router.get("/tournaments/{id}/registered-rosters")
+async def get_tournament_registered_rosters(
+    id: str,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Rule 8: Retrieve all verified registered teams and player rosters for the selected tournament.
+    Uses existing team and user records (zero duplicate or mock records).
+    """
+    tourn = await db.tournaments.find_one({"$or": [{"_id": id}, {"id": id}, {"slug": id}]})
+    if not tourn:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+
+    tid = str(tourn.get("_id", tourn.get("id")))
+    tslug = tourn.get("slug", tid)
+
+    reg_cursor = db.tournament_registrations.find({
+        "$or": [{"tournament_id": tid}, {"tournament_id": tslug}],
+        "payment_status": {"$in": ["PAID", "FREE"]}
+    })
+    registrations = await reg_cursor.to_list(length=200)
+
+    # Check which teams are already paired in matches
+    matches = await db.matches.find({
+        "$or": [{"tournament_id": tid}, {"tournament_id": tslug}]
+    }).to_list(length=200)
+
+    paired_team_ids = set()
+    for m in matches:
+        if m.get("team_a_id"):
+            paired_team_ids.add(str(m["team_a_id"]))
+        if m.get("team_b_id"):
+            paired_team_ids.add(str(m["team_b_id"]))
+
+    rosters = []
+    for reg in registrations:
+        team_id = reg.get("team_id")
+        player_id = reg.get("player_id") or reg.get("user_id")
+
+        if team_id:
+            team_doc = await db.teams.find_one({"$or": [{"_id": team_id}, {"id": team_id}]})
+            if team_doc:
+                t_id_str = str(team_doc.get("_id", team_doc.get("id")))
+                members_handles = [
+                    m.get("game_handle", m.get("username", "player"))
+                    if isinstance(m, dict) else getattr(m, "game_handle", "player")
+                    for m in team_doc.get("members", [])
+                ]
+                rosters.append({
+                    "id": t_id_str,
+                    "team_id": t_id_str,
+                    "name": team_doc.get("name", "Team"),
+                    "tag": team_doc.get("tag", "TEAM"),
+                    "captain_username": team_doc.get("captain_username", "Captain"),
+                    "members": members_handles,
+                    "is_paired": t_id_str in paired_team_ids,
+                    "is_solo": False,
+                })
+        elif player_id:
+            user_doc = await db.users.find_one({"$or": [{"_id": player_id}, {"id": player_id}]})
+            if user_doc:
+                u_id_str = str(user_doc.get("_id", user_doc.get("id")))
+                p_name = user_doc.get("display_name") or user_doc.get("username", "Contender")
+                rosters.append({
+                    "id": u_id_str,
+                    "team_id": u_id_str,
+                    "name": p_name,
+                    "tag": "SOLO",
+                    "captain_username": p_name,
+                    "members": [p_name],
+                    "is_paired": u_id_str in paired_team_ids,
+                    "is_solo": True,
+                })
+
+    return {
+        "tournament_id": tid,
+        "tournament_title": tourn.get("title"),
+        "tournament_status": "REGISTRATION_CLOSED",
+        "match_format": tourn.get("match_format") or tourn.get("tournament_type") or "Single Elimination",
+        "series_format": tourn.get("series_format") or "BO1",
+        "total_teams": len(rosters),
+        "rosters": rosters,
+    }
+
+@router.post("/tournaments/{id}/generate-match-structure")
+async def generate_match_structure_admin(
+    id: str,
+    payload: Dict[str, Any],
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Rules 9 & 10: Generates tournament match structure based on selected tournament format.
+    Does NOT mark tournament as LIVE. Status remains REGISTRATION_CLOSED.
+    """
+    from app.services.bracket_engine import generate_tournament_bracket
+
+    tourn_doc = await db.tournaments.find_one({"$or": [{"_id": id}, {"id": id}, {"slug": id}]})
+    if not tourn_doc:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+
+    selected_format = payload.get("match_format") or payload.get("tournament_type") or tourn_doc.get("match_format") or "Single Elimination"
+    selected_series = payload.get("series_format") or tourn_doc.get("series_format") or "BO1"
+
+    # Update tournament format fields
+    await db.tournaments.update_one(
+        {"_id": tourn_doc["_id"]},
+        {"$set": {
+            "match_format": selected_format,
+            "tournament_type": selected_format,
+            "series_format": selected_series,
+            "status": "REGISTRATION_CLOSED"
+        }}
+    )
+
+    tourn_doc["match_format"] = selected_format
+    tourn_doc["tournament_type"] = selected_format
+    tourn_doc["series_format"] = selected_series
+    tourn_obj = Tournament.from_mongo(tourn_doc)
+
+    bracket_res = await generate_tournament_bracket(tourn_obj, db)
+
+    await record_audit_log(
+        db=db,
+        operator=admin_user.username,
+        role=admin_user.role,
+        action="GENERATE_MATCH_STRUCTURE",
+        target=f"Tournament {tourn_obj.title}",
+        details=f"Format: {selected_format} | Series: {selected_series}",
+    )
+
+    return {
+        "status": "success",
+        "message": f'Successfully generated match structure for "{tourn_obj.title}" ({selected_format})!',
+        "bracket": bracket_res.get("bracket", []),
+    }
+
+@router.post("/matches")
+async def create_match_admin(
+    payload: AdminMatchCreatePayload,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Rule 10: Matchup Builder endpoint.
+    Admin manually adds a match between two registered teams.
+    Validates against:
+    - Same team on both sides
+    - Duplicate matchups
+    - Overlapping schedule conflicts for either team
+    """
+    import uuid
+    from datetime import datetime, timezone, timedelta
+
+    if payload.team_a_id == payload.team_b_id:
+        raise HTTPException(status_code=400, detail="Cannot pair a team against itself. Please select two different teams.")
+
+    tourn = await db.tournaments.find_one({
+        "$or": [{"_id": payload.tournament_id}, {"id": payload.tournament_id}, {"slug": payload.tournament_id}]
+    })
+    if not tourn:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+
+    tid = str(tourn.get("_id", tourn.get("id")))
+
+    # Verify both teams exist
+    team_a = await db.teams.find_one({"$or": [{"_id": payload.team_a_id}, {"id": payload.team_a_id}]})
+    if not team_a:
+        team_a = await db.users.find_one({"$or": [{"_id": payload.team_a_id}, {"id": payload.team_a_id}]})
+    if not team_a:
+        raise HTTPException(status_code=404, detail="Team/Contender A not found")
+
+    team_b = await db.teams.find_one({"$or": [{"_id": payload.team_b_id}, {"id": payload.team_b_id}]})
+    if not team_b:
+        team_b = await db.users.find_one({"$or": [{"_id": payload.team_b_id}, {"id": payload.team_b_id}]})
+    if not team_b:
+        raise HTTPException(status_code=404, detail="Team/Contender B not found")
+
+    name_a = team_a.get("name") or team_a.get("username") or "Team A"
+    name_b = team_b.get("name") or team_b.get("username") or "Team B"
+
+    # Schedule parsing and conflict check
+    scheduled_at_dt = None
+    scheduled_time_str = payload.scheduled_time or "TBD"
+
+    if payload.scheduled_at:
+        try:
+            scheduled_at_dt = datetime.fromisoformat(payload.scheduled_at.replace("Z", "+00:00"))
+            scheduled_time_str = scheduled_at_dt.strftime("%b %d, %I:%M %p")
+        except Exception:
+            pass
+    elif payload.scheduled_date and payload.scheduled_time:
+        scheduled_time_str = f"{payload.scheduled_date} — {payload.scheduled_time}"
+
+    # Conflict check: warn if either team already has an active or scheduled match at the same time
+    if scheduled_at_dt:
+        window_start = scheduled_at_dt - timedelta(minutes=30)
+        window_end = scheduled_at_dt + timedelta(minutes=30)
+        conflict = await db.matches.find_one({
+            "tournament_id": tid,
+            "status": {"$in": ["SCHEDULED", "LIVE"]},
+            "scheduled_at": {"$gte": window_start, "$lte": window_end},
+            "$or": [
+                {"team_a_id": payload.team_a_id},
+                {"team_b_id": payload.team_a_id},
+                {"team_a_id": payload.team_b_id},
+                {"team_b_id": payload.team_b_id},
+            ]
+        })
+        if conflict:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Scheduling conflict: One of the teams ({name_a} or {name_b}) is already scheduled for another match within 30 minutes of this time slot.",
+            )
+
+    series_fmt = payload.series_format or payload.match_format or "BO1"
+    if series_fmt.lower() in ["best of 1", "bo1"]:
+        series_fmt = "BO1"
+    elif series_fmt.lower() in ["best of 3", "bo3"]:
+        series_fmt = "BO3"
+    elif series_fmt.lower() in ["best of 5", "bo5"]:
+        series_fmt = "BO5"
+
+    stage_name = payload.stage or payload.match_type.replace("_", " ").title()
+
+    match = Match(
+        tournament_id=tid,
+        stage=stage_name,
+        match_type=payload.match_type,
+        format=series_fmt,
+        series_format=series_fmt,
+        scheduled_at=scheduled_at_dt,
+        scheduled_time=scheduled_time_str,
+        live_link=payload.youtube_live_url,
+        youtube_live_url=payload.youtube_live_url,
+        status="SCHEDULED",
+        team_a_id=payload.team_a_id,
+        team_b_id=payload.team_b_id,
+        server_region=tourn.get("server_region", "AWS Mumbai (ap-south-1)"),
+        lobby_code=f"AMT-{uuid.uuid4().hex[:6].upper()}",
+        lobby_password=f"PASS-{uuid.uuid4().hex[:6].upper()}",
+        check_in_status={"team_a": False, "team_b": False},
+    )
+    await db.matches.insert_one(match.to_mongo())
+
+    await record_audit_log(
+        db=db,
+        operator=admin_user.username,
+        role=admin_user.role,
+        action="CREATE_MATCH",
+        target=f"Match {match.id} ({name_a} vs {name_b})",
+        details=f"Stage: {stage_name} | Series: {series_fmt} | Time: {scheduled_time_str}",
+    )
+
+    return {
+        "status": "success",
+        "message": f"Successfully created match: {name_a} vs {name_b}!",
+        "match": match.model_dump(),
+    }
+
+@router.patch("/matches/{id}/update")
+async def update_match_details_admin(
+    id: str,
+    payload: AdminMatchUpdatePayload,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Allows admin to modify match parameters: swap teams, change stage, series format, schedule, or YouTube URL.
+    """
+    match = await db.matches.find_one({"$or": [{"_id": id}, {"id": id}]})
+    if not match:
+        raise HTTPException(status_code=404, detail="Match not found")
+
+    update_fields = {}
+    if payload.team_a_id is not None:
+        update_fields["team_a_id"] = payload.team_a_id
+    if payload.team_b_id is not None:
+        update_fields["team_b_id"] = payload.team_b_id
+    if payload.match_type is not None:
+        update_fields["match_type"] = payload.match_type
+    if payload.stage is not None:
+        update_fields["stage"] = payload.stage
+    if payload.series_format is not None:
+        update_fields["series_format"] = payload.series_format
+        update_fields["format"] = payload.series_format
+    if payload.youtube_live_url is not None:
+        update_fields["youtube_live_url"] = payload.youtube_live_url
+        update_fields["live_link"] = payload.youtube_live_url
+    if payload.scheduled_time is not None:
+        update_fields["scheduled_time"] = payload.scheduled_time
+    if payload.scheduled_at is not None:
+        from datetime import datetime
+        try:
+            dt = datetime.fromisoformat(payload.scheduled_at.replace("Z", "+00:00"))
+            update_fields["scheduled_at"] = dt
+            update_fields["scheduled_time"] = dt.strftime("%b %d, %I:%M %p")
+        except Exception:
+            pass
+
+    if update_fields:
+        await db.matches.update_one({"_id": match["_id"]}, {"$set": update_fields})
+
+    await record_audit_log(
+        db=db,
+        operator=admin_user.username,
+        role=admin_user.role,
+        action="UPDATE_MATCH_DETAILS",
+        target=f"Match {id}",
+        details=str(update_fields),
+    )
+
+    return {"status": "success", "message": "Match updated successfully", "updated": update_fields}
+
+@router.delete("/matches/{id}")
+async def delete_match_admin(
+    id: str,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Removes a match from the tournament.
+    """
+    match = await db.matches.find_one({"$or": [{"_id": id}, {"id": id}]})
+    if not match:
+        raise HTTPException(status_code=404, detail="Match not found")
+
+    await db.matches.delete_one({"_id": match["_id"]})
+
+    await record_audit_log(
+        db=db,
+        operator=admin_user.username,
+        role=admin_user.role,
+        action="DELETE_MATCH",
+        target=f"Match {id}",
+        details=f"Deleted match {match.get('stage')} ({match.get('team_a_id')} vs {match.get('team_b_id')})",
+    )
+
+    return {"status": "success", "message": "Match removed successfully"}
+
+@router.post("/matches/{id}/mark-live")
+async def mark_match_live_admin(
+    id: str,
+    payload: AdminMarkMatchLivePayload,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Rules 14 & 15: Admin marks individual match as LIVE.
+    - Sets match status = LIVE
+    - Stores YouTube Live URL against this specific match
+    - Tournament status remains REGISTRATION_CLOSED (Rule 15: Tournament NEVER becomes Live!)
+    - Broadcasts live status change to WebSocket ticker
+    """
+    from app.core.ws import ws_manager
+
+    match = await db.matches.find_one({"$or": [{"_id": id}, {"id": id}]})
+    if not match:
+        raise HTTPException(status_code=404, detail="Match not found")
+
+    if not payload.youtube_live_url or not payload.youtube_live_url.strip():
+        raise HTTPException(status_code=400, detail="A valid YouTube Live URL is required to mark this match as LIVE.")
+
+    yt_url = payload.youtube_live_url.strip()
+
+    await db.matches.update_one(
+        {"_id": match["_id"]},
+        {"$set": {
+            "status": "LIVE",
+            "youtube_live_url": yt_url,
+            "live_link": yt_url,
+        }}
+    )
+
+    # Broadcast event
+    await ws_manager.broadcast({
+        "type": "MATCH_STATUS_CHANGED",
+        "match_id": str(match.get("_id", match.get("id"))),
+        "tournament_id": match.get("tournament_id"),
+        "status": "LIVE",
+        "youtube_live_url": yt_url,
+    })
+
+    await record_audit_log(
+        db=db,
+        operator=admin_user.username,
+        role=admin_user.role,
+        action="MARK_MATCH_LIVE",
+        target=f"Match {id}",
+        details=f"Match is now LIVE on YouTube: {yt_url}",
+    )
+
+    return {
+        "status": "success",
+        "message": "Match marked as LIVE! Stream is now active.",
+        "match_id": id,
+        "youtube_live_url": yt_url,
+    }
+
+@router.post("/matches/{id}/complete")
+async def complete_match_admin(
+    id: str,
+    payload: AdminCompleteMatchPayload,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Rule 18: Admin completes match, records scores and winner.
+    Match status -> COMPLETED.
+    Advances winner/standings in tournament bracket.
+    """
+    from app.services.bracket_engine import advance_bracket_match
+    from app.core.ws import ws_manager
+
+    match_doc = await db.matches.find_one({"$or": [{"_id": id}, {"id": id}]})
+    if not match_doc:
+        raise HTTPException(status_code=404, detail="Match not found")
+
+    match = Match.from_mongo(match_doc)
+    winner_id = payload.winner_team_id
+
+    # Validate winner belongs to competing teams
+    valid_teams = {str(match.team_a_id), str(match.team_b_id)}
+    if winner_id not in valid_teams and match.team_a_id and match.team_b_id:
+        raise HTTPException(
+            status_code=400,
+            detail="The specified winner must be one of the two competing teams/contenders in this match.",
+        )
+
+    await db.matches.update_one(
+        {"_id": match_doc["_id"]},
+        {"$set": {
+            "status": "COMPLETED",
+            "winner_team_id": winner_id,
+            "score_a": payload.score_a,
+            "score_b": payload.score_b,
+            "captain_notes": payload.captain_notes,
+        }}
+    )
+
+    match.winner_team_id = winner_id
+    match.score_a = payload.score_a
+    match.score_b = payload.score_b
+    match.status = "COMPLETED"
+
+    # Advance bracket
+    try:
+        await advance_bracket_match(
+            tournament_id=match.tournament_id,
+            completed_match=match,
+            winner_team_id=winner_id,
+            db=db,
+        )
+    except Exception as e:
+        print(f"[Bracket Advance Error]: {e}")
+
+    await ws_manager.broadcast({
+        "type": "MATCH_COMPLETED",
+        "match_id": match.id,
+        "tournament_id": match.tournament_id,
+        "winner_team_id": winner_id,
+        "score_a": payload.score_a,
+        "score_b": payload.score_b,
+    })
+
+    await record_audit_log(
+        db=db,
+        operator=admin_user.username,
+        role=admin_user.role,
+        action="COMPLETE_MATCH",
+        target=f"Match {match.id}",
+        details=f"Scores: {payload.score_a}-{payload.score_b} | Winner: {winner_id}",
+    )
+
+    return {
+        "status": "success",
+        "message": f"Match completed successfully! Final score: {payload.score_a} - {payload.score_b}.",
+    }
 
 
 

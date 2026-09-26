@@ -276,16 +276,37 @@ async def test_dynamic_tournament_team_size_and_live_bracket_matches(client):
     )
     assert ok_res2.status_code == 200
 
-    # 4. Organizer/Admin updates tournament status to "LIVE"
+    # 4. Organizer/Admin updates tournament status to "REGISTRATION_CLOSED"
     update_res = await client.put(
         f"/api/v1/organizer/tournaments/{t_id}",
-        json={"status": "LIVE"},
+        json={"status": "REGISTRATION_CLOSED"},
         headers=headers_admin,
     )
     assert update_res.status_code == 200
-    assert update_res.json()["status"] == "LIVE"
+    assert update_res.json()["status"] == "REGISTRATION_CLOSED"
 
-    # 5. Fetch matches for this tournament and verify live match exists
+    # 5. Generate match structure & mark match live via admin
+    gen_res = await client.post(
+        f"/api/v1/admin/tournaments/{t_id}/generate-match-structure",
+        json={"match_format": "SINGLE_ELIMINATION", "series_format": "BO3"},
+        headers=headers_admin,
+    )
+    assert gen_res.status_code == 200
+
+    matches_all = await client.get(f"/api/v1/matches?tournament_id={t_id}")
+    assert matches_all.status_code == 200
+    m_list = matches_all.json()
+    assert len(m_list) >= 1
+    m_id = m_list[0]["id"]
+
+    mark_live_res = await client.post(
+        f"/api/v1/admin/matches/{m_id}/mark-live",
+        json={"youtube_live_url": "https://www.youtube.com/watch?v=live123"},
+        headers=headers_admin,
+    )
+    assert mark_live_res.status_code == 200
+
+    # 6. Fetch matches for this tournament and verify live match exists
     matches_res = await client.get(f"/api/v1/matches?tournament_id={t_id}&status=LIVE")
     assert matches_res.status_code == 200
     matches = matches_res.json()
