@@ -14,6 +14,7 @@ router = APIRouter()
 @router.get("", response_model=List[MatchResponse])
 async def list_matches(
     tournament_id: Optional[str] = Query(None, description="Filter matches by tournament ID or slug"),
+    status: Optional[str] = Query(None, description="Filter matches by status (e.g. LIVE, UPCOMING, COMPLETED)"),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     query = {}
@@ -23,8 +24,27 @@ async def list_matches(
             tid = str(tourn.get("_id", tourn.get("id")))
             tslug = tourn.get("slug")
             query["$or"] = [{"tournament_id": tid}, {"tournament_id": tslug}]
+
+            # Auto-generate matches if tournament is LIVE or ONGOING with 0 matches and >= 2 registrations
+            if tourn.get("status") in ["LIVE", "ONGOING"]:
+                matches_count = await db.matches.count_documents({"$or": [{"tournament_id": tid}, {"tournament_id": tslug}]})
+                reg_count = await db.tournament_registrations.count_documents({"$or": [{"tournament_id": tid}, {"tournament_id": tslug}]})
+                if matches_count == 0 and reg_count >= 2:
+                    from app.services.bracket_engine import build_single_elimination_bracket
+                    from app.models.tournament import Tournament
+                    tourn_obj = Tournament.from_mongo(tourn)
+                    await build_single_elimination_bracket(tournament=tourn_obj, db=db)
         else:
             query["tournament_id"] = tournament_id
+
+    if status:
+        stat_upper = status.upper()
+        if stat_upper in ["LIVE", "ONGOING"]:
+            query["status"] = {"$in": ["LIVE", "IN_PROGRESS", "CHECK_IN_OPEN"]}
+        elif stat_upper in ["UPCOMING", "SCHEDULED"]:
+            query["status"] = {"$in": ["SCHEDULED", "CHECK_IN_OPEN"]}
+        else:
+            query["status"] = stat_upper
 
     cursor = db.matches.find(query)
     matches = await cursor.to_list(length=200)
@@ -33,7 +53,7 @@ async def list_matches(
     for m in matches:
         mid = str(m.get("_id", m.get("id")))
         tourn_id = m.get("tournament_id")
-        tourn = await db.tournaments.find_one({"$or": [{"_id": tourn_id}, {"id": tourn_id}]}) if tourn_id else None
+        tourn = await db.tournaments.find_one({"$or": [{"_id": tourn_id}, {"id": tourn_id}, {"slug": tourn_id}]}) if tourn_id else None
         
         game = None
         if tourn and tourn.get("game_id"):
@@ -44,7 +64,20 @@ async def list_matches(
         team_b_id = m.get("team_b_id")
 
         team_a = await db.teams.find_one({"$or": [{"_id": team_a_id}, {"id": team_a_id}]}) if team_a_id else None
+        if not team_a and team_a_id:
+            user_a = await db.users.find_one({"$or": [{"_id": team_a_id}, {"id": team_a_id}]})
+            if user_a:
+                team_a = {"name": user_a.get("username") or user_a.get("in_game_name") or "Player A", "tag": "SOLO"}
+
         team_b = await db.teams.find_one({"$or": [{"_id": team_b_id}, {"id": team_b_id}]}) if team_b_id else None
+        if not team_b and team_b_id:
+            user_b = await db.users.find_one({"$or": [{"_id": team_b_id}, {"id": team_b_id}]})
+            if user_b:
+                team_b = {"name": user_b.get("username") or user_b.get("in_game_name") or "Player B", "tag": "SOLO"}
+
+        match_status = m.get("status", "SCHEDULED")
+        if tourn and tourn.get("status") in ["LIVE", "ONGOING"] and team_a_id and team_b_id and match_status in ["SCHEDULED", "CHECK_IN_OPEN"]:
+            match_status = "LIVE"
 
         response.append(
             MatchResponse(
@@ -56,12 +89,12 @@ async def list_matches(
                 stage=m.get("stage", "QUARTER_FINAL"),
                 format=m.get("format", "BO1"),
                 scheduled_time=m.get("scheduled_time", "TBD"),
-                status=m.get("status", "SCHEDULED"),
+                status=match_status,
                 server_region=m.get("server_region", "AWS Mumbai (ap-south-1)"),
                 lobby_code=m.get("lobby_code"),
                 lobby_password=m.get("lobby_password"),
-                team_a={"name": team_a["name"], "tag": team_a["tag"], "score": m.get("score_a", 0)} if team_a else None,
-                team_b={"name": team_b["name"], "tag": team_b["tag"], "score": m.get("score_b", 0)} if team_b else None,
+                team_a={"name": team_a["name"], "tag": team_a.get("tag", "TEAM"), "score": m.get("score_a", 0)} if team_a else None,
+                team_b={"name": team_b["name"], "tag": team_b.get("tag", "TEAM"), "score": m.get("score_b", 0)} if team_b else None,
                 evidence_url=m.get("evidence_url"),
                 dispute_notes=m.get("dispute_notes"),
             )
@@ -86,17 +119,19 @@ async def captain_check_in(
     competing_teams = [tid for tid in [team_a_id, team_b_id] if tid]
 
     if competing_teams and current_user.role not in ["SUPER_ADMIN", "ORGANIZER"]:
-        mem_check = await db.teams.find_one({
-            "$and": [
-                {"$or": [{"_id": {"$in": competing_teams}}, {"id": {"$in": competing_teams}}]},
-                {"members.user_id": current_user.id},
-            ]
-        })
-        if not mem_check:
-            raise HTTPException(
-                status_code=403,
-                detail="You are not registered on either competing roster for this match.",
-            )
+        is_solo = current_user.id in competing_teams
+        if not is_solo:
+            mem_check = await db.teams.find_one({
+                "$and": [
+                    {"$or": [{"_id": {"$in": competing_teams}}, {"id": {"$in": competing_teams}}]},
+                    {"members.user_id": current_user.id},
+                ]
+            })
+            if not mem_check:
+                raise HTTPException(
+                    status_code=403,
+                    detail="You are not registered on either competing roster for this match.",
+                )
 
     new_status = match.get("status", "SCHEDULED")
     if new_status == "CHECK_IN_OPEN":
@@ -130,17 +165,19 @@ async def submit_match_result(
     competing_teams = [tid for tid in [team_a_id, team_b_id] if tid]
 
     if competing_teams and current_user.role not in ["SUPER_ADMIN", "ORGANIZER"]:
-        mem_check = await db.teams.find_one({
-            "$and": [
-                {"$or": [{"_id": {"$in": competing_teams}}, {"id": {"$in": competing_teams}}]},
-                {"members.user_id": current_user.id},
-            ]
-        })
-        if not mem_check:
-            raise HTTPException(
-                status_code=403,
-                detail="Only participating roster members or platform arbiters can submit scores.",
-            )
+        is_solo = current_user.id in competing_teams
+        if not is_solo:
+            mem_check = await db.teams.find_one({
+                "$and": [
+                    {"$or": [{"_id": {"$in": competing_teams}}, {"id": {"$in": competing_teams}}]},
+                    {"members.user_id": current_user.id},
+                ]
+            })
+            if not mem_check:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Only participating roster members or platform arbiters can submit scores.",
+                )
 
     await db.matches.update_one(
         {"_id": match["_id"]},

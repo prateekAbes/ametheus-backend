@@ -14,19 +14,23 @@ from app.schemas import TournamentResponse
 router = APIRouter()
 
 VALID_TRANSITIONS = {
-    "DRAFT": ["COMING_SOON", "REGISTRATION_OPEN", "CANCELLED"],
-    "COMING_SOON": ["DRAFT", "REGISTRATION_OPEN", "CANCELLED"],
+    "DRAFT": ["COMING_SOON", "REGISTRATION_OPEN", "LIVE", "CANCELLED"],
+    "COMING_SOON": ["DRAFT", "REGISTRATION_OPEN", "LIVE", "CANCELLED"],
     "REGISTRATION_OPEN": ["REGISTRATION_CLOSED", "LIVE", "CANCELLED"],
     "REGISTRATION_CLOSED": ["UPCOMING", "LIVE", "REGISTRATION_OPEN", "CANCELLED"],
     "UPCOMING": ["LIVE", "CANCELLED"],
-    "LIVE": ["COMPLETED", "CANCELLED"],
+    "LIVE": ["LIVE", "COMPLETED", "CANCELLED"],
     "COMPLETED": [],
     "CANCELLED": [],
 }
 
 def validate_tournament_transition(current_status: str, next_status: str):
-    allowed = VALID_TRANSITIONS.get(current_status, [])
-    if next_status not in allowed:
+    curr = "LIVE" if current_status == "ONGOING" else current_status
+    nxt = "LIVE" if next_status == "ONGOING" else next_status
+    if curr == nxt:
+        return
+    allowed = VALID_TRANSITIONS.get(curr, [])
+    if nxt not in allowed:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Illegal tournament transition from {current_status} to {next_status}. Allowed next states: {allowed}",
@@ -248,7 +252,9 @@ async def update_tournament(
     if payload.max_team_size is not None:
         update_fields["max_team_size"] = payload.max_team_size
     if payload.status is not None:
-        update_fields["status"] = payload.status
+        status_norm = "LIVE" if payload.status == "ONGOING" else payload.status
+        validate_tournament_transition(tourn.get("status", "DRAFT"), status_norm)
+        update_fields["status"] = status_norm
     if payload.expected_start_date is not None:
         update_fields["expected_start_date"] = payload.expected_start_date
     if payload.registration_open_date is not None:
@@ -263,7 +269,27 @@ async def update_tournament(
     gid = updated_tourn.get("game_id")
     game = await db.games.find_one({"$or": [{"_id": gid}, {"id": gid}, {"slug": gid}]})
     tid = str(updated_tourn.get("_id", updated_tourn.get("id")))
-    reg_count = await db.tournament_registrations.count_documents({"$or": [{"tournament_id": tid}, {"tournament_id": updated_tourn.get("slug")}]})
+    tslug = updated_tourn.get("slug")
+    reg_count = await db.tournament_registrations.count_documents({"$or": [{"tournament_id": tid}, {"tournament_id": tslug}]})
+
+    # If tournament transitioned to LIVE, ensure bracket matches exist and are LIVE
+    if updated_tourn.get("status") in ["LIVE", "ONGOING"]:
+        from app.services.bracket_engine import build_single_elimination_bracket
+        matches_count = await db.matches.count_documents({"$or": [{"tournament_id": tid}, {"tournament_id": tslug}]})
+        if matches_count == 0 and reg_count >= 2:
+            tourn_obj = Tournament.from_mongo(updated_tourn)
+            await build_single_elimination_bracket(tournament=tourn_obj, db=db)
+            updated_tourn = await db.tournaments.find_one({"_id": tourn["_id"]})
+        else:
+            await db.matches.update_many(
+                {
+                    "$or": [{"tournament_id": tid}, {"tournament_id": tslug}],
+                    "team_a_id": {"$ne": None},
+                    "team_b_id": {"$ne": None},
+                    "status": {"$in": ["SCHEDULED", "CHECK_IN_OPEN"]},
+                },
+                {"$set": {"status": "LIVE"}}
+            )
 
     return serialize_tournament_response(updated_tourn, game, reg_count)
 
@@ -462,7 +488,7 @@ async def generate_single_elimination_bracket(
 ):
     from app.services.bracket_engine import build_single_elimination_bracket
 
-    tourn_doc = await db.tournaments.find_one({"$or": [{"_id": id}, {"id": id}]})
+    tourn_doc = await db.tournaments.find_one({"$or": [{"_id": id}, {"id": id}, {"slug": id}]})
     if not tourn_doc:
         raise HTTPException(status_code=404, detail="Tournament not found")
 

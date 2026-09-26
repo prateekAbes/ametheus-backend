@@ -9,6 +9,20 @@ from app.services.audit import record_audit_log
 
 router = APIRouter()
 
+def serialize_upi_account(d: dict) -> dict:
+    item = dict(d)
+    doc_id = str(item.get("_id", item.get("id", "")))
+    item["id"] = doc_id
+    if "_id" in item:
+        item["_id"] = str(item["_id"])
+    created_at = item.get("created_at")
+    if created_at is not None:
+        if hasattr(created_at, "isoformat"):
+            item["created_at"] = created_at.isoformat()
+        else:
+            item["created_at"] = str(created_at)
+    return item
+
 @router.get("", response_model=List[UpiAccountResponse])
 async def list_upi_accounts(
     admin_user: User = Depends(require_super_admin),
@@ -18,8 +32,8 @@ async def list_upi_accounts(
     docs = await cursor.to_list(length=100)
     res = []
     for d in docs:
-        d["id"] = str(d.get("_id", d.get("id")))
-        res.append(UpiAccountResponse(**d))
+        cleaned = serialize_upi_account(d)
+        res.append(UpiAccountResponse(**cleaned))
     return res
 
 @router.post("", response_model=UpiAccountResponse, status_code=status.HTTP_201_CREATED)
@@ -53,8 +67,8 @@ async def create_upi_account(
         details="Added new rotating UPI account",
     )
 
-    doc["id"] = str(doc.get("_id", doc.get("id")))
-    return UpiAccountResponse(**doc)
+    cleaned = serialize_upi_account(doc)
+    return UpiAccountResponse(**cleaned)
 
 @router.patch("/{id}", response_model=UpiAccountResponse)
 async def update_upi_account(
@@ -72,7 +86,6 @@ async def update_upi_account(
         await db.upi_accounts.update_one({"_id": acc["_id"]}, {"$set": update_dict})
 
     updated = await db.upi_accounts.find_one({"_id": acc["_id"]})
-    updated["id"] = str(updated.get("_id", updated.get("id")))
 
     await record_audit_log(
         db=db,
@@ -83,7 +96,8 @@ async def update_upi_account(
         details=f"Updated fields: {list(update_dict.keys())}",
     )
 
-    return UpiAccountResponse(**updated)
+    cleaned = serialize_upi_account(updated)
+    return UpiAccountResponse(**cleaned)
 
 @router.post("/{id}/toggle-status")
 async def toggle_upi_account_status(

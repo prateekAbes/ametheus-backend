@@ -480,9 +480,13 @@ async def register_team_for_tournament(
             detail="Your team is registered for a different competitive title than this tournament",
         )
 
-    # 5b. Roster bounds check
-    min_size = tourn.get("min_team_size", game_obj.get("min_team_size", 1) if game_obj else 1)
-    max_size = tourn.get("max_team_size", game_obj.get("max_team_size", 5) if game_obj else 5)
+    # 5b. Roster bounds check (Requirement 2 & 3: Tournament defines its own required team size)
+    tourn_min = tourn.get("min_team_size") or tourn.get("required_team_size")
+    min_size = int(tourn_min) if tourn_min is not None else 1
+
+    tourn_max = tourn.get("max_team_size")
+    max_size = int(tourn_max) if tourn_max is not None else max(min_size, 5)
+
     members = team.get("members", [])
     members_count = len(members)
     # If the team was created with a captain_id and members list doesn't include the captain, ensure captain counts

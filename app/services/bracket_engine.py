@@ -23,28 +23,47 @@ async def build_single_elimination_bracket(
     tournament: Tournament,
     db: AsyncIOMotorDatabase,
 ) -> Dict[str, Any]:
-    # 1. Get registered teams
-    reg_cursor = db.tournament_registrations.find({"tournament_id": tournament.id})
+    # 1. Get registered teams or solo contenders
+    reg_cursor = db.tournament_registrations.find({
+        "$or": [{"tournament_id": tournament.id}, {"tournament_id": tournament.slug}]
+    })
     regs = await reg_cursor.to_list(length=100)
-    team_ids = [r.get("team_id") for r in regs if r.get("team_id")]
+    team_ids = [str(r.get("team_id")) for r in regs if r.get("team_id")]
+    solo_ids = [str(r.get("player_id") or r.get("user_id")) for r in regs if (r.get("player_id") or r.get("user_id")) and not r.get("team_id")]
     
-    teams = []
+    contenders = []
     if team_ids:
         team_cursor = db.teams.find({"$or": [{"_id": {"$in": team_ids}}, {"id": {"$in": team_ids}}]})
-        teams = await team_cursor.to_list(length=100)
+        team_docs = await team_cursor.to_list(length=100)
+        team_map = {str(t.get("_id", t.get("id"))): t for t in team_docs}
+        for tid in team_ids:
+            if tid in team_map:
+                contenders.append(tid)
+            else:
+                contenders.append(tid)
+    elif solo_ids:
+        user_cursor = db.users.find({"$or": [{"_id": {"$in": solo_ids}}, {"id": {"$in": solo_ids}}]})
+        user_docs = await user_cursor.to_list(length=100)
+        user_map = {str(u.get("_id", u.get("id"))): u for u in user_docs}
+        for uid in solo_ids:
+            if uid in user_map:
+                contenders.append(uid)
+            else:
+                contenders.append(uid)
 
-    num_teams = len(teams)
-    if num_teams < 2:
-        num_teams = 4
+    num_contenders = len(contenders)
+    if num_contenders < 2:
+        num_contenders = 4
 
-    total_rounds = max(1, math.ceil(math.log2(num_teams)))
-    matches_in_r1 = 2 ** (total_rounds - 1)
+    total_rounds = max(1, math.ceil(math.log2(num_contenders)))
 
     bracket_tree = []
     bye_matches = []
 
     # Clear existing matches for this tournament if regenerating
-    await db.matches.delete_many({"tournament_id": tournament.id})
+    await db.matches.delete_many({
+        "$or": [{"tournament_id": tournament.id}, {"tournament_id": tournament.slug}]
+    })
 
     # Generate matches round by round
     for r in range(1, total_rounds + 1):
@@ -59,16 +78,16 @@ async def build_single_elimination_bracket(
             status = "SCHEDULED"
 
             if r == 1:
-                # Seed teams into Round 1
+                # Seed contenders into Round 1
                 t_idx_a = (m_idx - 1) * 2
                 t_idx_b = t_idx_a + 1
-                if t_idx_a < len(teams):
-                    team_a_id = str(teams[t_idx_a].get("_id", teams[t_idx_a].get("id")))
-                if t_idx_b < len(teams):
-                    team_b_id = str(teams[t_idx_b].get("_id", teams[t_idx_b].get("id")))
+                if t_idx_a < len(contenders):
+                    team_a_id = contenders[t_idx_a]
+                if t_idx_b < len(contenders):
+                    team_b_id = contenders[t_idx_b]
 
                 if team_a_id and team_b_id:
-                    status = "CHECK_IN_OPEN"
+                    status = "LIVE"
                 elif team_a_id and not team_b_id:
                     status = "BYE"
                 else:
@@ -156,8 +175,8 @@ async def advance_bracket_match(
             update_data["team_b_id"] = winner_team_id
 
         if (update_data.get("team_a_id") or next_match.team_a_id) and (update_data.get("team_b_id") or next_match.team_b_id):
-            next_match.status = "CHECK_IN_OPEN"
-            update_data["status"] = "CHECK_IN_OPEN"
+            next_match.status = "LIVE"
+            update_data["status"] = "LIVE"
 
         await db.matches.update_one({"_id": next_match_doc["_id"]}, {"$set": update_data})
     else:

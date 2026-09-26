@@ -26,6 +26,8 @@ class Settings(BaseSettings):
     ]
     CLERK_ISSUER: str = "https://clerk.ametheus.gg"
     SUPER_ADMIN_EMAIL: str = "admin@ametheus.gg"
+    SUPPORT_PHONE: str = "+91 98765 43210"
+    SUPPORT_EMAIL: str = "support@ametheus.gg"
     ESCROW_SECRET_KEY: str = "ametheus_escrow_vault_secret_2026"
 
     @field_validator("DATABASE_URL", mode="before")

@@ -171,7 +171,7 @@ class UpiAccountResponse(BaseModel):
     status: str = "ACTIVE"
     payment_count: int = 0
     created_at: Optional[Any] = None
-    model_config = ConfigDict(from_attributes=True, extra="allow")
+    model_config = ConfigDict(from_attributes=True, extra="ignore")
 
 class GamePaymentInitiateRequest(BaseModel):
     game_slug: str

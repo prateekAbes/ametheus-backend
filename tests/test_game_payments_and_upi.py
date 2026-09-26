@@ -154,9 +154,11 @@ async def test_multiple_payments_without_utr_do_not_conflict(client):
 
 @pytest.mark.asyncio
 async def test_legacy_upi_accounts_serialization_without_created_at(client, db_session):
+    from bson.objectid import ObjectId
     admin_headers = make_auth_headers("usr_super_admin")
+    raw_oid = ObjectId()
     legacy_doc = {
-        "_id": "upi_legacy_001",
+        "_id": raw_oid,
         "code": "LEGACY01",
         "upi_id": "legacy@bank",
         "payee_name": "Legacy Merchant",
@@ -168,6 +170,7 @@ async def test_legacy_upi_accounts_serialization_without_created_at(client, db_s
     accounts = r.json()
     legacy = next((a for a in accounts if a.get("code") == "LEGACY01"), None)
     assert legacy is not None
+    assert legacy["id"] == str(raw_oid)
     assert legacy["upi_id"] == "legacy@bank"
     assert legacy["created_at"] is None
     assert legacy["payment_count"] == 0
