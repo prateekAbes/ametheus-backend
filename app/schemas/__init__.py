@@ -168,10 +168,10 @@ class UpiAccountResponse(BaseModel):
     payee_name: str
     qr_url: Optional[str] = None
     display_name: Optional[str] = None
-    status: str
-    payment_count: int
-    created_at: Any
-    model_config = ConfigDict(from_attributes=True)
+    status: str = "ACTIVE"
+    payment_count: int = 0
+    created_at: Optional[Any] = None
+    model_config = ConfigDict(from_attributes=True, extra="allow")
 
 class GamePaymentInitiateRequest(BaseModel):
     game_slug: str

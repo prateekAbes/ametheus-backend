@@ -6,7 +6,7 @@ from mongomock_motor import AsyncMongoMockClient
 
 from app.core.database import get_db, set_database, get_database, init_db_indexes
 from app.core.security import create_access_token
-from app.seed import populate_seed_data
+from tests.seed import populate_seed_data
 from app.main import app
 
 # Ensure identical module reference when imported as 'tests.conftest' or 'conftest'

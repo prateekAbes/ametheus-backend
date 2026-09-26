@@ -46,7 +46,7 @@ app.add_middleware(
 
 # Rate Limiting & Request Logging Middleware
 RATE_LIMIT_WINDOW = 60.0  # seconds
-RATE_LIMIT_MAX_REQUESTS = 120
+RATE_LIMIT_MAX_REQUESTS = 300
 _ip_request_timestamps: dict[str, list[float]] = defaultdict(list)
 
 EXEMPT_PATHS = {
@@ -66,14 +66,20 @@ async def rate_limit_and_logging_middleware(request: Request, call_next):
 
     # Rate Limiting Check (exempt health, docs, openapi, and WebSocket paths)
     if path not in EXEMPT_PATHS and not path.startswith("/ws/"):
-        client_ip = request.client.host if request.client else "unknown"
+        forwarded_for = request.headers.get("x-forwarded-for")
+        if forwarded_for:
+            client_ip = forwarded_for.split(",")[0].strip()
+        else:
+            client_ip = request.client.host if request.client else "unknown"
+
         now = time.time()
         timestamps = [ts for ts in _ip_request_timestamps[client_ip] if now - ts < RATE_LIMIT_WINDOW]
         if len(timestamps) >= RATE_LIMIT_MAX_REQUESTS:
             return JSONResponse(
                 status_code=429,
+                headers={"Retry-After": "5"},
                 content={
-                    "detail": "Too many requests. Rate limit exceeded (120 req/min). Please try again shortly."
+                    "detail": "Too many requests. Rate limit exceeded (300 req/min). Please try again shortly."
                 },
             )
         timestamps.append(now)
