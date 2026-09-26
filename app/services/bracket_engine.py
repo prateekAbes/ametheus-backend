@@ -1,7 +1,10 @@
 import secrets
 import json
 import math
+from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any
+from bson import ObjectId
+from fastapi import HTTPException
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from app.models.tournament import Tournament, TournamentRegistration
 from app.models.team import Team
@@ -30,9 +33,9 @@ def resolve_stage_format(tournament: Tournament, stage_name: str, r: int, total_
 
     for attr in ["match_format", "series_format", "format"]:
         default_fmt = getattr(tournament, attr, None)
-        if default_fmt in ["Best of 1", "Best of 3", "Best of 5"]:
+        if default_fmt in ["Best of 1", "Best of 3"]:
             return default_fmt
-        if default_fmt in ["BO1", "BO3", "BO5"]:
+        if default_fmt in ["BO1", "BO3"]:
             return default_fmt
     return "BO3" if r == total_rounds else "BO1"
 
@@ -722,8 +725,8 @@ async def build_group_stage_knockout(
         match_type="GRAND_FINAL",
         round_number=4,
         match_number=1,
-        format="BO5",
-        series_format="BO5",
+        format="BO3",
+        series_format="BO3",
         scheduled_time="Championship Final",
         status="SCHEDULED",
         server_region=tournament.server_region,
@@ -835,3 +838,503 @@ async def advance_bracket_match(
             )
 
     return next_match
+
+
+async def swap_match_teams(
+    match_id: str,
+    db: AsyncIOMotorDatabase
+) -> Dict[str, Any]:
+    """
+    Swaps Team 1 and Team 2 in a match:
+    team_a_id <-> team_b_id
+    team_a_name <-> team_b_name
+    team_a_score <-> team_b_score
+    """
+    match_query = {"$or": [{"id": match_id}, {"_id": match_id}]}
+    if ObjectId.is_valid(match_id):
+        match_query["$or"].append({"_id": ObjectId(match_id)})
+
+    match_doc = await db.matches.find_one(match_query)
+    if not match_doc:
+        raise HTTPException(status_code=404, detail="Match not found")
+
+    old_a_id = match_doc.get("team_a_id")
+    old_b_id = match_doc.get("team_b_id")
+    old_a_name = match_doc.get("team_a_name")
+    old_b_name = match_doc.get("team_b_name")
+    old_a_score = match_doc.get("score_a", 0) or 0
+    old_b_score = match_doc.get("score_b", 0) or 0
+
+    update_fields = {
+        "team_a_id": old_b_id,
+        "team_b_id": old_a_id,
+        "team_a_name": old_b_name,
+        "team_b_name": old_a_name,
+        "score_a": old_b_score,
+        "score_b": old_a_score,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    await db.matches.update_one({"_id": match_doc["_id"]}, {"$set": update_fields})
+    updated_doc = await db.matches.find_one({"_id": match_doc["_id"]})
+    return Match.from_mongo(updated_doc).model_dump()
+
+
+async def calculate_advancement_suggestion(
+    match_id: str,
+    db: AsyncIOMotorDatabase
+) -> Dict[str, Any]:
+    """
+    Calculates suggested next stage, round, match, and slot for winner advancement,
+    and returns all available destinations across stages/rounds/matches in the tournament.
+    """
+    match_query = {"$or": [{"id": match_id}, {"_id": match_id}]}
+    if ObjectId.is_valid(match_id):
+        match_query["$or"].append({"_id": ObjectId(match_id)})
+
+    match_doc = await db.matches.find_one(match_query)
+    if not match_doc:
+        raise HTTPException(status_code=404, detail="Match not found")
+
+    tournament_id = str(match_doc.get("tournament_id"))
+    t_query = {"$or": [{"id": tournament_id}, {"_id": tournament_id}]}
+    if ObjectId.is_valid(tournament_id):
+        t_query["$or"].append({"_id": ObjectId(tournament_id)})
+
+    t_doc = await db.tournaments.find_one(t_query)
+    if not t_doc:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+
+    tournament = Tournament.from_mongo(t_doc)
+    stages = tournament.stages or []
+    current_stage_id = match_doc.get("stage_id")
+    current_round_id = match_doc.get("round_id")
+    match_num = match_doc.get("match_number", 1)
+
+    suggested: Optional[Dict[str, Any]] = None
+
+    # Retrieve all matches of this tournament to build destination tree
+    all_matches_cursor = db.matches.find({"tournament_id": tournament_id})
+    all_matches_raw = await all_matches_cursor.to_list(length=500)
+    all_matches = [Match.from_mongo(m) for m in all_matches_raw]
+
+    # Map matches by stage and round
+    matches_by_stage_round: Dict[str, Dict[str, List[Match]]] = {}
+    for m in all_matches:
+        s_id = m.stage_id or "default"
+        r_id = m.round_id or str(m.round_number)
+        if s_id not in matches_by_stage_round:
+            matches_by_stage_round[s_id] = {}
+        if r_id not in matches_by_stage_round[s_id]:
+            matches_by_stage_round[s_id][r_id] = []
+        matches_by_stage_round[s_id][r_id].append(m)
+
+    # Sort stages by order
+    sorted_stages = sorted(stages, key=lambda s: s.stage_order)
+
+    # Try finding next round in current stage, or first round in next stage
+    current_stage_idx = -1
+    for idx, s in enumerate(sorted_stages):
+        if s.stage_id == current_stage_id:
+            current_stage_idx = idx
+            break
+
+    target_stage = None
+    target_round = None
+
+    if current_stage_idx >= 0:
+        c_stage = sorted_stages[current_stage_idx]
+        c_rounds = sorted(c_stage.rounds or [], key=lambda r: r.round_order)
+        c_round_idx = -1
+        for r_idx, r in enumerate(c_rounds):
+            if r.round_id == current_round_id:
+                c_round_idx = r_idx
+                break
+
+        if c_round_idx >= 0 and c_round_idx + 1 < len(c_rounds):
+            # Next round in current stage
+            target_stage = c_stage
+            target_round = c_rounds[c_round_idx + 1]
+        elif current_stage_idx + 1 < len(sorted_stages):
+            # First round in next stage
+            next_stage = sorted_stages[current_stage_idx + 1]
+            if next_stage.rounds:
+                target_stage = next_stage
+                target_round = sorted(next_stage.rounds, key=lambda r: r.round_order)[0]
+
+    # Find suggested match and slot in target round
+    if target_stage and target_round:
+        target_stage_matches = matches_by_stage_round.get(target_stage.stage_id, {}).get(target_round.round_id, [])
+        target_stage_matches = sorted(target_stage_matches, key=lambda m: m.match_number)
+
+        suggested_match_num = math.ceil(match_num / 2)
+        suggested_slot = "team_a" if (match_num % 2 != 0) else "team_b"
+
+        # Try to find match matching suggested match number
+        target_match = None
+        for m in target_stage_matches:
+            if m.match_number == suggested_match_num:
+                target_match = m
+                break
+
+        # Fallback to any match with an empty slot
+        if not target_match:
+            for m in target_stage_matches:
+                if (suggested_slot == "team_a" and not m.team_a_id) or (suggested_slot == "team_b" and not m.team_b_id):
+                    target_match = m
+                    break
+
+        if not target_match and target_stage_matches:
+            target_match = target_stage_matches[0]
+
+        suggested = {
+            "stage_id": target_stage.stage_id,
+            "stage_name": target_stage.stage_name,
+            "round_id": target_round.round_id,
+            "round_name": target_round.round_name,
+            "match_id": target_match.id if target_match else None,
+            "match_number": target_match.match_number if target_match else suggested_match_num,
+            "slot": suggested_slot,
+        }
+    else:
+        # Fallback for standard single-stage tournaments
+        next_round_num = match_doc.get("round_number", 1) + 1
+        suggested_match_num = math.ceil(match_num / 2)
+        suggested_slot = "team_a" if (match_num % 2 != 0) else "team_b"
+        target_match = None
+        for m in all_matches:
+            if m.round_number == next_round_num and m.match_number == suggested_match_num:
+                target_match = m
+                break
+        suggested = {
+            "stage_id": current_stage_id or "default",
+            "stage_name": match_doc.get("stage") or "Tournament Stage",
+            "round_id": str(next_round_num),
+            "round_name": f"Round {next_round_num}",
+            "match_id": target_match.id if target_match else None,
+            "match_number": suggested_match_num,
+            "slot": suggested_slot,
+        }
+
+    # Build available destinations list for admin manual selection
+    destinations = []
+    if sorted_stages:
+        for s in sorted_stages:
+            stage_entry = {
+                "stage_id": s.stage_id,
+                "stage_name": s.stage_name,
+                "stage_order": s.stage_order,
+                "rounds": []
+            }
+            for r in sorted(s.rounds or [], key=lambda r: r.round_order):
+                round_entry = {
+                    "round_id": r.round_id,
+                    "round_name": r.round_name,
+                    "round_order": r.round_order,
+                    "matches": []
+                }
+                r_matches = matches_by_stage_round.get(s.stage_id, {}).get(r.round_id, [])
+                for m in sorted(r_matches, key=lambda m: m.match_number):
+                    # Do not include the source match itself as a destination
+                    if m.id != match_id:
+                        round_entry["matches"].append({
+                            "match_id": m.id,
+                            "match_number": m.match_number,
+                            "team_a_id": m.team_a_id,
+                            "team_a_name": m.team_a_name,
+                            "team_b_id": m.team_b_id,
+                            "team_b_name": m.team_b_name,
+                            "status": m.status
+                        })
+                stage_entry["rounds"].append(round_entry)
+            destinations.append(stage_entry)
+
+    # Current match details
+    source_match = Match.from_mongo(match_doc).model_dump()
+
+    return {
+        "source_match": source_match,
+        "suggested": suggested,
+        "available_destinations": destinations
+    }
+
+
+async def advance_match_winner(
+    match_id: str,
+    payload: Dict[str, Any],
+    db: AsyncIOMotorDatabase
+) -> Dict[str, Any]:
+    """
+    Advances a match winner to the target stage/round/match/slot.
+    Updates target match slot, updates source match status & advancement trail.
+    """
+    match_query = {"$or": [{"id": match_id}, {"_id": match_id}]}
+    if ObjectId.is_valid(match_id):
+        match_query["$or"].append({"_id": ObjectId(match_id)})
+
+    match_doc = await db.matches.find_one(match_query)
+    if not match_doc:
+        raise HTTPException(status_code=404, detail="Source match not found")
+
+    winner_team_id = payload.get("winner_team_id") or match_doc.get("winner_team_id")
+    if not winner_team_id:
+        raise HTTPException(status_code=400, detail="A winner team must be specified before advancing")
+
+    # Fetch team name
+    winner_team_name = "Team"
+    team_query = {"$or": [{"id": winner_team_id}, {"_id": winner_team_id}]}
+    if ObjectId.is_valid(winner_team_id):
+        team_query["$or"].append({"_id": ObjectId(winner_team_id)})
+    t_doc = await db.teams.find_one(team_query)
+    if t_doc:
+        winner_team_name = t_doc.get("name", "Team")
+    elif winner_team_id == match_doc.get("team_a_id"):
+        winner_team_name = match_doc.get("team_a_name", "Team A")
+    elif winner_team_id == match_doc.get("team_b_id"):
+        winner_team_name = match_doc.get("team_b_name", "Team B")
+
+    target_match_id = payload.get("destination_match_id") or payload.get("target_match_id")
+    target_stage_id = payload.get("destination_stage_id") or payload.get("target_stage_id")
+    target_round_id = payload.get("destination_round_id") or payload.get("target_round_id")
+    target_slot = payload.get("destination_slot") or payload.get("target_slot") or "team_a"
+
+    if not target_match_id:
+        raise HTTPException(status_code=400, detail="Target destination match ID is required")
+
+    dest_query = {"$or": [{"id": target_match_id}, {"_id": target_match_id}]}
+    if ObjectId.is_valid(target_match_id):
+        dest_query["$or"].append({"_id": ObjectId(target_match_id)})
+
+    dest_doc = await db.matches.find_one(dest_query)
+    if not dest_doc:
+        raise HTTPException(status_code=404, detail="Destination match not found")
+
+    # Update destination match slot
+    dest_update: Dict[str, Any] = {"updated_at": datetime.now(timezone.utc).isoformat()}
+    if target_slot == "team_a":
+        dest_update["team_a_id"] = winner_team_id
+        dest_update["team_a_name"] = winner_team_name
+    else:
+        dest_update["team_b_id"] = winner_team_id
+        dest_update["team_b_name"] = winner_team_name
+
+    await db.matches.update_one({"_id": dest_doc["_id"]}, {"$set": dest_update})
+
+    # Update source match with advancement metadata
+    advancement_data = {
+        "advanced_team_id": winner_team_id,
+        "advanced_team_name": winner_team_name,
+        "target_stage_id": target_stage_id,
+        "target_round_id": target_round_id,
+        "target_match_id": target_match_id,
+        "target_slot": target_slot,
+        "advanced_at": datetime.now(timezone.utc).isoformat()
+    }
+
+    source_update = {
+        "winner_team_id": winner_team_id,
+        "status": "COMPLETED",
+        "advancement": advancement_data,
+        "updated_at": datetime.now(timezone.utc).isoformat()
+    }
+    await db.matches.update_one({"_id": match_doc["_id"]}, {"$set": source_update})
+
+    updated_source = await db.matches.find_one({"_id": match_doc["_id"]})
+    updated_dest = await db.matches.find_one({"_id": dest_doc["_id"]})
+
+    return {
+        "success": True,
+        "message": f"Successfully advanced {winner_team_name} to destination match",
+        "source_match": Match.from_mongo(updated_source).model_dump(),
+        "destination_match": Match.from_mongo(updated_dest).model_dump(),
+        "advancement": advancement_data
+    }
+
+
+async def revert_match_advancement(
+    match_id: str,
+    db: AsyncIOMotorDatabase
+) -> Dict[str, Any]:
+    """
+    Reverts an advancement, safely clearing the advanced team from the destination match slot
+    and resetting the source match advancement metadata.
+    """
+    match_query = {"$or": [{"id": match_id}, {"_id": match_id}]}
+    if ObjectId.is_valid(match_id):
+        match_query["$or"].append({"_id": ObjectId(match_id)})
+
+    match_doc = await db.matches.find_one(match_query)
+    if not match_doc:
+        raise HTTPException(status_code=404, detail="Source match not found")
+
+    advancement = match_doc.get("advancement")
+    if not advancement:
+        raise HTTPException(status_code=400, detail="No advancement recorded for this match")
+
+    target_match_id = advancement.get("target_match_id")
+    target_slot = advancement.get("target_slot", "team_a")
+
+    if target_match_id:
+        dest_query = {"$or": [{"id": target_match_id}, {"_id": target_match_id}]}
+        if ObjectId.is_valid(target_match_id):
+            dest_query["$or"].append({"_id": ObjectId(target_match_id)})
+
+        dest_doc = await db.matches.find_one(dest_query)
+        if dest_doc:
+            dest_update: Dict[str, Any] = {"updated_at": datetime.now(timezone.utc).isoformat()}
+            if target_slot == "team_a":
+                dest_update["team_a_id"] = None
+                dest_update["team_a_name"] = None
+            else:
+                dest_update["team_b_id"] = None
+                dest_update["team_b_name"] = None
+            await db.matches.update_one({"_id": dest_doc["_id"]}, {"$set": dest_update})
+
+    # Clear advancement from source match
+    await db.matches.update_one(
+        {"_id": match_doc["_id"]},
+        {"$unset": {"advancement": ""}, "$set": {"updated_at": datetime.now(timezone.utc).isoformat()}}
+    )
+
+    updated_source = await db.matches.find_one({"_id": match_doc["_id"]})
+    return {
+        "success": True,
+        "message": "Advancement reverted successfully",
+        "source_match": Match.from_mongo(updated_source).model_dump()
+    }
+
+
+async def get_tournament_history(
+    tournament_id: str,
+    db: AsyncIOMotorDatabase
+) -> Dict[str, Any]:
+    """
+    Returns full tournament history stage-by-stage and round-by-round,
+    preserving scores, winners, dates/times, stream URLs, and advancement paths.
+    """
+    t_query = {"$or": [{"id": tournament_id}, {"_id": tournament_id}]}
+    if ObjectId.is_valid(tournament_id):
+        t_query["$or"].append({"_id": ObjectId(tournament_id)})
+
+    t_doc = await db.tournaments.find_one(t_query)
+    if not t_doc:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+
+    tournament = Tournament.from_mongo(t_doc)
+
+    matches_cursor = db.matches.find({"tournament_id": tournament_id}).sort([("round_number", 1), ("match_number", 1)])
+    raw_matches = await matches_cursor.to_list(length=500)
+    all_matches = [Match.from_mongo(m) for m in raw_matches]
+
+    # Structure by stages
+    stages_history = []
+    if tournament.stages:
+        sorted_stages = sorted(tournament.stages, key=lambda s: s.stage_order)
+        for s in sorted_stages:
+            stage_entry = {
+                "stage_id": s.stage_id,
+                "stage_name": s.stage_name,
+                "stage_order": s.stage_order,
+                "stage_format": s.stage_format,
+                "rounds": []
+            }
+            for r in sorted(s.rounds or [], key=lambda r: r.round_order):
+                r_matches = [
+                    m.model_dump() for m in all_matches
+                    if (m.stage_id == s.stage_id and m.round_id == r.round_id)
+                ]
+                stage_entry["rounds"].append({
+                    "round_id": r.round_id,
+                    "round_name": r.round_name,
+                    "round_order": r.round_order,
+                    "series_format": r.series_format,
+                    "matches": r_matches
+                })
+            stages_history.append(stage_entry)
+
+    return {
+        "tournament_id": tournament.id,
+        "tournament_name": getattr(tournament, "name", None) or getattr(tournament, "title", "Tournament"),
+        "tournament_status": tournament.status,
+        "live_stream_url": tournament.live_stream_url,
+        "stages": stages_history,
+        "matches": [m.model_dump() for m in all_matches]
+    }
+
+
+async def get_team_journey(
+    tournament_id: str,
+    team_id: str,
+    db: AsyncIOMotorDatabase
+) -> Dict[str, Any]:
+    """
+    Returns the dynamic Team Journey path across all stages and rounds for a given team.
+    """
+    t_query = {"$or": [{"id": tournament_id}, {"_id": tournament_id}]}
+    if ObjectId.is_valid(tournament_id):
+        t_query["$or"].append({"_id": ObjectId(tournament_id)})
+
+    t_doc = await db.tournaments.find_one(t_query)
+    if not t_doc:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+
+    tournament = Tournament.from_mongo(t_doc)
+
+    team_query = {"$or": [{"id": team_id}, {"_id": team_id}]}
+    if ObjectId.is_valid(team_id):
+        team_query["$or"].append({"_id": ObjectId(team_id)})
+    team_doc = await db.teams.find_one(team_query)
+    team_name = team_doc.get("name", "Team") if team_doc else "Team"
+
+    # Find matches where team participated
+    matches_cursor = db.matches.find({
+        "tournament_id": tournament_id,
+        "$or": [
+            {"team_a_id": team_id},
+            {"team_b_id": team_id}
+        ]
+    }).sort([("round_number", 1), ("match_number", 1)])
+    raw_matches = await matches_cursor.to_list(length=100)
+
+    journey_steps = []
+    for m_doc in raw_matches:
+        m = Match.from_mongo(m_doc)
+        is_team_a = (m.team_a_id == team_id)
+        opponent_id = m.team_b_id if is_team_a else m.team_a_id
+        opponent_name = m.team_b_name if is_team_a else m.team_a_name
+        team_score = (m.score_a or 0) if is_team_a else (m.score_b or 0)
+        opp_score = (m.score_b or 0) if is_team_a else (m.score_a or 0)
+
+        result = "PENDING"
+        if m.status == "COMPLETED":
+            if m.winner_team_id == team_id:
+                result = "WIN"
+            elif m.winner_team_id:
+                result = "LOSS"
+            else:
+                result = "DRAW"
+
+        journey_steps.append({
+            "match_id": m.id,
+            "stage_id": m.stage_id,
+            "stage_name": m.stage_name or m.stage,
+            "round_id": m.round_id,
+            "round_name": m.round_name or f"Round {m.round_number}",
+            "match_number": m.match_number,
+            "series_format": m.series_format,
+            "opponent_id": opponent_id,
+            "opponent_name": opponent_name,
+            "score": f"{team_score} - {opp_score}",
+            "result": result,
+            "status": m.status,
+            "scheduled_time": m.scheduled_time,
+            "advancement": m.advancement if (m.advancement and m.advancement.get("advanced_team_id") == team_id) else None
+        })
+
+    return {
+        "tournament_id": tournament.id,
+        "tournament_name": getattr(tournament, "name", None) or getattr(tournament, "title", "Tournament"),
+        "team_id": team_id,
+        "team_name": team_name,
+        "journey": journey_steps
+    }

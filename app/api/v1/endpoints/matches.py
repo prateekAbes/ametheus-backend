@@ -5,6 +5,7 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from app.api.deps import get_db, get_current_user
 from app.models.user import User
+from app.models.match import Match
 from app.models.dispute import Dispute
 from app.schemas import MatchResponse, MatchResultSubmit, DisputeCreate
 from app.services.audit import record_audit_log
@@ -18,11 +19,9 @@ def normalize_match_format(fmt: Optional[str]) -> str:
     f = fmt.strip().lower()
     if f in ["bo1", "best of 1"]:
         return "Best of 1"
-    if f in ["bo3", "best of 3"]:
+    if f in ["bo3", "best of 3", "bo5", "best of 5"]:
         return "Best of 3"
-    if f in ["bo5", "best of 5"]:
-        return "Best of 5"
-    return fmt
+    return "Best of 1"
 
 @router.get("", response_model=List[MatchResponse])
 async def list_matches(
@@ -279,3 +278,35 @@ async def create_match_dispute(
         "message": "Dispute opened and match frozen for administrative review",
         "dispute_id": dispute.id,
     }
+
+
+@router.get("/{id}")
+async def get_match_detail(
+    id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    from bson import ObjectId
+    m_query = {"$or": [{"_id": id}, {"id": id}]}
+    if ObjectId.is_valid(id):
+        m_query["$or"].append({"_id": ObjectId(id)})
+
+    match = await db.matches.find_one(m_query)
+    if not match:
+        raise HTTPException(status_code=404, detail="Match not found")
+
+    m = Match.from_mongo(match).model_dump()
+
+    # Inherit tournament stream url if not set on match
+    if not m.get("youtube_live_url"):
+        tourn_id = m.get("tournament_id")
+        if tourn_id:
+            t_query = {"$or": [{"id": tourn_id}, {"_id": tourn_id}, {"slug": tourn_id}]}
+            if ObjectId.is_valid(tourn_id):
+                t_query["$or"].append({"_id": ObjectId(tourn_id)})
+            tourn_doc = await db.tournaments.find_one(t_query)
+            if tourn_doc and tourn_doc.get("live_stream_url"):
+                m["youtube_live_url"] = tourn_doc.get("live_stream_url")
+                m["live_link"] = tourn_doc.get("live_stream_url")
+
+    return m
+

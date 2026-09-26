@@ -24,6 +24,7 @@ from app.services.wallet_service import debit_wallet_funds
 from app.services.upi_service import get_next_active_upi_account, build_upi_payment_uri
 from app.services.audit import record_audit_log
 from app.services.notification import create_notification
+from app.services.bracket_engine import get_tournament_history, get_team_journey
 
 router = APIRouter()
 
@@ -1049,4 +1050,36 @@ async def update_tournament_stage_formats(
     )
 
     return {"status": "success", "message": "Tournament stage formats updated successfully", "updated": update_fields}
+
+
+@router.get("/{id}/history")
+async def get_tournament_history_endpoint(
+    id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Returns full stage-by-stage and round-by-round tournament history with scores, winners, and timestamps.
+    """
+    tourn = await find_tournament_by_id_or_slug(db, id)
+    if not tourn:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+    t_id = str(tourn.get("id") or tourn.get("_id"))
+    return await get_tournament_history(t_id, db)
+
+
+@router.get("/{id}/teams/{team_id}/journey")
+async def get_team_journey_endpoint(
+    id: str,
+    team_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Returns dynamic team journey path across all tournament stages and rounds.
+    """
+    tourn = await find_tournament_by_id_or_slug(db, id)
+    if not tourn:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+    t_id = str(tourn.get("id") or tourn.get("_id"))
+    return await get_team_journey(t_id, team_id, db)
+
 

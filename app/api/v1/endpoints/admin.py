@@ -6,7 +6,7 @@ from app.api.deps import get_db, get_current_user, require_super_admin, require_
 from app.models.user import User
 from app.models.admin import TournamentAdminAssignment, AuditLog
 from app.models.match import Match
-from app.models.tournament import Tournament
+from app.models.tournament import Tournament, TournamentStage, StageRound
 from app.models.dispute import Dispute
 from app.schemas import (
     AdminAssignmentCreate,
@@ -23,8 +23,26 @@ from app.schemas import (
     AdminMatchScoreUpdate,
     AdminMatchSetupItem,
     AdminSaveLiveStructurePayload,
+    TournamentStageCreate,
+    TournamentStageUpdate,
+    StageReorderPayload,
+    StageRoundCreate,
+    StageRoundUpdate,
+    StageMatchCreate,
+    MatchAdvancementPayload,
+    MatchSwapPayload,
+    TournamentStreamUpdatePayload,
+    WalletAuditSummaryResponse,
 )
 from app.services.audit import record_audit_log
+from app.services.bracket_engine import (
+    swap_match_teams,
+    calculate_advancement_suggestion,
+    advance_match_winner,
+    revert_match_advancement,
+    get_tournament_history,
+    get_team_journey,
+)
 
 router = APIRouter()
 
@@ -775,7 +793,12 @@ async def approve_payment(
     admin_user: User = Depends(require_super_admin),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
-    payment = await db.game_payments.find_one({"$or": [{"_id": payment_id}, {"id": payment_id}]})
+    from bson import ObjectId
+    p_query = {"$or": [{"_id": payment_id}, {"id": payment_id}]}
+    if ObjectId.is_valid(payment_id):
+        p_query["$or"].append({"_id": ObjectId(payment_id)})
+
+    payment = await db.game_payments.find_one(p_query)
     if not payment:
         raise HTTPException(status_code=404, detail="Payment record not found")
 
@@ -791,9 +814,10 @@ async def approve_payment(
     from datetime import datetime, timezone
     now = datetime.now(timezone.utc)
 
-    # Atomic condition: only transition if status is PENDING
+    # Transition from any pending status to APPROVED
+    valid_statuses = ["PENDING", "INITIATED", "PENDING_VERIFICATION", "SUBMITTED"]
     update_res = await db.game_payments.update_one(
-        {"_id": payment["_id"], "status": "PENDING"},
+        {"_id": payment["_id"], "status": {"$in": valid_statuses}},
         {
             "$set": {
                 "status": "APPROVED",
@@ -803,8 +827,8 @@ async def approve_payment(
         }
     )
 
-    if update_res.modified_count == 0:
-        return {"status": "success", "message": "Payment was already approved or is not in PENDING status"}
+    if update_res.modified_count == 0 and payment.get("status") not in valid_statuses:
+        return {"status": "success", "message": f"Payment is already {payment.get('status')}"}
 
     # If it was a tournament entry payment, set registration to PAID
     if payment.get("payment_type") == "TOURNAMENT_ENTRY":
@@ -876,7 +900,12 @@ async def reject_payment(
     admin_user: User = Depends(require_super_admin),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
-    payment = await db.game_payments.find_one({"$or": [{"_id": payment_id}, {"id": payment_id}]})
+    from bson import ObjectId
+    p_query = {"$or": [{"_id": payment_id}, {"id": payment_id}]}
+    if ObjectId.is_valid(payment_id):
+        p_query["$or"].append({"_id": ObjectId(payment_id)})
+
+    payment = await db.game_payments.find_one(p_query)
     if not payment:
         raise HTTPException(status_code=404, detail="Payment record not found")
 
@@ -2375,6 +2404,564 @@ async def complete_match_admin(
     return {
         "status": "success",
         "message": f"Match completed successfully! Final score: {payload.score_a} - {payload.score_b}.",
+    }
+
+
+# ----------------- WALLET AUDIT LOGS -----------------
+
+@router.get("/wallet-audit-logs")
+async def get_wallet_audit_logs(
+    search: Optional[str] = None,
+    txn_type: Optional[str] = None,
+    limit: int = 100,
+    skip: int = 0,
+    admin_user: User = Depends(require_super_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Returns aggregate wallet system metrics and searchable/filterable transaction audit ledger.
+    Handles negative net values correctly without truncating.
+    """
+    from bson import ObjectId
+
+    # Aggregate total wallet balances across all users
+    user_cursor = db.users.find({"is_dummy": {"$ne": True}})
+    all_users = await user_cursor.to_list(length=2000)
+
+    total_system_balance_paise = 0
+    total_users_count = len(all_users)
+    user_map = {}
+    for u in all_users:
+        u_id = str(u.get("_id", u.get("id")))
+        user_map[u_id] = u
+        bal_paise = int(u.get("inr_balance_paise", 0))
+        if bal_paise == 0 and u.get("inr_balance"):
+            try:
+                bal_paise = int(float(u["inr_balance"]) * 100)
+            except Exception:
+                bal_paise = 0
+        total_system_balance_paise += bal_paise
+
+    # Build ledger query
+    ledger_query: Dict[str, Any] = {"is_dummy": {"$ne": True}}
+    if txn_type and txn_type != "ALL":
+        ledger_query["txn_type"] = txn_type
+
+    if search and search.strip():
+        s = search.strip()
+        matched_user_ids = []
+        for u_id, u in user_map.items():
+            uname = (u.get("username") or "").lower()
+            email = (u.get("email") or "").lower()
+            dname = (u.get("display_name") or "").lower()
+            if s.lower() in uname or s.lower() in email or s.lower() in dname or s in u_id:
+                matched_user_ids.append(u_id)
+
+        search_or: List[Dict[str, Any]] = [
+            {"description": {"$regex": s, "$options": "i"}},
+            {"reference_id": {"$regex": s, "$options": "i"}},
+            {"admin_id": {"$regex": s, "$options": "i"}},
+            {"user_id": {"$regex": s, "$options": "i"}},
+        ]
+        if matched_user_ids:
+            search_or.append({"user_id": {"$in": matched_user_ids}})
+        ledger_query["$or"] = search_or
+
+    total_txns = await db.wallet_ledger.count_documents(ledger_query)
+    cursor = db.wallet_ledger.find(ledger_query).sort("created_at", -1).skip(skip).limit(limit)
+    raw_txns = await cursor.to_list(length=limit)
+
+    txns = []
+    total_credited_paise = 0
+    total_debited_paise = 0
+
+    for t in raw_txns:
+        t_id = str(t.get("_id", t.get("id")))
+        u_id = str(t.get("user_id"))
+        u_info = user_map.get(u_id)
+        amt_paise = t.get("amount_paise", 0)
+        if amt_paise > 0:
+            total_credited_paise += amt_paise
+        else:
+            total_debited_paise += abs(amt_paise)
+
+        txns.append({
+            "id": t_id,
+            "user_id": u_id,
+            "username": u_info.get("username", "Unknown") if u_info else "Unknown",
+            "user_email": u_info.get("email", "") if u_info else "",
+            "txn_type": t.get("txn_type"),
+            "amount_paise": amt_paise,
+            "amount_inr": amt_paise / 100,
+            "balance_before_paise": t.get("balance_before_paise", 0),
+            "balance_before_inr": (t.get("balance_before_paise", 0)) / 100,
+            "balance_after_paise": t.get("balance_after_paise", 0),
+            "balance_after_inr": (t.get("balance_after_paise", 0)) / 100,
+            "reference_id": t.get("reference_id"),
+            "description": t.get("description", ""),
+            "admin_id": t.get("admin_id"),
+            "created_at": str(t.get("created_at")),
+        })
+
+    return {
+        "status": "success",
+        "system_aggregate_balance": total_system_balance_paise / 100,
+        "total_users": total_users_count,
+        "total_transactions": total_txns,
+        "total_credited_inr": total_credited_paise / 100,
+        "total_debited_inr": total_debited_paise / 100,
+        "transactions": txns,
+    }
+
+
+# ----------------- DYNAMIC STAGES & ROUNDS MANAGEMENT -----------------
+
+@router.get("/tournaments/{tournament_id}/stages")
+async def get_tournament_stages(
+    tournament_id: str,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    from bson import ObjectId
+    t_query = {"$or": [{"id": tournament_id}, {"_id": tournament_id}]}
+    if ObjectId.is_valid(tournament_id):
+        t_query["$or"].append({"_id": ObjectId(tournament_id)})
+    t_doc = await db.tournaments.find_one(t_query)
+    if not t_doc:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+
+    tournament = Tournament.from_mongo(t_doc)
+    stages = [s.model_dump() for s in (tournament.stages or [])]
+    stages = sorted(stages, key=lambda s: s.get("stage_order", 0))
+    return {
+        "status": "success",
+        "stages": stages,
+        "live_stream_url": tournament.live_stream_url,
+    }
+
+
+@router.post("/tournaments/{tournament_id}/stages")
+async def create_tournament_stage(
+    tournament_id: str,
+    payload: TournamentStageCreate,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    import uuid
+    from bson import ObjectId
+    t_query = {"$or": [{"id": tournament_id}, {"_id": tournament_id}]}
+    if ObjectId.is_valid(tournament_id):
+        t_query["$or"].append({"_id": ObjectId(tournament_id)})
+    t_doc = await db.tournaments.find_one(t_query)
+    if not t_doc:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+
+    tournament = Tournament.from_mongo(t_doc)
+    stages = tournament.stages or []
+    stage_id = f"stage_{uuid.uuid4().hex[:8]}"
+    stage_order = len(stages) + 1
+
+    new_stage = TournamentStage(
+        stage_id=stage_id,
+        stage_order=stage_order,
+        stage_name=payload.name,
+        stage_format=payload.format,
+        series_format=payload.series_format,
+        advancing_teams_count=payload.advancing_teams_count,
+        status="UPCOMING",
+        rounds=[],
+    )
+
+    await db.tournaments.update_one(
+        {"_id": t_doc["_id"]},
+        {"$push": {"stages": new_stage.to_mongo()}}
+    )
+
+    return {"status": "success", "message": "Stage created successfully", "stage": new_stage.model_dump()}
+
+
+@router.patch("/tournaments/{tournament_id}/stages/{stage_id}")
+async def update_tournament_stage(
+    tournament_id: str,
+    stage_id: str,
+    payload: TournamentStageUpdate,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    from bson import ObjectId
+    t_query = {"$or": [{"id": tournament_id}, {"_id": tournament_id}]}
+    if ObjectId.is_valid(tournament_id):
+        t_query["$or"].append({"_id": ObjectId(tournament_id)})
+    t_doc = await db.tournaments.find_one(t_query)
+    if not t_doc:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+
+    tournament = Tournament.from_mongo(t_doc)
+    stages = tournament.stages or []
+    found = False
+    for s in stages:
+        if s.stage_id == stage_id:
+            found = True
+            if payload.name is not None:
+                s.stage_name = payload.name
+            if payload.format is not None:
+                s.stage_format = payload.format
+            if payload.series_format is not None:
+                s.series_format = payload.series_format
+            if payload.advancing_teams_count is not None:
+                s.advancing_teams_count = payload.advancing_teams_count
+            if payload.status is not None:
+                s.status = payload.status
+            break
+
+    if not found:
+        raise HTTPException(status_code=404, detail="Stage not found")
+
+    await db.tournaments.update_one(
+        {"_id": t_doc["_id"]},
+        {"$set": {"stages": [s.to_mongo() for s in stages]}}
+    )
+
+    return {"status": "success", "message": "Stage updated successfully"}
+
+
+@router.delete("/tournaments/{tournament_id}/stages/{stage_id}")
+async def delete_tournament_stage(
+    tournament_id: str,
+    stage_id: str,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    from bson import ObjectId
+    t_query = {"$or": [{"id": tournament_id}, {"_id": tournament_id}]}
+    if ObjectId.is_valid(tournament_id):
+        t_query["$or"].append({"_id": ObjectId(tournament_id)})
+    t_doc = await db.tournaments.find_one(t_query)
+    if not t_doc:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+
+    tournament = Tournament.from_mongo(t_doc)
+    stages = [s for s in (tournament.stages or []) if s.stage_id != stage_id]
+    for idx, s in enumerate(stages):
+        s.stage_order = idx + 1
+
+    await db.tournaments.update_one(
+        {"_id": t_doc["_id"]},
+        {"$set": {"stages": [s.to_mongo() for s in stages]}}
+    )
+
+    await db.matches.delete_many({
+        "tournament_id": tournament_id,
+        "stage_id": stage_id,
+    })
+
+    return {"status": "success", "message": "Stage and associated matches deleted"}
+
+
+@router.post("/tournaments/{tournament_id}/stages/reorder")
+async def reorder_tournament_stages(
+    tournament_id: str,
+    payload: StageReorderPayload,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    from bson import ObjectId
+    t_query = {"$or": [{"id": tournament_id}, {"_id": tournament_id}]}
+    if ObjectId.is_valid(tournament_id):
+        t_query["$or"].append({"_id": ObjectId(tournament_id)})
+    t_doc = await db.tournaments.find_one(t_query)
+    if not t_doc:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+
+    tournament = Tournament.from_mongo(t_doc)
+    existing_stages = {s.stage_id: s for s in (tournament.stages or [])}
+
+    reordered: List[TournamentStage] = []
+    for idx, s_id in enumerate(payload.stage_ids):
+        if s_id in existing_stages:
+            st = existing_stages[s_id]
+            st.stage_order = idx + 1
+            reordered.append(st)
+
+    for s_id, st in existing_stages.items():
+        if s_id not in payload.stage_ids:
+            st.stage_order = len(reordered) + 1
+            reordered.append(st)
+
+    await db.tournaments.update_one(
+        {"_id": t_doc["_id"]},
+        {"$set": {"stages": [s.to_mongo() for s in reordered]}}
+    )
+
+    return {"status": "success", "message": "Stages reordered successfully"}
+
+
+@router.post("/tournaments/{tournament_id}/stages/{stage_id}/rounds")
+async def create_stage_round(
+    tournament_id: str,
+    stage_id: str,
+    payload: StageRoundCreate,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    import uuid
+    from bson import ObjectId
+    t_query = {"$or": [{"id": tournament_id}, {"_id": tournament_id}]}
+    if ObjectId.is_valid(tournament_id):
+        t_query["$or"].append({"_id": ObjectId(tournament_id)})
+    t_doc = await db.tournaments.find_one(t_query)
+    if not t_doc:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+
+    tournament = Tournament.from_mongo(t_doc)
+    stages = tournament.stages or []
+    target_stage = next((s for s in stages if s.stage_id == stage_id), None)
+    if not target_stage:
+        raise HTTPException(status_code=404, detail="Stage not found")
+
+    rounds = target_stage.rounds or []
+    round_id = f"round_{uuid.uuid4().hex[:8]}"
+    round_order = payload.round_number or (len(rounds) + 1)
+
+    new_round = StageRound(
+        round_id=round_id,
+        round_order=round_order,
+        round_name=payload.name,
+        series_format=payload.series_format or target_stage.series_format or "BO1",
+        scheduled_date=payload.scheduled_date,
+        scheduled_time=payload.scheduled_time,
+        status="UPCOMING",
+    )
+    rounds.append(new_round)
+    target_stage.rounds = rounds
+
+    await db.tournaments.update_one(
+        {"_id": t_doc["_id"]},
+        {"$set": {"stages": [s.to_mongo() for s in stages]}}
+    )
+
+    return {"status": "success", "message": "Round created successfully", "round": new_round.model_dump()}
+
+
+@router.patch("/tournaments/{tournament_id}/stages/{stage_id}/rounds/{round_id}")
+async def update_stage_round(
+    tournament_id: str,
+    stage_id: str,
+    round_id: str,
+    payload: StageRoundUpdate,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    from bson import ObjectId
+    t_query = {"$or": [{"id": tournament_id}, {"_id": tournament_id}]}
+    if ObjectId.is_valid(tournament_id):
+        t_query["$or"].append({"_id": ObjectId(tournament_id)})
+    t_doc = await db.tournaments.find_one(t_query)
+    if not t_doc:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+
+    tournament = Tournament.from_mongo(t_doc)
+    stages = tournament.stages or []
+    target_stage = next((s for s in stages if s.stage_id == stage_id), None)
+    if not target_stage:
+        raise HTTPException(status_code=404, detail="Stage not found")
+
+    target_round = next((r for r in (target_stage.rounds or []) if r.round_id == round_id), None)
+    if not target_round:
+        raise HTTPException(status_code=404, detail="Round not found")
+
+    if payload.name is not None:
+        target_round.round_name = payload.name
+    if payload.status is not None:
+        target_round.status = payload.status
+    if payload.series_format is not None:
+        target_round.series_format = payload.series_format
+    if payload.scheduled_date is not None:
+        target_round.scheduled_date = payload.scheduled_date
+    if payload.scheduled_time is not None:
+        target_round.scheduled_time = payload.scheduled_time
+
+    await db.tournaments.update_one(
+        {"_id": t_doc["_id"]},
+        {"$set": {"stages": [s.to_mongo() for s in stages]}}
+    )
+
+    return {"status": "success", "message": "Round updated successfully"}
+
+
+@router.delete("/tournaments/{tournament_id}/stages/{stage_id}/rounds/{round_id}")
+async def delete_stage_round(
+    tournament_id: str,
+    stage_id: str,
+    round_id: str,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    from bson import ObjectId
+    t_query = {"$or": [{"id": tournament_id}, {"_id": tournament_id}]}
+    if ObjectId.is_valid(tournament_id):
+        t_query["$or"].append({"_id": ObjectId(tournament_id)})
+    t_doc = await db.tournaments.find_one(t_query)
+    if not t_doc:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+
+    tournament = Tournament.from_mongo(t_doc)
+    stages = tournament.stages or []
+    target_stage = next((s for s in stages if s.stage_id == stage_id), None)
+    if not target_stage:
+        raise HTTPException(status_code=404, detail="Stage not found")
+
+    target_stage.rounds = [r for r in (target_stage.rounds or []) if r.round_id != round_id]
+
+    await db.tournaments.update_one(
+        {"_id": t_doc["_id"]},
+        {"$set": {"stages": [s.to_mongo() for s in stages]}}
+    )
+
+    await db.matches.delete_many({
+        "tournament_id": tournament_id,
+        "stage_id": stage_id,
+        "round_id": round_id,
+    })
+
+    return {"status": "success", "message": "Round and its matches deleted"}
+
+
+@router.post("/tournaments/{tournament_id}/stages/{stage_id}/rounds/{round_id}/matches")
+async def create_stage_match(
+    tournament_id: str,
+    stage_id: str,
+    round_id: str,
+    payload: StageMatchCreate,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    from bson import ObjectId
+    import secrets
+    t_query = {"$or": [{"id": tournament_id}, {"_id": tournament_id}]}
+    if ObjectId.is_valid(tournament_id):
+        t_query["$or"].append({"_id": ObjectId(tournament_id)})
+    t_doc = await db.tournaments.find_one(t_query)
+    if not t_doc:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+
+    tournament = Tournament.from_mongo(t_doc)
+    target_stage = next((s for s in (tournament.stages or []) if s.stage_id == stage_id), None)
+    stage_name = target_stage.stage_name if target_stage else "Stage"
+    target_round = next((r for r in (target_stage.rounds or []) if r.round_id == round_id), None) if target_stage else None
+    round_name = target_round.round_name if target_round else "Round"
+    round_order = target_round.round_order if target_round else 1
+
+    match_count = await db.matches.count_documents({
+        "tournament_id": tournament_id,
+        "stage_id": stage_id,
+        "round_id": round_id,
+    })
+    match_number = payload.match_number or (match_count + 1)
+
+    team_a_name = payload.team_a_name
+    if payload.team_a_id and not team_a_name:
+        ta_doc = await db.teams.find_one({"$or": [{"_id": payload.team_a_id}, {"id": payload.team_a_id}]})
+        if ta_doc:
+            team_a_name = ta_doc.get("name")
+
+    team_b_name = payload.team_b_name
+    if payload.team_b_id and not team_b_name:
+        tb_doc = await db.teams.find_one({"$or": [{"_id": payload.team_b_id}, {"id": payload.team_b_id}]})
+        if tb_doc:
+            team_b_name = tb_doc.get("name")
+
+    match_stream = payload.youtube_live_url or tournament.live_stream_url
+
+    new_match = Match(
+        tournament_id=tournament.id,
+        stage_id=stage_id,
+        stage_name=stage_name,
+        round_id=round_id,
+        round_name=round_name,
+        round_number=round_order,
+        match_number=match_number,
+        team_a_id=payload.team_a_id,
+        team_b_id=payload.team_b_id,
+        team_a_name=team_a_name,
+        team_b_name=team_b_name,
+        format=payload.series_format,
+        series_format=payload.series_format,
+        scheduled_date=payload.scheduled_date,
+        scheduled_time=payload.scheduled_time or f"{payload.scheduled_date or ''}",
+        youtube_live_url=match_stream,
+        status="SCHEDULED",
+        server_region=tournament.server_region,
+        lobby_code=f"AMT-M{match_number}",
+        lobby_password=f"AMT-{secrets.token_hex(3).upper()}",
+    )
+
+    await db.matches.insert_one(new_match.to_mongo())
+    return {"status": "success", "message": "Match created", "match": new_match.model_dump()}
+
+
+@router.post("/matches/{match_id}/swap")
+async def swap_teams(
+    match_id: str,
+    payload: Optional[MatchSwapPayload] = None,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    result = await swap_match_teams(match_id, db)
+    return {"status": "success", "message": "Teams swapped successfully", "match": result}
+
+
+@router.get("/matches/{match_id}/advancement-options")
+async def get_match_advancement_options(
+    match_id: str,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    return await calculate_advancement_suggestion(match_id, db)
+
+
+@router.post("/matches/{match_id}/advance")
+async def advance_match_winner_endpoint(
+    match_id: str,
+    payload: MatchAdvancementPayload,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    return await advance_match_winner(match_id, payload.model_dump(), db)
+
+
+@router.post("/matches/{match_id}/revert-advancement")
+async def revert_match_advancement_endpoint(
+    match_id: str,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    return await revert_match_advancement(match_id, db)
+
+
+@router.patch("/tournaments/{tournament_id}/stream")
+async def update_tournament_stream(
+    tournament_id: str,
+    payload: TournamentStreamUpdatePayload,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    from bson import ObjectId
+    t_query = {"$or": [{"id": tournament_id}, {"_id": tournament_id}]}
+    if ObjectId.is_valid(tournament_id):
+        t_query["$or"].append({"_id": ObjectId(tournament_id)})
+
+    res = await db.tournaments.update_one(
+        t_query,
+        {"$set": {"live_stream_url": payload.live_stream_url}}
+    )
+    if res.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+
+    return {
+        "status": "success",
+        "message": "Tournament live stream URL updated",
+        "live_stream_url": payload.live_stream_url
     }
 
 

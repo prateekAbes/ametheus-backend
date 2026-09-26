@@ -97,6 +97,12 @@ class MongoTestSession:
                 col = self.db.notifications
             elif "audit" in cls_name:
                 col = self.db.audit_logs
+            elif "wallet" in cls_name or "ledger" in cls_name:
+                col = self.db.wallet_ledger
+            elif "payment" in cls_name:
+                col = self.db.game_payments
+            elif "payout" in cls_name:
+                col = self.db.payouts
             else:
                 col = self.db.general
 

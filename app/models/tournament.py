@@ -4,12 +4,81 @@ from datetime import datetime
 from pydantic import BaseModel, Field
 from app.models.base import generate_uuid, get_utc_now
 
+class StageRound(BaseModel):
+    id: str = Field(default_factory=generate_uuid)
+    round_id: Optional[str] = None
+    stage_id: Optional[str] = None
+    round_number: int = 1
+    round_order: int = 1
+    name: str = "Round 1"
+    round_name: Optional[str] = None
+    status: str = "UPCOMING"  # UPCOMING, IN_PROGRESS, COMPLETED
+    series_format: str = "BO1"  # Strictly "BO1" or "BO3"
+    scheduled_date: Optional[str] = None
+    scheduled_time: Optional[str] = None
+    match_ids: List[str] = Field(default_factory=list)
+
+    def model_post_init(self, __context: Any) -> None:
+        if not self.round_id:
+            self.round_id = self.id
+        if not self.round_name:
+            self.round_name = self.name
+        if not self.name and self.round_name:
+            self.name = self.round_name
+        if self.round_order == 1 and self.round_number != 1:
+            self.round_order = self.round_number
+        elif self.round_number == 1 and self.round_order != 1:
+            self.round_number = self.round_order
+
+    def to_mongo(self) -> dict:
+        return self.model_dump()
+
+class TournamentStage(BaseModel):
+    id: str = Field(default_factory=generate_uuid)
+    stage_id: Optional[str] = None
+    stage_number: int = 1
+    stage_order: int = 1
+    name: str = "Stage 1"
+    stage_name: Optional[str] = None
+    format: str = "KNOCKOUT"
+    stage_format: Optional[str] = None
+    status: str = "UPCOMING"  # UPCOMING, IN_PROGRESS, COMPLETED, CANCELLED
+    series_format: str = "BO1"  # Strictly "BO1" or "BO3"
+    advancing_teams_count: Optional[int] = None
+    qualified_team_ids: List[str] = Field(default_factory=list)
+    eliminated_team_ids: List[str] = Field(default_factory=list)
+    rounds: List[StageRound] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=get_utc_now)
+    updated_at: datetime = Field(default_factory=get_utc_now)
+
+    def model_post_init(self, __context: Any) -> None:
+        if not self.stage_id:
+            self.stage_id = self.id
+        if not self.stage_name:
+            self.stage_name = self.name
+        if not self.name and self.stage_name:
+            self.name = self.stage_name
+        if not self.stage_format:
+            self.stage_format = self.format
+        if not self.format and self.stage_format:
+            self.format = self.stage_format
+        if self.stage_order == 1 and self.stage_number != 1:
+            self.stage_order = self.stage_number
+        elif self.stage_number == 1 and self.stage_order != 1:
+            self.stage_number = self.stage_order
+
+    def to_mongo(self) -> dict:
+        d = self.model_dump()
+        d["rounds"] = [r if isinstance(r, dict) else r.to_mongo() for r in (self.rounds or [])]
+        return d
+
 class Tournament(BaseModel):
     id: str = Field(default_factory=generate_uuid)
     slug: str
     game_id: str
     organizer_id: Optional[str] = None
     title: str
+    name: Optional[str] = None
     prize_pool_inr: int = 0
     entry_fee_inr: int = 0
     status: str = "REGISTRATION_OPEN"  # COMING_SOON, REGISTRATION_OPEN, REGISTRATION_CLOSED, COMPLETED, CANCELLED
@@ -26,7 +95,10 @@ class Tournament(BaseModel):
     format: str = "Single Elimination"
     tournament_type: str = "Single Elimination"
     match_format: str = "Single Elimination"  # SINGLE_ELIMINATION, DOUBLE_ELIMINATION, CONSOLATION, SINGLE_ROUND_ROBIN, DOUBLE_ROUND_ROBIN, SWISS, LADDER, GROUP_STAGE_KNOCKOUT
-    series_format: str = "BO1"  # BO1, BO3, BO5
+    series_format: str = "BO1"  # Strictly "BO1" or "BO3" (BO5 removed)
+    live_stream_url: Optional[str] = None  # Permanent 1-stream per tournament
+    stages: List[TournamentStage] = Field(default_factory=list)
+    current_stage_id: Optional[str] = None
     stage_formats: dict[str, str] = Field(default_factory=dict)
     registration_deadline: Optional[datetime] = None
     check_in_window_minutes: int = 15
@@ -69,6 +141,11 @@ class Tournament(BaseModel):
         if "_id" in d and "id" not in d:
             d["id"] = str(d.pop("_id"))
 
+        if not d.get("name") and d.get("title"):
+            d["name"] = d["title"]
+        if not d.get("title") and d.get("name"):
+            d["title"] = d["name"]
+
         # Rule 5 & 11: Tournament NEVER has LIVE or ONGOING status. Live belongs strictly to individual matches.
         raw_status = str(d.get("status", "REGISTRATION_OPEN")).upper()
         if raw_status in ["LIVE", "ONGOING", "IN_PROGRESS"]:
@@ -76,7 +153,7 @@ class Tournament(BaseModel):
         elif raw_status in ["UPCOMING", "DRAFT"]:
             d["status"] = "COMING_SOON"
 
-        # Migrate legacy match_format / series_format
+        # Migrate legacy match_format / series_format - BO5 mapped strictly to BO3
         raw_fmt = d.get("match_format") or d.get("format") or "Single Elimination"
         if raw_fmt in ["Best of 1", "BO1"]:
             d["series_format"] = "BO1"
@@ -85,8 +162,12 @@ class Tournament(BaseModel):
             d["series_format"] = "BO3"
             d["match_format"] = d.get("tournament_type") or "Single Elimination"
         elif raw_fmt in ["Best of 5", "BO5"]:
-            d["series_format"] = "BO5"
+            d["series_format"] = "BO3"
             d["match_format"] = d.get("tournament_type") or "Single Elimination"
+
+        # If live_stream_url not set, check youtube_live_url or stream_url
+        if not d.get("live_stream_url"):
+            d["live_stream_url"] = d.get("youtube_live_url") or d.get("stream_url") or None
 
         # Parse legacy JSON strings if migrated from SQL
         for field in ["rules", "schedule", "prizes", "bracket_rounds"]:

@@ -516,3 +516,66 @@ class LeaderboardEntryResponse(BaseModel):
     rank: int = 1
     created_at: Optional[Any] = None
     model_config = ConfigDict(from_attributes=True, extra="allow")
+
+# Stage & Round Schemas
+class TournamentStageCreate(BaseModel):
+    name: str
+    format: str = "KNOCKOUT"  # KNOCKOUT, ROUND_ROBIN, DOUBLE_ROUND_ROBIN, DOUBLE_ELIMINATION, SWISS, GROUP_STAGE
+    series_format: str = "BO1"  # "BO1" or "BO3"
+    advancing_teams_count: Optional[int] = None
+
+class TournamentStageUpdate(BaseModel):
+    name: Optional[str] = None
+    format: Optional[str] = None
+    series_format: Optional[str] = None
+    advancing_teams_count: Optional[int] = None
+    status: Optional[str] = None
+
+class StageReorderPayload(BaseModel):
+    stage_ids: List[str]
+
+class StageRoundCreate(BaseModel):
+    name: str
+    round_number: Optional[int] = None
+    series_format: Optional[str] = "BO1"
+    scheduled_date: Optional[str] = None
+    scheduled_time: Optional[str] = None
+
+class StageRoundUpdate(BaseModel):
+    name: Optional[str] = None
+    status: Optional[str] = None
+    series_format: Optional[str] = None
+    scheduled_date: Optional[str] = None
+    scheduled_time: Optional[str] = None
+
+class StageMatchCreate(BaseModel):
+    team_a_id: Optional[str] = None
+    team_b_id: Optional[str] = None
+    team_a_name: Optional[str] = None
+    team_b_name: Optional[str] = None
+    series_format: str = "BO1"  # "BO1" or "BO3"
+    scheduled_date: Optional[str] = None
+    scheduled_time: Optional[str] = None
+    youtube_live_url: Optional[str] = None
+    match_number: Optional[int] = None
+
+class MatchAdvancementPayload(BaseModel):
+    winner_team_id: Optional[str] = None
+    destination_stage_id: str
+    destination_round_id: str
+    destination_match_id: str
+    destination_slot: str = "team_a"  # "team_a" or "team_b"
+
+class MatchSwapPayload(BaseModel):
+    reason: Optional[str] = None
+
+class TournamentStreamUpdatePayload(BaseModel):
+    live_stream_url: str
+
+class WalletAuditSummaryResponse(BaseModel):
+    total_wallet_pool_inr: float
+    total_money_added_inr: float
+    total_money_spent_inr: float
+    total_transactions: int
+    transactions: List[Dict[str, Any]]
+
