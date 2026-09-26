@@ -389,6 +389,27 @@ class AdminMatchUpdatePayload(BaseModel):
     live_link: Optional[str] = None
     status: Optional[str] = None
 
+class AdminMatchSetupItem(BaseModel):
+    id: Optional[str] = None
+    round_number: int = 1
+    match_number: int = 1
+    stage: str
+    match_type: str = "QUALIFIER"
+    series_format: str = "BO1"
+    team_a_id: Optional[str] = None
+    team_b_id: Optional[str] = None
+    team_a_name: Optional[str] = None
+    team_b_name: Optional[str] = None
+    scheduled_date: Optional[str] = None
+    scheduled_time: Optional[str] = None
+    scheduled_at: Optional[str] = None
+    youtube_live_url: Optional[str] = None
+
+class AdminSaveLiveStructurePayload(BaseModel):
+    match_format: str
+    series_format: str = "BO1"
+    matches: List[AdminMatchSetupItem]
+
 class AdminMarkMatchLivePayload(BaseModel):
     youtube_live_url: str
 

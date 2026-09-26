@@ -21,6 +21,8 @@ from app.schemas import (
     AdminMatchScheduleUpdate,
     AdminMatchStatusUpdate,
     AdminMatchScoreUpdate,
+    AdminMatchSetupItem,
+    AdminSaveLiveStructurePayload,
 )
 from app.services.audit import record_audit_log
 
@@ -1614,9 +1616,12 @@ async def get_tournament_registered_rosters(
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """
-    Rule 8: Retrieve all verified registered teams and player rosters for the selected tournament.
-    Uses existing team and user records (zero duplicate or mock records).
+    Retrieve all verified registered teams and player rosters for the selected tournament.
+    Queries using both string IDs, slugs, and ObjectId, filtering valid non-rejected registrations.
+    Returns normalized teams and rosters with captains and members.
     """
+    from bson import ObjectId
+
     tourn = await db.tournaments.find_one({"$or": [{"_id": id}, {"id": id}, {"slug": id}]})
     if not tourn:
         raise HTTPException(status_code=404, detail="Tournament not found")
@@ -1624,9 +1629,16 @@ async def get_tournament_registered_rosters(
     tid = str(tourn.get("_id", tourn.get("id")))
     tslug = tourn.get("slug", tid)
 
+    tid_query = [tid, tslug]
+    try:
+        if ObjectId.is_valid(tid):
+            tid_query.append(ObjectId(tid))
+    except Exception:
+        pass
+
     reg_cursor = db.tournament_registrations.find({
-        "$or": [{"tournament_id": tid}, {"tournament_id": tslug}],
-        "payment_status": {"$in": ["PAID", "FREE"]}
+        "$or": [{"tournament_id": {"$in": tid_query}}, {"tournament_id": tid}, {"tournament_id": tslug}],
+        "payment_status": {"$nin": ["REJECTED", "CANCELLED", "REFUNDED"]},
     })
     registrations = await reg_cursor.to_list(length=200)
 
@@ -1642,54 +1654,144 @@ async def get_tournament_registered_rosters(
         if m.get("team_b_id"):
             paired_team_ids.add(str(m["team_b_id"]))
 
-    rosters = []
+    teams_list = []
     for reg in registrations:
         team_id = reg.get("team_id")
         player_id = reg.get("player_id") or reg.get("user_id")
 
         if team_id:
-            team_doc = await db.teams.find_one({"$or": [{"_id": team_id}, {"id": team_id}]})
+            team_or = [{"_id": team_id}, {"id": team_id}]
+            try:
+                if ObjectId.is_valid(str(team_id)):
+                    team_or.append({"_id": ObjectId(str(team_id))})
+            except Exception:
+                pass
+            team_doc = await db.teams.find_one({"$or": team_or})
             if team_doc:
                 t_id_str = str(team_doc.get("_id", team_doc.get("id")))
-                members_handles = [
-                    m.get("game_handle", m.get("username", "player"))
-                    if isinstance(m, dict) else getattr(m, "game_handle", "player")
-                    for m in team_doc.get("members", [])
-                ]
-                rosters.append({
+
+                # Captain lookup
+                cap_user = None
+                cap_id = team_doc.get("captain_id")
+                if cap_id:
+                    cap_or = [{"_id": cap_id}, {"id": cap_id}]
+                    try:
+                        if ObjectId.is_valid(str(cap_id)):
+                            cap_or.append({"_id": ObjectId(str(cap_id))})
+                    except Exception:
+                        pass
+                    cap_user = await db.users.find_one({"$or": cap_or})
+
+                cap_username = (
+                    cap_user.get("username")
+                    or cap_user.get("display_name")
+                    or team_doc.get("captain_username", "Captain")
+                    if cap_user
+                    else team_doc.get("captain_username", "Captain")
+                )
+                cap_game_id = cap_user.get("game_id") if cap_user else None
+
+                # Members list
+                members_list = []
+                members_handles = []
+                for m in team_doc.get("members", []):
+                    if isinstance(m, dict):
+                        u_id = str(m.get("user_id", ""))
+                        u_name = m.get("username", "Player")
+                        g_handle = m.get("game_handle", m.get("game_id", ""))
+                        role = m.get("role", "PLAYER")
+                    else:
+                        u_id = str(getattr(m, "user_id", ""))
+                        u_name = getattr(m, "username", "Player")
+                        g_handle = getattr(m, "game_handle", getattr(m, "game_id", ""))
+                        role = getattr(m, "role", "PLAYER")
+                    members_list.append({
+                        "user_id": u_id,
+                        "username": u_name,
+                        "game_id": g_handle,
+                        "role": role,
+                    })
+                    members_handles.append(g_handle or u_name)
+
+                # Ensure captain is listed in members if missing
+                if cap_id and not any(m["user_id"] == str(cap_id) for m in members_list):
+                    members_list.insert(0, {
+                        "user_id": str(cap_id),
+                        "username": cap_username,
+                        "game_id": cap_game_id or cap_username,
+                        "role": "CAPTAIN",
+                    })
+                    members_handles.insert(0, cap_game_id or cap_username)
+
+                entry = {
                     "id": t_id_str,
                     "team_id": t_id_str,
                     "name": team_doc.get("name", "Team"),
+                    "team_name": team_doc.get("name", "Team"),
                     "tag": team_doc.get("tag", "TEAM"),
-                    "captain_username": team_doc.get("captain_username", "Captain"),
-                    "members": members_handles,
+                    "team_tag": team_doc.get("tag", "TEAM"),
+                    "captain": {
+                        "user_id": str(cap_id or ""),
+                        "username": cap_username,
+                        "game_id": cap_game_id,
+                    },
+                    "captain_username": cap_username,
+                    "members": members_list,
+                    "member_handles": members_handles,
                     "is_paired": t_id_str in paired_team_ids,
                     "is_solo": False,
-                })
+                }
+                teams_list.append(entry)
+
         elif player_id:
-            user_doc = await db.users.find_one({"$or": [{"_id": player_id}, {"id": player_id}]})
+            user_or = [{"_id": player_id}, {"id": player_id}]
+            try:
+                if ObjectId.is_valid(str(player_id)):
+                    user_or.append({"_id": ObjectId(str(player_id))})
+            except Exception:
+                pass
+            user_doc = await db.users.find_one({"$or": user_or})
             if user_doc:
                 u_id_str = str(user_doc.get("_id", user_doc.get("id")))
                 p_name = user_doc.get("display_name") or user_doc.get("username", "Contender")
-                rosters.append({
+                g_id = user_doc.get("game_id", "")
+                entry = {
                     "id": u_id_str,
                     "team_id": u_id_str,
                     "name": p_name,
+                    "team_name": p_name,
                     "tag": "SOLO",
+                    "team_tag": "SOLO",
+                    "captain": {
+                        "user_id": u_id_str,
+                        "username": p_name,
+                        "game_id": g_id,
+                    },
                     "captain_username": p_name,
-                    "members": [p_name],
+                    "members": [{
+                        "user_id": u_id_str,
+                        "username": p_name,
+                        "game_id": g_id,
+                        "role": "SOLO",
+                    }],
+                    "member_handles": [p_name],
                     "is_paired": u_id_str in paired_team_ids,
                     "is_solo": True,
-                })
+                }
+                teams_list.append(entry)
 
     return {
         "tournament_id": tid,
         "tournament_title": tourn.get("title"),
         "tournament_status": "REGISTRATION_CLOSED",
+        "game_name": tourn.get("game_name", "Esports"),
+        "game_slug": tourn.get("game_slug", "esports"),
         "match_format": tourn.get("match_format") or tourn.get("tournament_type") or "Single Elimination",
         "series_format": tourn.get("series_format") or "BO1",
-        "total_teams": len(rosters),
-        "rosters": rosters,
+        "total_teams": len(teams_list),
+        "total_registered": len(teams_list),
+        "teams": teams_list,
+        "rosters": teams_list,
     }
 
 @router.post("/tournaments/{id}/generate-match-structure")
@@ -1700,8 +1802,9 @@ async def generate_match_structure_admin(
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """
-    Rules 9 & 10: Generates tournament match structure based on selected tournament format.
-    Does NOT mark tournament as LIVE. Status remains REGISTRATION_CLOSED.
+    Generates complete tournament match structure based on selected competition format.
+    Returns both the bracket hierarchy and a flat list of rich match items ready for bulk review and scheduling.
+    Tournament remains REGISTRATION_CLOSED.
     """
     from app.services.bracket_engine import generate_tournament_bracket
 
@@ -1709,6 +1812,7 @@ async def generate_match_structure_admin(
     if not tourn_doc:
         raise HTTPException(status_code=404, detail="Tournament not found")
 
+    tid = str(tourn_doc.get("_id", tourn_doc.get("id")))
     selected_format = payload.get("match_format") or payload.get("tournament_type") or tourn_doc.get("match_format") or "Single Elimination"
     selected_series = payload.get("series_format") or tourn_doc.get("series_format") or "BO1"
 
@@ -1730,20 +1834,206 @@ async def generate_match_structure_admin(
 
     bracket_res = await generate_tournament_bracket(tourn_obj, db)
 
+    # Fetch all newly generated matches with details
+    saved_matches = await db.matches.find({
+        "$or": [{"tournament_id": tid}, {"tournament_id": tourn_doc.get("slug")}]
+    }).sort([("round_number", 1), ("match_number", 1)]).to_list(length=200)
+
+    # Map team names
+    team_ids_needed = set()
+    for m in saved_matches:
+        if m.get("team_a_id"):
+            team_ids_needed.add(str(m["team_a_id"]))
+        if m.get("team_b_id"):
+            team_ids_needed.add(str(m["team_b_id"]))
+
+    team_map = {}
+    if team_ids_needed:
+        team_docs = await db.teams.find({"$or": [{"_id": {"$in": list(team_ids_needed)}}, {"id": {"$in": list(team_ids_needed)}}]}).to_list(length=200)
+        for td in team_docs:
+            name = td.get("name") or td.get("team_name", "Team")
+            team_map[str(td.get("_id"))] = name
+            if td.get("id"):
+                team_map[str(td.get("id"))] = name
+        user_docs = await db.users.find({"$or": [{"_id": {"$in": list(team_ids_needed)}}, {"id": {"$in": list(team_ids_needed)}}]}).to_list(length=200)
+        for ud in user_docs:
+            u_name = ud.get("display_name") or ud.get("username", "Contender")
+            team_map[str(ud.get("_id"))] = u_name
+            if ud.get("id"):
+                team_map[str(ud.get("id"))] = u_name
+
+    matches_rich = []
+    for m in saved_matches:
+        t_a_id = m.get("team_a_id")
+        t_b_id = m.get("team_b_id")
+        t_a_name = team_map.get(str(t_a_id), f"Team ({t_a_id})") if t_a_id else "TBD"
+        t_b_name = team_map.get(str(t_b_id), f"Team ({t_b_id})") if t_b_id else "TBD"
+
+        matches_rich.append({
+            "id": str(m.get("_id", m.get("id"))),
+            "round_number": m.get("round_number", 1),
+            "match_number": m.get("match_number", 1),
+            "stage": m.get("stage", f"Round {m.get('round_number', 1)} Match {m.get('match_number', 1)}"),
+            "match_type": m.get("match_type", "QUALIFIER"),
+            "series_format": m.get("series_format") or selected_series,
+            "team_a_id": t_a_id,
+            "team_b_id": t_b_id,
+            "team_a_name": t_a_name,
+            "team_b_name": t_b_name,
+            "scheduled_date": m.get("scheduled_date") or "",
+            "scheduled_time": m.get("scheduled_time") or "",
+            "scheduled_at": m.get("scheduled_at") or "",
+            "youtube_live_url": m.get("youtube_live_url") or "",
+            "status": m.get("status", "SCHEDULED"),
+        })
+
     await record_audit_log(
         db=db,
         operator=admin_user.username,
         role=admin_user.role,
         action="GENERATE_MATCH_STRUCTURE",
         target=f"Tournament {tourn_obj.title}",
-        details=f"Format: {selected_format} | Series: {selected_series}",
+        details=f"Format: {selected_format} | Series: {selected_series} | Matches: {len(matches_rich)}",
     )
 
     return {
         "status": "success",
-        "message": f'Successfully generated match structure for "{tourn_obj.title}" ({selected_format})!',
+        "message": f'Successfully generated match structure for "{tourn_obj.title}" ({selected_format}) with {len(matches_rich)} matches!',
         "bracket": bracket_res.get("bracket", []),
+        "matches": matches_rich,
     }
+
+@router.post("/tournaments/{id}/save-live-structure")
+async def save_live_match_structure_admin(
+    id: str,
+    payload: AdminSaveLiveStructurePayload,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Saves the complete live match setup in one atomic operation.
+    Persists all matches as SCHEDULED with per-match YouTube URLs and schedules.
+    Tournament remains REGISTRATION_CLOSED.
+    """
+    import uuid
+    import secrets
+
+    tourn_doc = await db.tournaments.find_one({"$or": [{"_id": id}, {"id": id}, {"slug": id}]})
+    if not tourn_doc:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+
+    tid = str(tourn_doc.get("_id", tourn_doc.get("id")))
+    tslug = tourn_doc.get("slug", tid)
+
+    # Delete existing matches for this tournament to cleanly replace with approved structure
+    await db.matches.delete_many({
+        "$or": [{"tournament_id": tid}, {"tournament_id": tslug}]
+    })
+
+    bracket_rounds_map = {}
+    saved_matches = []
+
+    for idx, item in enumerate(payload.matches, start=1):
+        match_id = item.id or f"match_{uuid.uuid4().hex[:12]}"
+        r_num = item.round_number or 1
+        m_num = item.match_number or idx
+        stage = item.stage or f"Round {r_num} — Match {m_num}"
+        m_type = item.match_type or "QUALIFIER"
+        s_fmt = item.series_format or payload.series_format or "BO1"
+
+        sched_date = item.scheduled_date or ""
+        sched_time = item.scheduled_time or ""
+        sched_combined = f"{sched_date} {sched_time}".strip() or (str(item.scheduled_at) if item.scheduled_at else "") or f"Round {r_num} Match {m_num}"
+
+        parsed_dt = None
+        if item.scheduled_at:
+            try:
+                from datetime import datetime
+                if isinstance(item.scheduled_at, str):
+                    parsed_dt = datetime.fromisoformat(item.scheduled_at.replace("Z", "+00:00"))
+            except Exception:
+                pass
+        if not parsed_dt and sched_date and sched_time:
+            from datetime import datetime
+            for fmt_str in ("%Y-%m-%d %H:%M", "%Y-%m-%d %I:%M %p", "%Y-%m-%d %I:%M%p", "%d %B %Y %I:%M %p"):
+                try:
+                    parsed_dt = datetime.strptime(f"{sched_date} {sched_time}".strip(), fmt_str)
+                    break
+                except Exception:
+                    pass
+
+        db_match = Match(
+            id=match_id,
+            tournament_id=tid,
+            stage=stage,
+            match_type=m_type,
+            round_number=r_num,
+            match_number=m_num,
+            format=s_fmt,
+            series_format=s_fmt,
+            scheduled_time=sched_combined,
+            scheduled_at=parsed_dt,
+            status="SCHEDULED",
+            team_a_id=item.team_a_id,
+            team_b_id=item.team_b_id,
+            youtube_live_url=item.youtube_live_url or None,
+            live_link=item.youtube_live_url or None,
+            server_region=tourn_doc.get("server_region", "Asia (Mumbai)"),
+            lobby_code=f"AMT-R{r_num}M{m_num}",
+            lobby_password=f"AMT-{secrets.token_hex(3).upper()}",
+        )
+        await db.matches.insert_one(db_match.to_mongo())
+        saved_matches.append(db_match.id)
+
+        if r_num not in bracket_rounds_map:
+            bracket_rounds_map[r_num] = {
+                "round_number": r_num,
+                "round_name": f"Round {r_num}",
+                "matches": []
+            }
+        bracket_rounds_map[r_num]["matches"].append({
+            "id": db_match.id,
+            "stage": stage,
+            "match_type": m_type,
+            "series_format": s_fmt,
+            "match_number": m_num,
+            "team_a_id": item.team_a_id,
+            "team_b_id": item.team_b_id,
+            "youtube_live_url": item.youtube_live_url,
+            "scheduled_time": sched_combined,
+            "status": "SCHEDULED",
+        })
+
+    bracket_tree = [bracket_rounds_map[k] for k in sorted(bracket_rounds_map.keys())]
+
+    # Save to tournament
+    await db.tournaments.update_one(
+        {"_id": tourn_doc["_id"]},
+        {"$set": {
+            "match_format": payload.match_format,
+            "tournament_type": payload.match_format,
+            "series_format": payload.series_format,
+            "bracket_rounds": bracket_tree,
+            "status": "REGISTRATION_CLOSED",
+        }}
+    )
+
+    await record_audit_log(
+        db=db,
+        operator=admin_user.username,
+        role=admin_user.role,
+        action="SAVE_LIVE_MATCH_STRUCTURE",
+        target=f"Tournament {tourn_doc.get('title')}",
+        details=f"Saved {len(saved_matches)} matches. Format: {payload.match_format}, Series: {payload.series_format}",
+    )
+
+    return {
+        "status": "success",
+        "message": f"Successfully saved {len(saved_matches)} live matches for {tourn_doc.get('title')}!",
+        "total_matches": len(saved_matches),
+        "bracket_rounds": bracket_tree,
+    }
+
 
 @router.post("/matches")
 async def create_match_admin(

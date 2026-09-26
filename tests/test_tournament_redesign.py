@@ -193,3 +193,62 @@ async def test_tournament_direct_upi_and_admin_workflow(client):
     m_check = await client.get("/api/v1/matches?tournament_id=tourn-test-01")
     assert m_check.json()[0]["status"] == "COMPLETED"
     assert m_check.json()[0]["winner_team_id"] == team_1_id
+
+@pytest.mark.asyncio
+async def test_live_matches_rosters_and_bulk_save(client):
+    headers_admin = make_auth_headers("usr_super_admin")
+
+    # 1. Fetch registered rosters
+    rosters_resp = await client.get("/api/v1/admin/tournaments/tourn-test-01/registered-rosters", headers=headers_admin)
+    assert rosters_resp.status_code == 200
+    r_data = rosters_resp.json()
+    assert "teams" in r_data
+    assert "rosters" in r_data
+    assert len(r_data["teams"]) == 2
+    assert r_data["teams"][0]["team_name"] in ["Team Alpha", "Team Omega"]
+    assert r_data["teams"][0]["captain"]["username"] in ["captain1", "captain2"]
+
+    # 2. Bulk save live match structure
+    save_resp = await client.post(
+        "/api/v1/admin/tournaments/tourn-test-01/save-live-structure",
+        json={
+            "match_format": "Single Elimination",
+            "series_format": "BO3",
+            "matches": [
+                {
+                    "round_number": 1,
+                    "match_number": 1,
+                    "stage": "Championship Grand Final",
+                    "match_type": "GRAND_FINAL",
+                    "series_format": "BO3",
+                    "team_a_id": r_data["teams"][0]["team_id"],
+                    "team_b_id": r_data["teams"][1]["team_id"],
+                    "team_a_name": r_data["teams"][0]["team_name"],
+                    "team_b_name": r_data["teams"][1]["team_name"],
+                    "scheduled_date": "2026-09-27",
+                    "scheduled_time": "10:00 AM",
+                    "youtube_live_url": "https://youtube.com/live/championship-final",
+                }
+            ],
+        },
+        headers=headers_admin,
+    )
+    assert save_resp.status_code == 200
+    assert save_resp.json()["total_matches"] == 1
+
+    # Verify tournament status remains REGISTRATION_CLOSED
+    tourn_check = await client.get("/api/v1/tournaments/valorant-championship-2026")
+    assert tourn_check.json()["status"] == "REGISTRATION_CLOSED"
+    assert tourn_check.json()["match_format"] == "Single Elimination"
+    assert tourn_check.json()["series_format"] == "BO3"
+
+    # Verify matches in DB
+    matches_check = await client.get("/api/v1/matches?tournament_id=tourn-test-01")
+    assert matches_check.status_code == 200
+    m_list = matches_check.json()
+    assert len(m_list) == 1
+    assert m_list[0]["youtube_live_url"] == "https://youtube.com/live/championship-final"
+    assert m_list[0]["match_type"] == "GRAND_FINAL"
+    assert m_list[0]["series_format"] == "BO3"
+    assert m_list[0]["status"] == "SCHEDULED"
+

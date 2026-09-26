@@ -37,9 +37,17 @@ def resolve_stage_format(tournament: Tournament, stage_name: str, r: int, total_
     return "BO3" if r == total_rounds else "BO1"
 
 async def get_contenders(tournament: Tournament, db: AsyncIOMotorDatabase) -> List[str]:
+    from bson import ObjectId
+    tid_query = [tournament.id, tournament.slug]
+    try:
+        if ObjectId.is_valid(str(tournament.id)):
+            tid_query.append(ObjectId(str(tournament.id)))
+    except Exception:
+        pass
+
     reg_cursor = db.tournament_registrations.find({
-        "$or": [{"tournament_id": tournament.id}, {"tournament_id": tournament.slug}],
-        "payment_status": {"$in": ["PAID", "FREE"]},
+        "$or": [{"tournament_id": {"$in": tid_query}}, {"tournament_id": tournament.id}, {"tournament_id": tournament.slug}],
+        "payment_status": {"$nin": ["REJECTED", "CANCELLED", "REFUNDED"]},
     })
     regs = await reg_cursor.to_list(length=200)
     team_ids = [str(r.get("team_id")) for r in regs if r.get("team_id")]
@@ -47,17 +55,33 @@ async def get_contenders(tournament: Tournament, db: AsyncIOMotorDatabase) -> Li
 
     contenders = []
     if team_ids:
-        team_cursor = db.teams.find({"$or": [{"_id": {"$in": team_ids}}, {"id": {"$in": team_ids}}]})
-        team_docs = await team_cursor.to_list(length=200)
-        team_map = {str(t.get("_id", t.get("id"))): t for t in team_docs}
+        team_or = []
         for tid in team_ids:
-            if tid in team_map or tid:
+            team_or.append({"_id": tid})
+            team_or.append({"id": tid})
+            try:
+                if ObjectId.is_valid(tid):
+                    team_or.append({"_id": ObjectId(tid)})
+            except Exception:
+                pass
+        team_cursor = db.teams.find({"$or": team_or}) if team_or else None
+        team_docs = await team_cursor.to_list(length=200) if team_cursor else []
+        team_map = {}
+        for t in team_docs:
+            team_map[str(t.get("_id"))] = t
+            if t.get("id"):
+                team_map[str(t.get("id"))] = t
+        for tid in team_ids:
+            if tid in team_map:
+                contenders.append(str(team_map[tid].get("_id", team_map[tid].get("id"))))
+            else:
                 contenders.append(tid)
     elif solo_ids:
         for uid in solo_ids:
             if uid:
                 contenders.append(uid)
     return contenders
+
 
 # 1. SINGLE ELIMINATION
 async def build_single_elimination_bracket(
