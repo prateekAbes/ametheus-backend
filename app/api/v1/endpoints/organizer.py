@@ -54,6 +54,8 @@ class TournamentCreatePayload(BaseModel):
     announcement_text: Optional[str] = None
     rank_requirement: str = "Open to All Ranks"
     format: str = "Single Elimination Bracket"
+    tournament_type: Optional[str] = "Single Elimination"
+    match_format: Optional[str] = "Best of 1"
     banner_url: Optional[str] = None
     description: str
     rules: List[str] = []
@@ -76,6 +78,8 @@ class TournamentUpdatePayload(BaseModel):
     announcement_text: Optional[str] = None
     rank_requirement: Optional[str] = None
     format: Optional[str] = None
+    tournament_type: Optional[str] = None
+    match_format: Optional[str] = None
     banner_url: Optional[str] = None
     description: Optional[str] = None
     rules: Optional[List[str]] = None
@@ -134,6 +138,8 @@ def serialize_tournament_response(t: dict, game_obj: Optional[dict], reg_count: 
         max_team_size=t.get("max_team_size", 5),
         rank_requirement=t.get("rank_requirement", "Open to All Ranks"),
         format=t.get("format", "Single Elimination Bracket"),
+        tournament_type=t.get("tournament_type", "Single Elimination"),
+        match_format=t.get("match_format", "Best of 1"),
         banner_url=t.get("banner_url", ""),
         badge_color=t.get("badge_color", "#E56A10"),
         description=t.get("description", ""),
@@ -185,6 +191,8 @@ async def create_tournament(
         max_team_size=payload.max_team_size or 5,
         rank_requirement=payload.rank_requirement,
         format=payload.format,
+        tournament_type=payload.tournament_type or "Single Elimination",
+        match_format=payload.match_format or "Best of 1",
         banner_url=banner,
         badge_color=game.get("accent_color", "#E56A10"),
         description=payload.description,
@@ -237,6 +245,10 @@ async def update_tournament(
         update_fields["rank_requirement"] = payload.rank_requirement
     if payload.format is not None:
         update_fields["format"] = payload.format
+    if payload.tournament_type is not None:
+        update_fields["tournament_type"] = payload.tournament_type
+    if payload.match_format is not None:
+        update_fields["match_format"] = payload.match_format
     if payload.banner_url is not None:
         update_fields["banner_url"] = payload.banner_url
     if payload.description is not None:
@@ -274,11 +286,11 @@ async def update_tournament(
 
     # If tournament transitioned to LIVE, ensure bracket matches exist and are LIVE
     if updated_tourn.get("status") in ["LIVE", "ONGOING"]:
-        from app.services.bracket_engine import build_single_elimination_bracket
+        from app.services.bracket_engine import generate_tournament_bracket
         matches_count = await db.matches.count_documents({"$or": [{"tournament_id": tid}, {"tournament_id": tslug}]})
         if matches_count == 0 and reg_count >= 2:
             tourn_obj = Tournament.from_mongo(updated_tourn)
-            await build_single_elimination_bracket(tournament=tourn_obj, db=db)
+            await generate_tournament_bracket(tournament=tourn_obj, db=db)
             updated_tourn = await db.tournaments.find_one({"_id": tourn["_id"]})
         else:
             await db.matches.update_many(
@@ -486,7 +498,7 @@ async def generate_single_elimination_bracket(
     organizer: User = Depends(require_organizer),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
-    from app.services.bracket_engine import build_single_elimination_bracket
+    from app.services.bracket_engine import generate_tournament_bracket
 
     tourn_doc = await db.tournaments.find_one({"$or": [{"_id": id}, {"id": id}, {"slug": id}]})
     if not tourn_doc:
@@ -499,7 +511,7 @@ async def generate_single_elimination_bracket(
     prev_status = tourn_doc.get("status")
 
     tourn_obj = Tournament.from_mongo(tourn_doc)
-    bracket_info = await build_single_elimination_bracket(tournament=tourn_obj, db=db)
+    bracket_info = await generate_tournament_bracket(tournament=tourn_obj, db=db)
 
     tid = str(tourn_doc.get("_id", tourn_doc.get("id")))
     await record_audit_log(

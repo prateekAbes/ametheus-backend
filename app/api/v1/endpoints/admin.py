@@ -121,7 +121,9 @@ async def verify_match_result(
                 detail="Forbidden: You are not assigned to manage this match's tournament (Rule 2.2)",
             )
 
-    winner_team_id = match.team_a_id if (match.score_a or 0) >= (match.score_b or 0) else match.team_b_id
+    winner_team_id = match.winner_team_id
+    if not winner_team_id or winner_team_id not in [match.team_a_id, match.team_b_id]:
+        winner_team_id = match.team_a_id if (match.score_a or 0) >= (match.score_b or 0) else match.team_b_id
 
     from app.services.bracket_engine import advance_bracket_match
     next_match = await advance_bracket_match(
@@ -1045,6 +1047,17 @@ async def complete_payout(
             description=f"Withdrawal to {payout.get('upi_id')} (UTR: {out_utr})",
         )
 
+    from app.services.notification import create_notification
+    amt_inr = payout.get("amount_paise", 0) / 100
+    await create_notification(
+        db=db,
+        user_id=payout["user_id"],
+        title="Payout Processed",
+        message=f"Your payout of ₹{amt_inr:.2f} has been completed via UPI. Reference UTR: {out_utr}.",
+        notification_type="PAYMENT",
+        link="/dashboard",
+    )
+
     await record_audit_log(
         db=db,
         operator=admin_user.username,
@@ -1090,6 +1103,17 @@ async def reject_payout(
             user_id=payout["user_id"],
             amount_paise=payout["amount_paise"],
         )
+
+    from app.services.notification import create_notification
+    amt_inr = payout.get("amount_paise", 0) / 100
+    await create_notification(
+        db=db,
+        user_id=payout["user_id"],
+        title="Payout Request Rejected",
+        message=f"Your withdrawal request of ₹{amt_inr:.2f} was rejected: {payload.rejection_reason}. Reserved funds have been returned to your wallet.",
+        notification_type="PAYMENT",
+        link="/dashboard",
+    )
 
     await record_audit_log(
         db=db,
@@ -1236,9 +1260,13 @@ async def get_live_matches_dashboard(
 
     return {
         "tournaments_ready": ready_tournaments,
+        "ready_for_match_creation": ready_tournaments,
         "scheduled_matches": scheduled_matches,
+        "scheduled": scheduled_matches,
         "live_matches": live_matches,
+        "live_now": live_matches,
         "completed_matches": completed_matches,
+        "completed": completed_matches,
     }
 
 @router.post("/matches/pair")
@@ -1395,6 +1423,34 @@ async def update_match_schedule(
     if update_fields:
         await db.matches.update_one({"_id": match["_id"]}, {"$set": update_fields})
 
+        # Notify affected rosters if time was changed
+        if "scheduled_time" in update_fields or "scheduled_at" in update_fields:
+            from app.services.notification import create_notification
+            notify_users = []
+            for tid in [match.get("team_a_id"), match.get("team_b_id")]:
+                if not tid:
+                    continue
+                team_doc = await db.teams.find_one({"$or": [{"_id": tid}, {"id": tid}]})
+                if team_doc:
+                    if team_doc.get("captain_id"):
+                        notify_users.append(team_doc["captain_id"])
+                    for mem in team_doc.get("members", []):
+                        uid = mem.get("user_id") if isinstance(mem, dict) else getattr(mem, "user_id", None)
+                        if uid:
+                            notify_users.append(uid)
+                else:
+                    notify_users.append(tid)
+
+            for uid in set(notify_users):
+                await create_notification(
+                    db=db,
+                    user_id=uid,
+                    title="Match Rescheduled",
+                    message=f"Your match in {update_fields.get('stage', match.get('stage', 'the tournament'))} has been rescheduled to {update_fields.get('scheduled_time', 'a new time')}.",
+                    notification_type="MATCH",
+                    link="/matches",
+                )
+
     await record_audit_log(
         db=db,
         operator=admin_user.username,
@@ -1506,24 +1562,7 @@ async def update_match_score_admin(
     }
 
 # ----------------- DEVELOPMENT DUMMY DATA CONTROLS -----------------
-
-@router.post("/dev/seed-dummy")
-async def seed_dummy_data_endpoint(
-    admin_user: User = Depends(require_super_admin),
-    db: AsyncIOMotorDatabase = Depends(get_db),
-):
-    from app.seed_dummy import run_seed_dummy
-    result = await run_seed_dummy(db)
-    return {"status": "success", "message": "Dummy data generated successfully", "details": result}
-
-@router.post("/dev/remove-dummy")
-async def remove_dummy_data_endpoint(
-    admin_user: User = Depends(require_super_admin),
-    db: AsyncIOMotorDatabase = Depends(get_db),
-):
-    from app.remove_dummy import run_remove_dummy
-    result = await run_remove_dummy(db)
-    return {"status": "success", "message": "Dummy data removed successfully", "details": result}
+# Removed: Production database contains only authorized competitive entities.
 
 
 

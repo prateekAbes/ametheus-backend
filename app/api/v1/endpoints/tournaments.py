@@ -57,6 +57,14 @@ async def find_tournament_by_id_or_slug(db: AsyncIOMotorDatabase, identifier: st
         # Also match title if the slug looks like a converted title
         title_pattern = re.escape(identifier.replace("-", " "))
         or_clauses.append({"title": {"$regex": f"^{title_pattern}$", "$options": "i"}})
+
+        # Fallback for game-suffixed slugs e.g. free-fire-tournament -> matches free-fire
+        clean_name = identifier.lower().replace("-tournament", "").replace("_tournament", "").strip("-_ ")
+        if clean_name and clean_name != identifier.lower():
+            or_clauses.append({"slug": clean_name})
+            or_clauses.append({"game_slug": clean_name})
+            or_clauses.append({"slug": {"$regex": f"^{re.escape(clean_name)}", "$options": "i"}})
+            or_clauses.append({"title": {"$regex": re.escape(clean_name.replace("-", " ")), "$options": "i"}})
     except Exception:
         pass
 
@@ -461,32 +469,45 @@ async def register_team_for_tournament(
         if existing_reg:
             raise HTTPException(status_code=400, detail="You are already registered for this tournament")
 
-        wallet_txn_id = None
-        if fee_inr > 0:
-            fee_paise = int(round(fee_inr * 100))
-            wallet_txn_id = f"txn_tourn_{uuid.uuid4().hex[:12]}"
-            await debit_wallet_funds(
-                db=db,
-                user_id=current_user.id,
-                amount_paise=fee_paise,
-                txn_type="TOURNAMENT_ENTRY",
-                reference_id=tid,
-                description=f"Solo entry fee: {tourn.get('title', 'Tournament')}",
-            )
-
+        # 1. Insert registration record first (PENDING if paid, FREE if free)
         reg = TournamentRegistration(
             tournament_id=tid,
             player_id=current_user.id,
             payment_method="WALLET" if fee_inr > 0 else "FREE",
-            payment_status="PAID" if fee_inr > 0 else "FREE",
-            wallet_txn_id=wallet_txn_id,
-            order_id=wallet_txn_id or f"reg_{uuid.uuid4().hex[:10]}",
+            payment_status="PENDING_WALLET" if fee_inr > 0 else "FREE",
+            order_id=f"reg_{uuid.uuid4().hex[:10]}",
             check_in_status="PENDING",
         )
         try:
             await db.tournament_registrations.insert_one(reg.to_mongo())
         except DuplicateKeyError:
             raise HTTPException(status_code=400, detail="You are already registered for this tournament")
+
+        # 2. Debit wallet funds if paid
+        wallet_txn_id = None
+        if fee_inr > 0:
+            fee_paise = int(round(fee_inr * 100))
+            wallet_txn_id = f"txn_tourn_{uuid.uuid4().hex[:12]}"
+            try:
+                await debit_wallet_funds(
+                    db=db,
+                    user_id=current_user.id,
+                    amount_paise=fee_paise,
+                    txn_type="TOURNAMENT_ENTRY",
+                    reference_id=reg.id,
+                    description=f"Solo entry fee: {tourn.get('title', 'Tournament')}",
+                )
+                await db.tournament_registrations.update_one(
+                    {"_id": reg.id},
+                    {"$set": {"payment_status": "PAID", "wallet_txn_id": wallet_txn_id, "order_id": wallet_txn_id}}
+                )
+                reg.payment_status = "PAID"
+                reg.wallet_txn_id = wallet_txn_id
+                reg.order_id = wallet_txn_id
+            except Exception as e:
+                # Rollback registration if payment fails
+                await db.tournament_registrations.delete_one({"_id": reg.id})
+                raise e
 
         if reg_count + 1 >= max_teams:
             await db.tournaments.update_one({"_id": tourn["_id"]}, {"$set": {"status": "REGISTRATION_CLOSED"}})
@@ -574,34 +595,45 @@ async def register_team_for_tournament(
     if existing_reg:
         raise HTTPException(status_code=400, detail="Team is already registered for this tournament")
 
-    # 7. Debit entry fee from captain wallet if paid tournament
-    wallet_txn_id = None
-    if fee_inr > 0:
-        fee_paise = int(round(fee_inr * 100))
-        wallet_txn_id = f"txn_tourn_{uuid.uuid4().hex[:12]}"
-        await debit_wallet_funds(
-            db=db,
-            user_id=current_user.id,
-            amount_paise=fee_paise,
-            txn_type="TOURNAMENT_ENTRY",
-            reference_id=tid,
-            description=f"Team entry fee: {tourn.get('title', 'Tournament')} ({team.get('name')})",
-        )
-
-    # 8. Create registration record
+    # 7. Create registration record first (PENDING if paid, FREE if free)
     reg = TournamentRegistration(
         tournament_id=tid,
         team_id=team_id,
         payment_method="WALLET" if fee_inr > 0 else "FREE",
-        payment_status="PAID" if fee_inr > 0 else "FREE",
-        wallet_txn_id=wallet_txn_id,
-        order_id=wallet_txn_id or f"reg_{uuid.uuid4().hex[:10]}",
+        payment_status="PENDING_WALLET" if fee_inr > 0 else "FREE",
+        order_id=f"reg_{uuid.uuid4().hex[:10]}",
         check_in_status="PENDING",
     )
     try:
         await db.tournament_registrations.insert_one(reg.to_mongo())
     except DuplicateKeyError:
         raise HTTPException(status_code=400, detail="Team is already registered for this tournament")
+
+    # 8. Debit entry fee from captain wallet if paid tournament
+    wallet_txn_id = None
+    if fee_inr > 0:
+        fee_paise = int(round(fee_inr * 100))
+        wallet_txn_id = f"txn_tourn_{uuid.uuid4().hex[:12]}"
+        try:
+            await debit_wallet_funds(
+                db=db,
+                user_id=current_user.id,
+                amount_paise=fee_paise,
+                txn_type="TOURNAMENT_ENTRY",
+                reference_id=reg.id,
+                description=f"Team entry fee: {tourn.get('title', 'Tournament')} ({team.get('name')})",
+            )
+            await db.tournament_registrations.update_one(
+                {"_id": reg.id},
+                {"$set": {"payment_status": "PAID", "wallet_txn_id": wallet_txn_id, "order_id": wallet_txn_id}}
+            )
+            reg.payment_status = "PAID"
+            reg.wallet_txn_id = wallet_txn_id
+            reg.order_id = wallet_txn_id
+        except Exception as e:
+            # Rollback registration if payment fails
+            await db.tournament_registrations.delete_one({"_id": reg.id})
+            raise e
 
     if reg_count + 1 >= max_teams:
         await db.tournaments.update_one({"_id": tourn["_id"]}, {"$set": {"status": "REGISTRATION_CLOSED"}})
@@ -880,16 +912,25 @@ async def submit_tournament_upi_utr(
         "$or": [{"_id": {"$ne": payment["_id"]}}, {"id": {"$ne": payment.get("id")}}]
     })
     if existing_utr:
-        raise HTTPException(status_code=400, detail="This UPI Transaction ID / UTR has already been submitted for another payment.")
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This UPI Transaction ID / UTR has already been submitted for another payment.",
+        )
 
-    await db.game_payments.update_one(
-        {"_id": payment["_id"]},
-        {"$set": {
-            "utr": clean_utr,
-            "screenshot_url": payload.screenshot_url,
-            "status": "PENDING",
-        }}
-    )
+    try:
+        await db.game_payments.update_one(
+            {"_id": payment["_id"]},
+            {"$set": {
+                "utr": clean_utr,
+                "screenshot_url": payload.screenshot_url,
+                "status": "PENDING",
+            }}
+        )
+    except DuplicateKeyError:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This UPI Transaction ID / UTR has already been submitted for another payment.",
+        )
 
     reg_id = payment.get("registration_id")
     if reg_id:

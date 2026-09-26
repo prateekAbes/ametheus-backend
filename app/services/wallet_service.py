@@ -93,6 +93,16 @@ async def debit_wallet_funds(
     if not user:
         raise HTTPException(status_code=404, detail="User account not found")
 
+    # Idempotency check: if transaction already processed for this reference, do not debit twice
+    if reference_id:
+        existing_txn = await db.wallet_ledger.find_one({
+            "user_id": user_id,
+            "reference_id": reference_id,
+            "txn_type": txn_type,
+        })
+        if existing_txn:
+            return int(user.get("inr_balance_paise", 0))
+
     current_avail = int(user.get("inr_balance_paise", 0))
     if current_avail == 0 and user.get("inr_balance"):
         try:

@@ -95,7 +95,14 @@ async def list_games(
 
 @router.get("/{slug}", response_model=GameResponse)
 async def get_game_by_slug(slug: str, db: AsyncIOMotorDatabase = Depends(get_db)):
-    g = await db.games.find_one({"$or": [{"slug": slug}, {"_id": slug}, {"id": slug}]})
+    from bson import ObjectId
+    or_clauses = [{"slug": slug}, {"slug": slug.lower()}, {"_id": slug}, {"id": slug}]
+    if ObjectId.is_valid(slug):
+        try:
+            or_clauses.append({"_id": ObjectId(slug)})
+        except Exception:
+            pass
+    g = await db.games.find_one({"$or": or_clauses})
     if not g:
         raise HTTPException(status_code=404, detail="Game not found")
     

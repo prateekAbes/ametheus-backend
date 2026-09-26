@@ -64,8 +64,13 @@ EXEMPT_PATHS = {
 async def rate_limit_and_logging_middleware(request: Request, call_next):
     path = request.url.path
 
+    # Security check: Block probes for .git, .env, etc.
+    lower_path = path.lower()
+    if "/.git" in lower_path or "/.env" in lower_path or lower_path.endswith((".git", ".env", ".yaml", ".yml")):
+        return JSONResponse(status_code=404, content={"detail": "Not Found"})
+
     # Rate Limiting Check (exempt health, docs, openapi, and WebSocket paths)
-    if path not in EXEMPT_PATHS and not path.startswith("/ws/"):
+    if path not in EXEMPT_PATHS and not path.startswith("/ws/") and not path.startswith(f"{settings.API_V1_STR}/ws/"):
         forwarded_for = request.headers.get("x-forwarded-for")
         if forwarded_for:
             client_ip = forwarded_for.split(",")[0].strip()
@@ -157,9 +162,11 @@ async def trigger_seed():
 
 
 @app.websocket("/ws/ticker")
+@app.websocket(f"{settings.API_V1_STR}/ws/ticker")
 async def websocket_match_ticker(websocket: WebSocket):
     """
     Real-time live match ticker WebSocket broadcast.
+    Available on both /ws/ticker and /api/v1/ws/ticker.
     """
     await ws_manager.connect(websocket)
     try:
