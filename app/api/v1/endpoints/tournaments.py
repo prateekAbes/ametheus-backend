@@ -2,14 +2,28 @@ import json
 import re
 import uuid
 from typing import List, Optional
+from datetime import datetime, timezone
+from pymongo.errors import DuplicateKeyError
 from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, status
 from motor.motor_asyncio import AsyncIOMotorDatabase
-from app.api.deps import get_db, get_current_user
+from app.api.deps import get_db, get_current_user, require_organizer
 from app.models.user import User
 from app.models.tournament import Tournament, TournamentRegistration
-from app.schemas import TournamentResponse, TournamentRegisterRequest, MatchResponse
+from app.models.payment import GamePayment
+from app.schemas import (
+    TournamentResponse,
+    TournamentRegisterRequest,
+    MatchResponse,
+    TournamentRegisterUpiResponse,
+    SubmitTournamentUtrRequest,
+    TournamentRegistrationStatusResponse,
+    TournamentStageFormatsUpdate,
+)
 from app.services.wallet_service import debit_wallet_funds
+from app.services.upi_service import get_next_active_upi_account, build_upi_payment_uri
+from app.services.audit import record_audit_log
+from app.services.notification import create_notification
 
 router = APIRouter()
 
@@ -105,6 +119,11 @@ async def list_tournaments(
                 max_team_size=t.get("max_team_size", 5),
                 rank_requirement=t.get("rank_requirement", "Open to All Ranks"),
                 format=t.get("format", "Single Elimination Bracket"),
+                tournament_type=t.get("tournament_type", "Single Elimination"),
+                match_format=t.get("match_format", "Best of 1"),
+                stage_formats=safe_json_loads(t.get("stage_formats"), {}),
+                registration_deadline=t.get("registration_deadline").isoformat() if isinstance(t.get("registration_deadline"), datetime) else t.get("registration_deadline"),
+                check_in_window_minutes=t.get("check_in_window_minutes", 15),
                 banner_url=t.get("banner_url") or "https://images.unsplash.com/photo-1542751371-adc38448a05e?q=80&w=1200",
                 badge_color=t.get("badge_color", "#E56A10"),
                 description=t.get("description", ""),
@@ -300,6 +319,11 @@ async def get_tournament_by_slug(slug: str, db: AsyncIOMotorDatabase = Depends(g
         max_team_size=max_team_size,
         rank_requirement=t.get("rank_requirement", "Open to All Ranks"),
         format=t.get("format", "Single Elimination Bracket"),
+        tournament_type=t.get("tournament_type", "Single Elimination"),
+        match_format=t.get("match_format", "Best of 1"),
+        stage_formats=safe_json_loads(t.get("stage_formats"), {}),
+        registration_deadline=t.get("registration_deadline").isoformat() if isinstance(t.get("registration_deadline"), datetime) else t.get("registration_deadline"),
+        check_in_window_minutes=t.get("check_in_window_minutes", 15),
         banner_url=t.get("banner_url") or "https://images.unsplash.com/photo-1542751371-adc38448a05e?q=80&w=1200",
         badge_color=t.get("badge_color", "#E56A10"),
         description=t.get("description", ""),
@@ -385,13 +409,37 @@ async def register_team_for_tournament(
             detail=f"Registration is not open for this tournament (current status: {tourn.get('status')})",
         )
 
+    # 1b. Registration deadline check
+    reg_deadline = tourn.get("registration_deadline")
+    if reg_deadline:
+        try:
+            if isinstance(reg_deadline, str):
+                reg_deadline_dt = datetime.fromisoformat(reg_deadline.replace("Z", "+00:00"))
+            else:
+                reg_deadline_dt = reg_deadline
+            now_utc = datetime.now(timezone.utc)
+            if reg_deadline_dt.tzinfo is None:
+                reg_deadline_dt = reg_deadline_dt.replace(tzinfo=timezone.utc)
+            if now_utc > reg_deadline_dt:
+                await db.tournaments.update_one({"_id": tourn["_id"]}, {"$set": {"status": "REGISTRATION_CLOSED"}})
+                raise HTTPException(
+                    status_code=400,
+                    detail="Registration deadline for this tournament has passed.",
+                )
+        except HTTPException:
+            raise
+        except Exception:
+            pass
+
     # 2. Capacity check
     reg_count = await db.tournament_registrations.count_documents({
-        "$or": [{"tournament_id": tid}, {"tournament_id": tourn.get("slug")}]
+        "$or": [{"tournament_id": tid}, {"tournament_id": tourn.get("slug")}],
+        "payment_status": {"$ne": "REJECTED"}
     })
 
     max_teams = tourn.get("max_teams", 16)
     if reg_count >= max_teams:
+        await db.tournaments.update_one({"_id": tourn["_id"]}, {"$set": {"status": "REGISTRATION_CLOSED"}})
         raise HTTPException(
             status_code=400,
             detail=f"Tournament capacity of {max_teams} teams has been reached",
@@ -408,6 +456,7 @@ async def register_team_for_tournament(
         existing_reg = await db.tournament_registrations.find_one({
             "tournament_id": tid,
             "player_id": current_user.id,
+            "payment_status": {"$ne": "REJECTED"}
         })
         if existing_reg:
             raise HTTPException(status_code=400, detail="You are already registered for this tournament")
@@ -428,14 +477,20 @@ async def register_team_for_tournament(
         reg = TournamentRegistration(
             tournament_id=tid,
             player_id=current_user.id,
+            payment_method="WALLET" if fee_inr > 0 else "FREE",
             payment_status="PAID" if fee_inr > 0 else "FREE",
             wallet_txn_id=wallet_txn_id,
             order_id=wallet_txn_id or f"reg_{uuid.uuid4().hex[:10]}",
             check_in_status="PENDING",
         )
-        await db.tournament_registrations.insert_one(reg.to_mongo())
+        try:
+            await db.tournament_registrations.insert_one(reg.to_mongo())
+        except DuplicateKeyError:
+            raise HTTPException(status_code=400, detail="You are already registered for this tournament")
 
-        from app.services.notification import create_notification
+        if reg_count + 1 >= max_teams:
+            await db.tournaments.update_one({"_id": tourn["_id"]}, {"$set": {"status": "REGISTRATION_CLOSED"}})
+
         await create_notification(
             db=db,
             user_id=current_user.id,
@@ -474,13 +529,18 @@ async def register_team_for_tournament(
         )
 
     # 5. Game discipline match
-    if team.get("game_id") != tourn.get("game_id"):
+    valid_game_ids = {str(tourn.get("game_id"))}
+    if game_obj:
+        for k in ("_id", "id", "slug"):
+            if game_obj.get(k):
+                valid_game_ids.add(str(game_obj.get(k)))
+    if str(team.get("game_id")) not in valid_game_ids:
         raise HTTPException(
             status_code=400,
             detail="Your team is registered for a different competitive title than this tournament",
         )
 
-    # 5b. Roster bounds check (Requirement 2 & 3: Tournament defines its own required team size)
+    # 5b. Roster bounds check
     tourn_min = tourn.get("min_team_size") or tourn.get("required_team_size")
     min_size = int(tourn_min) if tourn_min is not None else 1
 
@@ -489,7 +549,6 @@ async def register_team_for_tournament(
 
     members = team.get("members", [])
     members_count = len(members)
-    # If the team was created with a captain_id and members list doesn't include the captain, ensure captain counts
     cap_id = team.get("captain_id")
     if cap_id and not any((m.get("user_id") if isinstance(m, dict) else getattr(m, "user_id", None)) == cap_id for m in members):
         members_count += 1
@@ -509,12 +568,13 @@ async def register_team_for_tournament(
     existing_reg = await db.tournament_registrations.find_one({
         "tournament_id": tid,
         "team_id": team_id,
+        "payment_status": {"$ne": "REJECTED"}
     })
 
     if existing_reg:
         raise HTTPException(status_code=400, detail="Team is already registered for this tournament")
 
-    # 7. Debit entry fee from captain wallet if paid tournament (Requirement 24, 25, 40)
+    # 7. Debit entry fee from captain wallet if paid tournament
     wallet_txn_id = None
     if fee_inr > 0:
         fee_paise = int(round(fee_inr * 100))
@@ -532,14 +592,20 @@ async def register_team_for_tournament(
     reg = TournamentRegistration(
         tournament_id=tid,
         team_id=team_id,
+        payment_method="WALLET" if fee_inr > 0 else "FREE",
         payment_status="PAID" if fee_inr > 0 else "FREE",
         wallet_txn_id=wallet_txn_id,
         order_id=wallet_txn_id or f"reg_{uuid.uuid4().hex[:10]}",
         check_in_status="PENDING",
     )
-    await db.tournament_registrations.insert_one(reg.to_mongo())
+    try:
+        await db.tournament_registrations.insert_one(reg.to_mongo())
+    except DuplicateKeyError:
+        raise HTTPException(status_code=400, detail="Team is already registered for this tournament")
 
-    from app.services.notification import create_notification
+    if reg_count + 1 >= max_teams:
+        await db.tournaments.update_one({"_id": tourn["_id"]}, {"$set": {"status": "REGISTRATION_CLOSED"}})
+
     await create_notification(
         db=db,
         user_id=current_user.id,
@@ -558,4 +624,340 @@ async def register_team_for_tournament(
         "order_id": reg.order_id,
         "entry_fee_inr": fee_inr,
     }
+
+@router.get("/{id}/registration-status", response_model=TournamentRegistrationStatusResponse)
+async def get_registration_status(
+    id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Returns whether current user (or user's teams) is currently registered for the tournament.
+    """
+    tourn = await find_tournament_by_id_or_slug(db, id)
+    if not tourn:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+
+    tid = str(tourn.get("_id", tourn.get("id")))
+
+    # 1. Check solo registration
+    solo_reg = await db.tournament_registrations.find_one({
+        "tournament_id": tid,
+        "player_id": current_user.id,
+        "payment_status": {"$ne": "REJECTED"}
+    })
+    if solo_reg:
+        solo_reg["id"] = str(solo_reg.get("_id", solo_reg.get("id")))
+        solo_reg.pop("_id", None)
+        return TournamentRegistrationStatusResponse(is_registered=True, registration=solo_reg)
+
+    # 2. Check teams where user is captain or member
+    user_teams_cursor = db.teams.find({
+        "$or": [
+            {"captain_id": current_user.id},
+            {"members.user_id": current_user.id},
+        ]
+    })
+    user_teams = await user_teams_cursor.to_list(length=50)
+    team_ids = [str(t.get("_id", t.get("id"))) for t in user_teams]
+
+    if team_ids:
+        team_reg = await db.tournament_registrations.find_one({
+            "tournament_id": tid,
+            "team_id": {"$in": team_ids},
+            "payment_status": {"$ne": "REJECTED"}
+        })
+        if team_reg:
+            team_reg["id"] = str(team_reg.get("_id", team_reg.get("id")))
+            team_reg.pop("_id", None)
+            return TournamentRegistrationStatusResponse(is_registered=True, registration=team_reg)
+
+    return TournamentRegistrationStatusResponse(is_registered=False, registration=None)
+
+@router.post("/{id}/register-upi", response_model=TournamentRegisterUpiResponse)
+async def register_tournament_direct_upi(
+    id: str,
+    payload: TournamentRegisterRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Direct UPI Tournament Registration Flow:
+    1. Validates tournament status, deadline, and capacity.
+    2. Validates team requirements (or solo player).
+    3. Fetches active rotating platform UPI account.
+    4. Creates TournamentRegistration with PENDING_VERIFICATION.
+    5. Creates GamePayment with TOURNAMENT_ENTRY and INITIATED status.
+    6. Returns UPI ID, QR code and payee details for user transfer.
+    """
+    tourn = await find_tournament_by_id_or_slug(db, id)
+    if not tourn:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+
+    tid = str(tourn.get("_id", tourn.get("id")))
+
+    if tourn.get("status") != "REGISTRATION_OPEN":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Registration is not open for this tournament (current status: {tourn.get('status')})",
+        )
+
+    # Check deadline
+    reg_deadline = tourn.get("registration_deadline")
+    if reg_deadline:
+        try:
+            reg_deadline_dt = datetime.fromisoformat(reg_deadline.replace("Z", "+00:00")) if isinstance(reg_deadline, str) else reg_deadline
+            now_utc = datetime.now(timezone.utc)
+            if reg_deadline_dt.tzinfo is None:
+                reg_deadline_dt = reg_deadline_dt.replace(tzinfo=timezone.utc)
+            if now_utc > reg_deadline_dt:
+                await db.tournaments.update_one({"_id": tourn["_id"]}, {"$set": {"status": "REGISTRATION_CLOSED"}})
+                raise HTTPException(status_code=400, detail="Registration deadline has passed")
+        except HTTPException:
+            raise
+        except Exception:
+            pass
+
+    # Capacity check
+    reg_count = await db.tournament_registrations.count_documents({
+        "$or": [{"tournament_id": tid}, {"tournament_id": tourn.get("slug")}],
+        "payment_status": {"$ne": "REJECTED"}
+    })
+    max_teams = tourn.get("max_teams", 16)
+    if reg_count >= max_teams:
+        await db.tournaments.update_one({"_id": tourn["_id"]}, {"$set": {"status": "REGISTRATION_CLOSED"}})
+        raise HTTPException(status_code=400, detail=f"Tournament capacity of {max_teams} teams has been reached")
+
+    fee_inr = tourn.get("entry_fee_inr", 0)
+    fee_paise = int(round(fee_inr * 100))
+
+    gid = tourn.get("game_id")
+    game_obj = await db.games.find_one({"$or": [{"_id": gid}, {"id": gid}, {"slug": gid}]})
+    is_solo_game = bool(game_obj and (not game_obj.get("is_team_game", True) or game_obj.get("slug") == "chess"))
+
+    team_id = None
+    team_name = None
+
+    if payload.team_id:
+        if is_solo_game:
+            raise HTTPException(status_code=400, detail=f"{game_obj.get('name', 'Chess')} is a solo 1v1 discipline.")
+        team = await db.teams.find_one({"$or": [{"_id": payload.team_id}, {"id": payload.team_id}]})
+        if not team:
+            raise HTTPException(status_code=404, detail="Team not found")
+        if team.get("captain_id") != current_user.id:
+            raise HTTPException(status_code=403, detail="Only verified team captain can register this team")
+        team_id = str(team.get("_id", team.get("id")))
+        team_name = team.get("name")
+
+        valid_game_ids = {str(tourn.get("game_id"))}
+        if game_obj:
+            for k in ("_id", "id", "slug"):
+                if game_obj.get(k):
+                    valid_game_ids.add(str(game_obj.get(k)))
+        if str(team.get("game_id")) not in valid_game_ids:
+            raise HTTPException(
+                status_code=400,
+                detail="Your team is registered for a different competitive title than this tournament",
+            )
+
+        existing_reg = await db.tournament_registrations.find_one({
+            "tournament_id": tid,
+            "team_id": team_id,
+            "payment_status": {"$ne": "REJECTED"}
+        })
+        if existing_reg:
+            raise HTTPException(status_code=400, detail="Team is already registered for this tournament")
+    else:
+        existing_reg = await db.tournament_registrations.find_one({
+            "tournament_id": tid,
+            "player_id": current_user.id,
+            "payment_status": {"$ne": "REJECTED"}
+        })
+        if existing_reg:
+            raise HTTPException(status_code=400, detail="You are already registered for this tournament")
+
+    # Fetch active rotating admin UPI account
+    upi_account = await get_next_active_upi_account(db)
+    if not upi_account:
+        raise HTTPException(
+            status_code=503,
+            detail="No active platform UPI payment accounts currently available. Please use wallet balance or contact support.",
+        )
+
+    upi_id_str = upi_account.get("upi_id")
+    payee_name_str = upi_account.get("payee_name", "Ametheus Esports")
+    account_code_str = upi_account.get("code", "UPI001")
+    account_id_str = str(upi_account.get("_id", upi_account.get("id")))
+    qr_url_str = upi_account.get("qr_url")
+
+    upi_uri = build_upi_payment_uri(
+        upi_id=upi_id_str,
+        payee_name=payee_name_str,
+        amount_inr=float(fee_inr),
+        note=f"Tournament entry fee: {tourn.get('title', 'Tournament')[:25]}",
+    )
+
+    reg = TournamentRegistration(
+        tournament_id=tid,
+        team_id=team_id,
+        player_id=current_user.id if not team_id else None,
+        payment_method="UPI",
+        payment_status="PENDING_VERIFICATION",
+        check_in_status="PENDING",
+        order_id=f"upi_tourn_{uuid.uuid4().hex[:10]}",
+    )
+    try:
+        await db.tournament_registrations.insert_one(reg.to_mongo())
+    except DuplicateKeyError:
+        raise HTTPException(status_code=400, detail="Already registered for this tournament")
+
+    payment = GamePayment(
+        payment_type="TOURNAMENT_ENTRY",
+        user_id=current_user.id,
+        game_id=tourn.get("game_id"),
+        game_name=tourn.get("title"),
+        tournament_id=tid,
+        registration_id=reg.id,
+        team_id=team_id,
+        team_name=team_name,
+        amount_paise=fee_paise,
+        amount_inr=float(fee_inr),
+        payment_method="UPI",
+        payment_account_id=account_id_str,
+        payment_account_code=account_code_str,
+        upi_id=upi_id_str,
+        payee_name=payee_name_str,
+        qr_url=qr_url_str,
+        upi_uri=upi_uri,
+        status="INITIATED",
+    )
+    await db.game_payments.insert_one(payment.to_mongo())
+
+    # Link payment to registration
+    await db.tournament_registrations.update_one(
+        {"_id": reg.id},
+        {"$set": {"payment_id": payment.id}}
+    )
+
+    return TournamentRegisterUpiResponse(
+        payment_id=payment.id,
+        registration_id=reg.id,
+        tournament_id=tid,
+        tournament_title=tourn.get("title", "Tournament"),
+        amount_inr=float(fee_inr),
+        amount_paise=fee_paise,
+        account_code=account_code_str,
+        upi_id=upi_id_str,
+        payee_name=payee_name_str,
+        qr_url=qr_url_str,
+        upi_uri=upi_uri,
+        status="INITIATED",
+    )
+
+@router.post("/{id}/submit-upi-utr")
+async def submit_tournament_upi_utr(
+    id: str,
+    payload: SubmitTournamentUtrRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Submits 12-digit UTR reference for direct UPI tournament registration.
+    """
+    payment = await db.game_payments.find_one({"$or": [{"_id": payload.payment_id}, {"id": payload.payment_id}]})
+    if not payment:
+        raise HTTPException(status_code=404, detail="Payment record not found")
+
+    if payment.get("user_id") != current_user.id and current_user.role != "SUPER_ADMIN":
+        raise HTTPException(status_code=403, detail="Not authorized to submit UTR for this payment")
+
+    clean_utr = payload.utr.strip()
+    if len(clean_utr) < 6:
+        raise HTTPException(status_code=400, detail="Invalid UPI Transaction ID / UTR. Must be at least 6 characters.")
+
+    existing_utr = await db.game_payments.find_one({
+        "utr": clean_utr,
+        "$or": [{"_id": {"$ne": payment["_id"]}}, {"id": {"$ne": payment.get("id")}}]
+    })
+    if existing_utr:
+        raise HTTPException(status_code=400, detail="This UPI Transaction ID / UTR has already been submitted for another payment.")
+
+    await db.game_payments.update_one(
+        {"_id": payment["_id"]},
+        {"$set": {
+            "utr": clean_utr,
+            "screenshot_url": payload.screenshot_url,
+            "status": "PENDING",
+        }}
+    )
+
+    reg_id = payment.get("registration_id")
+    if reg_id:
+        await db.tournament_registrations.update_one(
+            {"$or": [{"_id": reg_id}, {"id": reg_id}]},
+            {"$set": {"utr": clean_utr, "payment_status": "PENDING_VERIFICATION"}}
+        )
+
+    await record_audit_log(
+        db=db,
+        operator=current_user.username,
+        role=current_user.role,
+        action="SUBMIT_TOURNAMENT_UTR",
+        target=f"Payment {payment.get('id')} / Tourn {id}",
+        details=f"Submitted UTR {clean_utr}",
+    )
+
+    await create_notification(
+        db=db,
+        user_id=current_user.id,
+        title="Tournament UPI Payment Submitted",
+        message=f"UTR {clean_utr} submitted for tournament registration. Slot held pending admin verification.",
+        notification_type="PAYMENT",
+        link=f"/tournaments/{id}",
+    )
+
+    return {
+        "status": "PENDING",
+        "message": "Payment UTR submitted successfully. Awaiting admin verification.",
+        "payment_id": payload.payment_id,
+        "utr": clean_utr,
+    }
+
+@router.patch("/admin/tournaments/{id}/stage-formats")
+async def update_tournament_stage_formats(
+    id: str,
+    payload: TournamentStageFormatsUpdate,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Configures tournament_type, match_format, stage_formats, and registration_deadline.
+    """
+    tourn = await find_tournament_by_id_or_slug(db, id)
+    if not tourn:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+
+    update_fields = {}
+    if payload.tournament_type:
+        update_fields["tournament_type"] = payload.tournament_type
+    if payload.match_format:
+        update_fields["match_format"] = payload.match_format
+    if payload.stage_formats is not None:
+        update_fields["stage_formats"] = payload.stage_formats
+    if payload.registration_deadline is not None:
+        update_fields["registration_deadline"] = payload.registration_deadline
+
+    if update_fields:
+        await db.tournaments.update_one({"_id": tourn["_id"]}, {"$set": update_fields})
+
+    await record_audit_log(
+        db=db,
+        operator=admin_user.username,
+        role=admin_user.role,
+        action="UPDATE_TOURNAMENT_STAGE_FORMATS",
+        target=f"Tournament {id}",
+        details=str(update_fields),
+    )
+
+    return {"status": "success", "message": "Tournament stage formats updated successfully", "updated": update_fields}
 

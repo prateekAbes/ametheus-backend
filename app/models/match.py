@@ -10,14 +10,18 @@ class Match(BaseModel):
     round_number: int = 1
     match_number: int = 1
     format: str = "Best of 3"
-    scheduled_time: str
-    status: str = "CHECK_IN_OPEN"  # CHECK_IN_OPEN, LIVE, PENDING_VERIFICATION, DISPUTED, COMPLETED
+    scheduled_at: Optional[datetime] = None  # Authoritative ISO UTC timestamp
+    scheduled_time: str = "TBD"
+    live_link: Optional[str] = None  # Live stream URL (YouTube, Twitch, Kick, etc.)
+    order: int = 0
+    status: str = "SCHEDULED"  # DRAFT, SCHEDULED, CHECK_IN_OPEN, LIVE, PENDING_VERIFICATION, DISPUTED, COMPLETED, CANCELLED
 
     team_a_id: Optional[str] = None
     team_b_id: Optional[str] = None
     score_a: Optional[int] = None
     score_b: Optional[int] = None
     winner_team_id: Optional[str] = None
+    check_in_status: dict[str, bool] = Field(default_factory=lambda: {"team_a": False, "team_b": False})
 
     server_region: str = "AWS Mumbai (ap-south-1)"
     lobby_code: str

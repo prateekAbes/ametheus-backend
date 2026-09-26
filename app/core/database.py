@@ -114,8 +114,16 @@ async def init_db_indexes(db: AsyncIOMotorDatabase):
         await db.game_payments.create_index("user_id")
         await db.game_payments.create_index("game_id")
         await db.game_payments.create_index("team_id")
+        await db.game_payments.create_index("tournament_id")
+        await db.game_payments.create_index("registration_id")
         await db.game_payments.create_index("payment_account_code")
         await db.game_payments.create_index("is_dummy")
+
+        # Matches
+        await db.matches.create_index("tournament_id")
+        await db.matches.create_index("status")
+        await db.matches.create_index("scheduled_at")
+        await db.matches.create_index([("tournament_id", 1), ("stage", 1)])
 
         # Wallet Ledger
         await db.wallet_ledger.create_index("user_id")

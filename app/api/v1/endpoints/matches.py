@@ -1,4 +1,5 @@
 from typing import List, Optional
+from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Query
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
@@ -10,6 +11,18 @@ from app.services.audit import record_audit_log
 from app.core.ws import ws_manager
 
 router = APIRouter()
+
+def normalize_match_format(fmt: Optional[str]) -> str:
+    if not fmt:
+        return "Best of 1"
+    f = fmt.strip().lower()
+    if f in ["bo1", "best of 1"]:
+        return "Best of 1"
+    if f in ["bo3", "best of 3"]:
+        return "Best of 3"
+    if f in ["bo5", "best of 5"]:
+        return "Best of 5"
+    return fmt
 
 @router.get("", response_model=List[MatchResponse])
 async def list_matches(
@@ -79,6 +92,7 @@ async def list_matches(
         if tourn and tourn.get("status") in ["LIVE", "ONGOING"] and team_a_id and team_b_id and match_status in ["SCHEDULED", "CHECK_IN_OPEN"]:
             match_status = "LIVE"
 
+        scheduled_at_iso = m.get("scheduled_at").isoformat() if isinstance(m.get("scheduled_at"), datetime) else m.get("scheduled_at")
         response.append(
             MatchResponse(
                 id=mid,
@@ -86,15 +100,20 @@ async def list_matches(
                 tournament_title=tourn["title"] if tourn else "Championship",
                 game_slug=game["slug"] if game else "valorant",
                 game_name=game["name"] if game else "Valorant",
-                stage=m.get("stage", "QUARTER_FINAL"),
-                format=m.get("format", "BO1"),
+                stage=m.get("stage", "Quarterfinals"),
+                format=normalize_match_format(m.get("format") or m.get("match_format")),
                 scheduled_time=m.get("scheduled_time", "TBD"),
+                scheduled_at=scheduled_at_iso,
+                live_link=m.get("live_link"),
+                order=m.get("order", 0),
                 status=match_status,
                 server_region=m.get("server_region", "AWS Mumbai (ap-south-1)"),
                 lobby_code=m.get("lobby_code"),
                 lobby_password=m.get("lobby_password"),
-                team_a={"name": team_a["name"], "tag": team_a.get("tag", "TEAM"), "score": m.get("score_a", 0)} if team_a else None,
-                team_b={"name": team_b["name"], "tag": team_b.get("tag", "TEAM"), "score": m.get("score_b", 0)} if team_b else None,
+                team_a={"id": team_a_id, "name": team_a["name"], "tag": team_a.get("tag", "TEAM"), "score": m.get("score_a", 0)} if team_a else None,
+                team_b={"id": team_b_id, "name": team_b["name"], "tag": team_b.get("tag", "TEAM"), "score": m.get("score_b", 0)} if team_b else None,
+                winner_team_id=m.get("winner_team_id"),
+                check_in_status=m.get("check_in_status") or {"team_a": False, "team_b": False},
                 evidence_url=m.get("evidence_url"),
                 dispute_notes=m.get("dispute_notes"),
             )
@@ -118,25 +137,34 @@ async def captain_check_in(
     team_b_id = match.get("team_b_id")
     competing_teams = [tid for tid in [team_a_id, team_b_id] if tid]
 
-    if competing_teams and current_user.role not in ["SUPER_ADMIN", "ORGANIZER"]:
-        is_solo = current_user.id in competing_teams
-        if not is_solo:
-            mem_check = await db.teams.find_one({
-                "$and": [
-                    {"$or": [{"_id": {"$in": competing_teams}}, {"id": {"$in": competing_teams}}]},
-                    {"members.user_id": current_user.id},
-                ]
-            })
-            if not mem_check:
-                raise HTTPException(
-                    status_code=403,
-                    detail="You are not registered on either competing roster for this match.",
-                )
+    team_a = await db.teams.find_one({"$or": [{"_id": team_a_id}, {"id": team_a_id}]}) if team_a_id else None
+    team_b = await db.teams.find_one({"$or": [{"_id": team_b_id}, {"id": team_b_id}]}) if team_b_id else None
+
+    is_team_a = current_user.id == team_a_id or (team_a and team_a.get("captain_id") == current_user.id) or any((m.get("user_id") if isinstance(m, dict) else getattr(m, "user_id", None)) == current_user.id for m in (team_a.get("members", []) if team_a else []))
+    is_team_b = current_user.id == team_b_id or (team_b and team_b.get("captain_id") == current_user.id) or any((m.get("user_id") if isinstance(m, dict) else getattr(m, "user_id", None)) == current_user.id for m in (team_b.get("members", []) if team_b else []))
+
+    if competing_teams and not is_team_a and not is_team_b and current_user.role not in ["SUPER_ADMIN", "ORGANIZER"]:
+        raise HTTPException(
+            status_code=403,
+            detail="You are not registered on either competing roster for this match.",
+        )
+
+    check_in_status = dict(match.get("check_in_status") or {"team_a": False, "team_b": False})
+    if is_team_a:
+        check_in_status["team_a"] = True
+    if is_team_b:
+        check_in_status["team_b"] = True
 
     new_status = match.get("status", "SCHEDULED")
-    if new_status == "CHECK_IN_OPEN":
+    if check_in_status.get("team_a") and check_in_status.get("team_b"):
         new_status = "LIVE"
-        await db.matches.update_one({"_id": match["_id"]}, {"$set": {"status": "LIVE"}})
+    elif new_status == "SCHEDULED":
+        new_status = "CHECK_IN_OPEN"
+
+    await db.matches.update_one(
+        {"_id": match["_id"]},
+        {"$set": {"check_in_status": check_in_status, "status": new_status}}
+    )
 
     await record_audit_log(
         db=db,

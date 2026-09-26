@@ -24,6 +24,11 @@ class Tournament(BaseModel):
     max_team_size: int = 5
     rank_requirement: str = "Open to All Ranks"
     format: str = "Single Elimination Bracket"
+    tournament_type: str = "Single Elimination"  # Single Elimination, Double Elimination, Round Robin, Swiss System, Custom
+    match_format: str = "Best of 1"  # Best of 1, Best of 3, Best of 5
+    stage_formats: dict[str, str] = Field(default_factory=dict)
+    registration_deadline: Optional[datetime] = None
+    check_in_window_minutes: int = 15
     banner_url: str
     badge_color: str = "#E56A10"
     description: str = ""
@@ -77,10 +82,14 @@ class TournamentRegistration(BaseModel):
     tournament_id: str
     team_id: Optional[str] = None
     player_id: Optional[str] = None
-    payment_status: str = "FREE"  # FREE, PENDING, PAID, REFUNDED
+    payment_method: str = "WALLET"  # WALLET, UPI, FREE
+    payment_status: str = "FREE"  # FREE, PENDING, PENDING_VERIFICATION, PAID, REJECTED, REFUNDED
+    payment_id: Optional[str] = None
+    utr: Optional[str] = None
     order_id: Optional[str] = None
     wallet_txn_id: Optional[str] = None
     check_in_status: str = "PENDING"  # PENDING, CHECKED_IN
+    registered_at: datetime = Field(default_factory=get_utc_now)
     created_at: datetime = Field(default_factory=get_utc_now)
     updated_at: datetime = Field(default_factory=get_utc_now)
 

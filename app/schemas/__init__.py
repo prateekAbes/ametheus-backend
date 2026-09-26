@@ -266,6 +266,11 @@ class TournamentResponse(BaseModel):
     max_team_size: Optional[int] = 5
     rank_requirement: Optional[str] = "Open to All Ranks"
     format: Optional[str] = "Single Elimination Bracket"
+    tournament_type: Optional[str] = "Single Elimination"
+    match_format: Optional[str] = "Best of 1"
+    stage_formats: Dict[str, str] = Field(default_factory=dict)
+    registration_deadline: Optional[str] = None
+    check_in_window_minutes: Optional[int] = 15
     banner_url: Optional[str] = ""
     badge_color: Optional[str] = "#E56A10"
     description: Optional[str] = ""
@@ -280,6 +285,36 @@ class TournamentRegisterRequest(BaseModel):
     team_id: Optional[str] = None
     player_id: Optional[str] = None
     player_handle: Optional[str] = None
+    idempotency_key: Optional[str] = None
+
+class TournamentRegisterUpiResponse(BaseModel):
+    payment_id: str
+    registration_id: str
+    tournament_id: str
+    tournament_title: str
+    amount_inr: float
+    amount_paise: int
+    account_code: Optional[str] = None
+    upi_id: Optional[str] = None
+    payee_name: Optional[str] = None
+    qr_url: Optional[str] = None
+    upi_uri: Optional[str] = None
+    status: str = "INITIATED"
+
+class SubmitTournamentUtrRequest(BaseModel):
+    payment_id: str
+    utr: str
+    screenshot_url: Optional[str] = None
+
+class TournamentRegistrationStatusResponse(BaseModel):
+    is_registered: bool
+    registration: Optional[Dict[str, Any]] = None
+
+class TournamentStageFormatsUpdate(BaseModel):
+    tournament_type: Optional[str] = None
+    match_format: Optional[str] = None
+    stage_formats: Optional[Dict[str, str]] = None
+    registration_deadline: Optional[str] = None
 
 # Match
 class MatchResponse(BaseModel):
@@ -291,15 +326,45 @@ class MatchResponse(BaseModel):
     stage: str
     format: str
     scheduled_time: str
+    scheduled_at: Optional[str] = None
+    live_link: Optional[str] = None
+    order: Optional[int] = 0
     status: str
     server_region: str
     lobby_code: str
     lobby_password: str
     team_a: Optional[Dict[str, Any]] = None
     team_b: Optional[Dict[str, Any]] = None
+    winner_team_id: Optional[str] = None
+    check_in_status: Optional[Dict[str, bool]] = None
     evidence_url: Optional[str] = None
     dispute_notes: Optional[str] = None
     model_config = ConfigDict(from_attributes=True, extra="allow")
+
+class AdminMatchPairRequest(BaseModel):
+    tournament_id: str
+    team_a_id: str
+    team_b_id: str
+    stage: str = "Quarterfinals"
+    match_format: str = "Best of 1"
+    scheduled_at: Optional[str] = None
+    live_link: Optional[str] = None
+
+class AdminMatchScheduleUpdate(BaseModel):
+    scheduled_at: Optional[str] = None
+    scheduled_time: Optional[str] = None
+    live_link: Optional[str] = None
+    match_format: Optional[str] = None
+    stage: Optional[str] = None
+
+class AdminMatchStatusUpdate(BaseModel):
+    status: str  # SCHEDULED, CHECK_IN_OPEN, LIVE, COMPLETED, CANCELLED
+
+class AdminMatchScoreUpdate(BaseModel):
+    score_a: int
+    score_b: int
+    winner_team_id: Optional[str] = None
+    complete_match: bool = False
 
 class MatchResultSubmit(BaseModel):
     score_a: int

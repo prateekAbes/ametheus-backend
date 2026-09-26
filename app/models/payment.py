@@ -32,10 +32,12 @@ class UpiAccount(BaseModel):
 
 class GamePayment(BaseModel):
     id: str = Field(default_factory=generate_uuid)
-    payment_type: str = "GAME_ENTRY"  # GAME_ENTRY, WALLET_TOPUP
+    payment_type: str = "GAME_ENTRY"  # GAME_ENTRY, WALLET_TOPUP, TOURNAMENT_ENTRY
     user_id: str
     game_id: Optional[str] = None
     game_name: Optional[str] = None
+    tournament_id: Optional[str] = None
+    registration_id: Optional[str] = None
     team_id: Optional[str] = None
     team_name: Optional[str] = None
     amount_paise: int
