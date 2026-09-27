@@ -40,3 +40,56 @@ async def test_media_upload_multipart():
         data = res.json()
         assert data["status"] == "success"
         assert data["id"].startswith("img_")
+
+
+@pytest.mark.asyncio
+async def test_page_media_get_and_update(client):
+    from tests.conftest import make_auth_headers
+
+    # 1. Fetch all page media configs
+    res = await client.get(f"{settings.API_V1_STR}/media/pages")
+    assert res.status_code == 200
+    pages = res.json()
+    assert isinstance(pages, list)
+    page_ids = [p["page_id"] for p in pages]
+    assert "home" in page_ids
+    assert "tournaments" in page_ids
+    assert "tournament_detail" in page_ids
+    assert "matches" in page_ids
+    assert "leaderboard" in page_ids
+
+    # 2. Fetch specific page media
+    res = await client.get(f"{settings.API_V1_STR}/media/pages/home")
+    assert res.status_code == 200
+    home_cfg = res.json()
+    assert home_cfg["page_id"] == "home"
+    assert home_cfg["media_type"] in ["gif", "image"]
+
+    # 3. Update page media as admin
+    headers_admin = make_auth_headers("usr_super_admin")
+    update_payload = {
+        "page_id": "home",
+        "media_type": "gif",
+        "media_url": "https://assets.ametheus.gg/hero-new.gif",
+        "fallback_url": "https://assets.ametheus.gg/hero-fallback.jpg",
+        "is_active": True,
+        "opacity": 0.35,
+    }
+    put_res = await client.put(
+        f"{settings.API_V1_STR}/media/pages/home",
+        json=update_payload,
+        headers=headers_admin,
+    )
+    assert put_res.status_code == 200
+    updated_data = put_res.json()
+    assert updated_data["media_url"] == "https://assets.ametheus.gg/hero-new.gif"
+    assert updated_data["fallback_url"] == "https://assets.ametheus.gg/hero-fallback.jpg"
+    assert updated_data["opacity"] == 0.35
+
+    # 4. Fetch updated config to verify persistence
+    get_res = await client.get(f"{settings.API_V1_STR}/media/pages/home")
+    assert get_res.status_code == 200
+    assert get_res.json()["media_url"] == "https://assets.ametheus.gg/hero-new.gif"
+    assert get_res.json()["fallback_url"] == "https://assets.ametheus.gg/hero-fallback.jpg"
+    assert get_res.json()["opacity"] == 0.35
+
