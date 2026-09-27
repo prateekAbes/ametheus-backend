@@ -2041,6 +2041,14 @@ async def save_live_match_structure_admin(
             status="SCHEDULED",
             team_a_id=item.team_a_id,
             team_b_id=item.team_b_id,
+            team_a_name=item.team_a_name,
+            team_b_name=item.team_b_name,
+            next_match_id=item.next_match_id,
+            next_match_slot=item.next_match_slot,
+            advancement_label=item.advancement_label,
+            join_info_enabled=item.join_info_enabled or False,
+            join_info=item.join_info,
+            match_message=item.match_message,
             youtube_live_url=item.youtube_live_url or None,
             live_link=item.youtube_live_url or None,
             server_region=tourn_doc.get("server_region", "Asia (Mumbai)"),
@@ -2216,8 +2224,16 @@ async def create_match_admin(
         status=payload.status or "SCHEDULED",
         team_a_id=payload.team_a_id,
         team_b_id=payload.team_b_id,
+        team_a_name=name_a,
+        team_b_name=name_b,
         team_a_placeholder=payload.team_a_placeholder,
         team_b_placeholder=payload.team_b_placeholder,
+        next_match_id=payload.next_match_id,
+        next_match_slot=payload.next_match_slot,
+        advancement_label=payload.advancement_label,
+        join_info_enabled=payload.join_info_enabled or False,
+        join_info=payload.join_info,
+        match_message=payload.match_message,
         score_a=payload.score_a if payload.score_a is not None else 0,
         score_b=payload.score_b if payload.score_b is not None else 0,
         winner_team_id=payload.winner_team_id,
@@ -2261,12 +2277,42 @@ async def update_match_details_admin(
     update_fields = {}
     if payload.team_a_id is not None:
         update_fields["team_a_id"] = payload.team_a_id
+        if payload.team_a_name:
+            update_fields["team_a_name"] = payload.team_a_name
+        else:
+            team_a = await db.teams.find_one({"$or": [{"_id": payload.team_a_id}, {"id": payload.team_a_id}]})
+            if team_a:
+                update_fields["team_a_name"] = team_a.get("name")
+    elif payload.team_a_name is not None:
+        update_fields["team_a_name"] = payload.team_a_name
+
     if payload.team_b_id is not None:
         update_fields["team_b_id"] = payload.team_b_id
+        if payload.team_b_name:
+            update_fields["team_b_name"] = payload.team_b_name
+        else:
+            team_b = await db.teams.find_one({"$or": [{"_id": payload.team_b_id}, {"id": payload.team_b_id}]})
+            if team_b:
+                update_fields["team_b_name"] = team_b.get("name")
+    elif payload.team_b_name is not None:
+        update_fields["team_b_name"] = payload.team_b_name
+
     if payload.team_a_placeholder is not None:
         update_fields["team_a_placeholder"] = payload.team_a_placeholder
     if payload.team_b_placeholder is not None:
         update_fields["team_b_placeholder"] = payload.team_b_placeholder
+    if payload.next_match_id is not None:
+        update_fields["next_match_id"] = payload.next_match_id
+    if payload.next_match_slot is not None:
+        update_fields["next_match_slot"] = payload.next_match_slot
+    if payload.advancement_label is not None:
+        update_fields["advancement_label"] = payload.advancement_label
+    if payload.join_info_enabled is not None:
+        update_fields["join_info_enabled"] = payload.join_info_enabled
+    if payload.join_info is not None:
+        update_fields["join_info"] = payload.join_info
+    if payload.match_message is not None:
+        update_fields["match_message"] = payload.match_message
     if payload.round_name is not None:
         update_fields["round_name"] = payload.round_name
         update_fields["stage"] = payload.round_name
@@ -2317,6 +2363,25 @@ async def update_match_details_admin(
                 await invalidate_reminders_on_schedule_change(id, new_time_str, update_fields.get("scheduled_at"), db)
             except Exception as e:
                 print(f"[Match Schedule Invalidation Error]: {e}")
+
+        # If winner is set and match status is COMPLETED, advance bracket
+        if update_fields.get("status") == "COMPLETED" or update_fields.get("winner_team_id"):
+            winner_id = update_fields.get("winner_team_id") or match.get("winner_team_id")
+            if winner_id:
+                try:
+                    from app.services.bracket_engine import advance_bracket_match
+                    refreshed_match_doc = await db.matches.find_one({"_id": match["_id"]})
+                    refreshed_match = Match.from_mongo(refreshed_match_doc)
+                    await advance_bracket_match(
+                        tournament_id=refreshed_match.tournament_id,
+                        completed_match=refreshed_match,
+                        winner_team_id=winner_id,
+                        db=db,
+                    )
+                except HTTPException:
+                    raise
+                except Exception as e:
+                    print(f"[Bracket Advance Error in update_match_details]: {e}")
 
     await record_audit_log(
         db=db,
@@ -2615,6 +2680,8 @@ async def complete_match_admin(
             winner_team_id=winner_id,
             db=db,
         )
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"[Bracket Advance Error]: {e}")
 

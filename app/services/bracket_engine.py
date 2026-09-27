@@ -789,8 +789,13 @@ async def advance_bracket_match(
     db: AsyncIOMotorDatabase,
 ) -> Optional[Match]:
     """
-    Advances the winner of completed_match into the next round match.
-    Matches remain SCHEDULED until admin triggers MARK AS LIVE.
+    Advances the winner of completed_match into the downstream match slot.
+    Supports:
+    - Explicit destination mapping via next_match_id and next_match_slot ('A' or 'B')
+    - Fallback automatic pairing: Round N Match M -> Round N+1 Match ceil(M/2) (odd -> Slot A, even -> Slot B)
+    - Non-sequential match completion (e.g. M3 finishes before M1; downstream slot populates immediately)
+    - Safe result editing (updates downstream slot if downstream match hasn't started; rejects with 400 if downstream match is already LIVE/COMPLETED)
+    - Idempotent execution
     """
     completed_match.winner_team_id = winner_team_id
     completed_match.status = "COMPLETED"
@@ -799,36 +804,130 @@ async def advance_bracket_match(
         {"$set": {"winner_team_id": winner_team_id, "status": "COMPLETED"}}
     )
 
-    next_round_num = completed_match.round_number + 1
-    next_match_num = math.ceil(completed_match.match_number / 2)
-    is_team_a = (completed_match.match_number % 2) != 0
+    # 1. Resolve winner display name
+    winner_name = None
+    if winner_team_id == completed_match.team_a_id:
+        winner_name = completed_match.team_a_name
+    elif winner_team_id == completed_match.team_b_id:
+        winner_name = completed_match.team_b_name
 
-    next_match_doc = await db.matches.find_one({
-        "tournament_id": tournament_id,
-        "round_number": next_round_num,
-        "match_number": next_match_num,
-    })
+    if not winner_name:
+        team_doc = await db.teams.find_one({"$or": [{"_id": winner_team_id}, {"id": winner_team_id}]})
+        if team_doc:
+            winner_name = team_doc.get("name")
+        else:
+            user_doc = await db.users.find_one({"$or": [{"_id": winner_team_id}, {"id": winner_team_id}]})
+            if user_doc:
+                winner_name = user_doc.get("username")
+            elif winner_team_id in [completed_match.team_a_name, completed_match.team_a_placeholder]:
+                winner_name = completed_match.team_a_name or completed_match.team_a_placeholder
+            elif winner_team_id in [completed_match.team_b_name, completed_match.team_b_placeholder]:
+                winner_name = completed_match.team_b_name or completed_match.team_b_placeholder
+
+    if not winner_name:
+        winner_name = str(winner_team_id)
+
+    # 2. Determine downstream match and slot
+    next_match_doc = None
+    is_team_a = True
+
+    # Case A: Explicit next_match_id
+    if completed_match.next_match_id:
+        next_match_doc = await db.matches.find_one({
+            "$or": [{"_id": completed_match.next_match_id}, {"id": completed_match.next_match_id}]
+        })
+        if next_match_doc:
+            slot = (completed_match.next_match_slot or "A").upper()
+            is_team_a = (slot != "B")
+
+    # Case B: Standard round-advancement pair
+    if not next_match_doc:
+        next_round_num = (completed_match.round_number or 1) + 1
+        m_num = completed_match.match_number or 1
+        next_match_num = math.ceil(m_num / 2)
+        is_team_a = (m_num % 2) != 0
+
+        tourn_id_str = str(tournament_id)
+        next_match_doc = await db.matches.find_one({
+            "$or": [{"tournament_id": tourn_id_str}, {"tournament_id": tournament_id}],
+            "round_number": next_round_num,
+            "match_number": next_match_num,
+        })
 
     next_match = None
     if next_match_doc:
         next_match = Match.from_mongo(next_match_doc)
+
+        # Safety Check for Result Editing:
+        # If downstream match is already active (LIVE, COMPLETED, PENDING_VERIFICATION) or has scores:
+        is_downstream_active = (
+            next_match.status in ["LIVE", "COMPLETED", "PENDING_VERIFICATION"] or
+            (next_match.score_a is not None and next_match.score_a > 0) or
+            (next_match.score_b is not None and next_match.score_b > 0) or
+            (next_match.winner_team_id is not None)
+        )
+        existing_occupant = next_match.team_a_id if is_team_a else next_match.team_b_id
+
+        if is_downstream_active and existing_occupant and existing_occupant != winner_team_id:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cannot change winner of Match {completed_match.match_number}: downstream match ({next_match.stage or next_match.round_name}) is already in progress or completed. Reset downstream match result first."
+            )
+
         update_data = {}
         if is_team_a:
             next_match.team_a_id = winner_team_id
+            next_match.team_a_name = winner_name
+            next_match.team_a_placeholder = None
             update_data["team_a_id"] = winner_team_id
+            update_data["team_a_name"] = winner_name
+            update_data["team_a_placeholder"] = None
         else:
             next_match.team_b_id = winner_team_id
+            next_match.team_b_name = winner_name
+            next_match.team_b_placeholder = None
             update_data["team_b_id"] = winner_team_id
+            update_data["team_b_name"] = winner_name
+            update_data["team_b_placeholder"] = None
 
-        # Retain status as SCHEDULED (Rule 15: match only becomes LIVE when admin clicks MARK AS LIVE)
         if next_match.status != "LIVE":
+            next_match.status = "SCHEDULED"
             update_data["status"] = "SCHEDULED"
 
         await db.matches.update_one({"_id": next_match_doc["_id"]}, {"$set": update_data})
+
+        # Synchronize bracket_rounds if stored on tournament
+        try:
+            tourn_doc = await db.tournaments.find_one({"$or": [{"_id": tournament_id}, {"id": tournament_id}]})
+            if tourn_doc and "bracket_rounds" in tourn_doc and isinstance(tourn_doc["bracket_rounds"], list):
+                updated_rounds = tourn_doc["bracket_rounds"]
+                target_mid = str(next_match_doc.get("_id", next_match_doc.get("id")))
+                modified = False
+                for r in updated_rounds:
+                    for m in r.get("matches", []):
+                        if str(m.get("id")) == target_mid or str(m.get("_id")) == target_mid:
+                            if is_team_a:
+                                m["team_a_id"] = winner_team_id
+                                m["team_a_name"] = winner_name
+                                m["team_a_placeholder"] = None
+                            else:
+                                m["team_b_id"] = winner_team_id
+                                m["team_b_name"] = winner_name
+                                m["team_b_placeholder"] = None
+                            modified = True
+                if modified:
+                    await db.tournaments.update_one(
+                        {"_id": tourn_doc["_id"]},
+                        {"$set": {"bracket_rounds": updated_rounds}}
+                    )
+        except Exception as e:
+            print(f"[Tournament Bracket Update Warning]: {e}")
+
     else:
         # Check if all tournament matches are completed
+        tourn_id_str = str(tournament_id)
         remaining = await db.matches.count_documents({
-            "tournament_id": tournament_id,
+            "$or": [{"tournament_id": tourn_id_str}, {"tournament_id": tournament_id}],
             "status": {"$in": ["LIVE", "SCHEDULED", "CHECK_IN_OPEN", "PENDING_VERIFICATION", "DISPUTED"]}
         })
         if remaining == 0:

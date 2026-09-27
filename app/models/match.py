@@ -34,6 +34,9 @@ class Match(BaseModel):
     winner_team_id: Optional[str] = None
     games: Optional[list[dict]] = None  # Individual game results for BO3 series
     advancement: Optional[dict] = None  # Tracks suggested and confirmed advancement destinations
+    next_match_id: Optional[str] = None  # ID of downstream match to advance winner to
+    next_match_slot: Optional[str] = None  # "A" or "B"
+    advancement_label: Optional[str] = None  # Human-readable destination label (e.g. "Round 2 Match 1 Slot A")
     check_in_status: dict[str, bool] = Field(default_factory=lambda: {"team_a": False, "team_b": False})
 
     server_region: str = "AWS Mumbai (ap-south-1)"

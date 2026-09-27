@@ -415,6 +415,12 @@ class AdminMatchCreatePayload(BaseModel):
     winner_team_id: Optional[str] = None
     games: Optional[List[Dict[str, Any]]] = None
     youtube_live_url: Optional[str] = None
+    next_match_id: Optional[str] = None
+    next_match_slot: Optional[str] = None  # "A" or "B"
+    advancement_label: Optional[str] = None
+    join_info_enabled: Optional[bool] = None
+    join_info: Optional[Dict[str, str]] = None
+    match_message: Optional[str] = None
 
 class AdminMatchUpdatePayload(BaseModel):
     team_a_id: Optional[str] = None
@@ -440,6 +446,12 @@ class AdminMatchUpdatePayload(BaseModel):
     games: Optional[List[Dict[str, Any]]] = None
     youtube_live_url: Optional[str] = None
     live_link: Optional[str] = None
+    next_match_id: Optional[str] = None
+    next_match_slot: Optional[str] = None  # "A" or "B"
+    advancement_label: Optional[str] = None
+    join_info_enabled: Optional[bool] = None
+    join_info: Optional[Dict[str, str]] = None
+    match_message: Optional[str] = None
 
 class AdminMatchSetupItem(BaseModel):
     id: Optional[str] = None
@@ -456,6 +468,12 @@ class AdminMatchSetupItem(BaseModel):
     scheduled_time: Optional[str] = None
     scheduled_at: Optional[str] = None
     youtube_live_url: Optional[str] = None
+    next_match_id: Optional[str] = None
+    next_match_slot: Optional[str] = None
+    advancement_label: Optional[str] = None
+    join_info_enabled: Optional[bool] = None
+    join_info: Optional[Dict[str, str]] = None
+    match_message: Optional[str] = None
 
 class AdminSaveLiveStructurePayload(BaseModel):
     match_format: str
