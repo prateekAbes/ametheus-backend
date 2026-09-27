@@ -308,5 +308,128 @@ async def get_match_detail(
                 m["youtube_live_url"] = tourn_doc.get("live_stream_url")
                 m["live_link"] = tourn_doc.get("live_stream_url")
 
+    # Strip sensitive join credentials from public view
+    m.pop("join_info", None)
+
     return m
+
+
+@router.get("/{id}/join-info")
+async def get_match_join_info(
+    id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Participant-Only Match Join Information Access:
+    Returns the game-specific join credentials (join code, party ID, room ID, lobby ID, password, join link, match message).
+    Restricted to platform administrators and confirmed participants of either team competing in this match.
+    """
+    from bson import ObjectId
+    m_query = {"$or": [{"_id": id}, {"id": id}]}
+    if ObjectId.is_valid(id):
+        m_query["$or"].append({"_id": ObjectId(id)})
+
+    match = await db.matches.find_one(m_query)
+    if not match:
+        raise HTTPException(status_code=404, detail="Match not found")
+
+    enabled = bool(match.get("join_info_enabled", False))
+    join_info = match.get("join_info") if enabled else None
+    match_msg = match.get("match_message")
+
+    # Admins and organizers can always access
+    if current_user.role in ["SUPER_ADMIN", "ORGANIZER"]:
+        return {
+            "join_info_enabled": enabled,
+            "join_info": join_info,
+            "match_message": match_msg,
+        }
+
+    # Scoped tournament admin assignment check
+    tourn_id = match.get("tournament_id")
+    if tourn_id:
+        assign_check = await db.tournament_admin_assignments.find_one({
+            "admin_user_id": current_user.id,
+            "tournament_id": tourn_id,
+        })
+        if assign_check:
+            return {
+                "join_info_enabled": enabled,
+                "join_info": join_info,
+                "match_message": match_msg,
+            }
+
+    # Verify user is a confirmed participant on either competing team
+    team_a_id = match.get("team_a_id")
+    team_b_id = match.get("team_b_id")
+    team_names = [t for t in [match.get("team_a_name"), match.get("team_b_name"), match.get("team_a_placeholder"), match.get("team_b_placeholder")] if t]
+    competing_teams = [t for t in [team_a_id, team_b_id] if t]
+
+    is_participant = False
+    # Check solo player match
+    if current_user.id in [team_a_id, team_b_id]:
+        is_participant = True
+    else:
+        # Check team rosters by IDs or team names
+        team_match = await db.teams.find_one({
+            "$and": [
+                {"$or": [
+                    {"_id": {"$in": competing_teams}},
+                    {"id": {"$in": competing_teams}},
+                    {"name": {"$in": team_names}},
+                ]},
+                {"$or": [
+                    {"captain_id": current_user.id},
+                    {"members.user_id": current_user.id},
+                    {"substitutes.user_id": current_user.id},
+                ]}
+            ]
+        })
+        if team_match:
+            is_participant = True
+
+    # Also check if user has a confirmed registration matching this match
+    if not is_participant:
+        user_reg = await db.tournament_registrations.find_one({
+            "tournament_id": {"$in": [tourn_id, str(match.get("tournament_id"))]},
+            "$or": [
+                {"player_id": current_user.id},
+                {"captain_id": current_user.id},
+                {"team_id": {"$in": competing_teams}},
+                {"team_name": {"$in": team_names}},
+            ],
+            "payment_status": {"$in": ["PAID", "FREE"]},
+        })
+        if user_reg:
+            is_participant = True
+
+    if not is_participant:
+        raise HTTPException(
+            status_code=403,
+            detail="Join information is restricted to confirmed match participants.",
+        )
+
+    # Check participant has a confirmed registration in this tournament
+    reg_check = await db.tournament_registrations.find_one({
+        "tournament_id": {"$in": [tourn_id, str(match.get("tournament_id"))]},
+        "$or": [
+            {"player_id": current_user.id},
+            {"captain_id": current_user.id},
+            {"team_id": {"$in": competing_teams}},
+            {"team_name": {"$in": team_names}},
+        ],
+        "payment_status": {"$in": ["PAID", "FREE"]},
+    })
+    if not reg_check and current_user.role not in ["SUPER_ADMIN", "ORGANIZER"]:
+        raise HTTPException(
+            status_code=403,
+            detail="Your tournament registration is not confirmed.",
+        )
+
+    return {
+        "join_info_enabled": enabled,
+        "join_info": join_info,
+        "match_message": match_msg,
+    }
 

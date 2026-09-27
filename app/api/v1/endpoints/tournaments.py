@@ -509,6 +509,8 @@ async def register_team_for_tournament(
     game_obj = await db.games.find_one({"$or": [{"_id": gid}, {"id": gid}, {"slug": gid}]})
     is_solo_game = bool(game_obj and (not game_obj.get("is_team_game", True) or game_obj.get("slug") == "chess"))
 
+    user_game_id = payload.game_id or payload.in_game_id
+
     if not payload.team_id:
         # Solo player registration without requiring a team
         existing_reg = await db.tournament_registrations.find_one({
@@ -539,6 +541,8 @@ async def register_team_for_tournament(
             id=reg_id,
             tournament_id=tid,
             player_id=current_user.id,
+            game_id=user_game_id,
+            in_game_id=user_game_id,
             payment_method="WALLET" if fee_inr > 0 else "FREE",
             payment_status="PAID" if fee_inr > 0 else "FREE",
             order_id=wallet_txn_id or f"reg_{uuid.uuid4().hex[:10]}",
@@ -666,6 +670,8 @@ async def register_team_for_tournament(
         id=reg_id,
         tournament_id=tid,
         team_id=team_id,
+        game_id=user_game_id,
+        in_game_id=user_game_id,
         payment_method="WALLET" if fee_inr > 0 else "FREE",
         payment_status="PAID" if fee_inr > 0 else "FREE",
         order_id=wallet_txn_id or f"reg_{uuid.uuid4().hex[:10]}",
@@ -1001,6 +1007,14 @@ async def submit_tournament_upi_utr(
     if payload.payment_id:
         payment = await db.game_payments.find_one({"$or": [{"_id": payload.payment_id}, {"id": payload.payment_id}]})
 
+    if not payment and tourn.get("status") in ["REGISTRATION_CLOSED", "CLOSED", "CANCELLED", "COMPLETED"]:
+        raise HTTPException(
+            status_code=400,
+            detail="Registration is closed for this tournament.",
+        )
+
+    user_game_id = payload.game_id or payload.in_game_id
+
     if payment:
         if payment.get("user_id") != current_user.id and current_user.role != "SUPER_ADMIN":
             raise HTTPException(status_code=403, detail="Not authorized to submit UTR for this payment")
@@ -1046,6 +1060,8 @@ async def submit_tournament_upi_utr(
             tournament_id=tid,
             team_id=team_id,
             player_id=current_user.id if not team_id else None,
+            game_id=user_game_id,
+            in_game_id=user_game_id,
             payment_method="UPI",
             payment_status="PENDING_VERIFICATION",
             payment_id=payment.id if hasattr(payment, "id") else str(payment.get("_id")),
@@ -1057,9 +1073,17 @@ async def submit_tournament_upi_utr(
         reg_id = new_reg.id
     else:
         reg_id = str(reg.get("_id", reg.get("id")))
+        update_doc = {
+            "utr": clean_utr,
+            "payment_status": "PENDING_VERIFICATION",
+            "payment_id": payment.id if hasattr(payment, "id") else str(payment.get("_id")),
+        }
+        if user_game_id:
+            update_doc["game_id"] = user_game_id
+            update_doc["in_game_id"] = user_game_id
         await db.tournament_registrations.update_one(
             {"_id": reg["_id"]},
-            {"$set": {"utr": clean_utr, "payment_status": "PENDING_VERIFICATION", "payment_id": payment.id if hasattr(payment, "id") else str(payment.get("_id"))}}
+            {"$set": update_doc}
         )
 
     # Update payment to PENDING with UTR
@@ -1169,5 +1193,71 @@ async def get_team_journey_endpoint(
         raise HTTPException(status_code=404, detail="Tournament not found")
     t_id = str(tourn.get("id") or tourn.get("_id"))
     return await get_team_journey(t_id, team_id, db)
+
+
+@router.get("/{id}/community")
+async def get_tournament_community_link(
+    id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Participant-Only Community Access:
+    Returns the configured community_platform (Discord or WhatsApp) and private community_link.
+    Restricted to platform administrators and confirmed (PAID/FREE) registered participants.
+    """
+    tourn = await find_tournament_by_id_or_slug(db, id)
+    if not tourn:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+
+    tid = str(tourn.get("_id", tourn.get("id")))
+    tslug = tourn.get("slug", tid)
+
+    platform = tourn.get("community_platform")
+    link = tourn.get("community_link")
+
+    if not link:
+        return {"community_platform": platform, "community_link": None}
+
+    # Admins and organizers can always view
+    if current_user.role in ["SUPER_ADMIN", "ORGANIZER"]:
+        return {"community_platform": platform, "community_link": link}
+
+    # Check tournament assignment for scoped admins
+    assign_check = await db.tournament_admin_assignments.find_one({
+        "admin_user_id": current_user.id,
+        "tournament_id": {"$in": [tid, tslug]},
+    })
+    if assign_check:
+        return {"community_platform": platform, "community_link": link}
+
+    # Check if current user is a confirmed participant (solo or team member)
+    user_teams_cursor = db.teams.find({
+        "$or": [
+            {"captain_id": current_user.id},
+            {"members.user_id": current_user.id},
+            {"substitutes.user_id": current_user.id},
+        ]
+    })
+    user_teams = await user_teams_cursor.to_list(length=100)
+    user_team_ids = [str(t.get("_id", t.get("id"))) for t in user_teams]
+
+    reg_or = [{"player_id": current_user.id}]
+    if user_team_ids:
+        reg_or.append({"team_id": {"$in": user_team_ids}})
+
+    confirmed_reg = await db.tournament_registrations.find_one({
+        "tournament_id": {"$in": [tid, tslug]},
+        "$or": reg_or,
+        "payment_status": {"$in": ["PAID", "FREE"]},
+    })
+
+    if not confirmed_reg:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Community link is restricted to confirmed participants of this tournament.",
+        )
+
+    return {"community_platform": platform, "community_link": link}
 
 

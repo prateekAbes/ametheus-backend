@@ -289,6 +289,8 @@ class TournamentRegisterRequest(BaseModel):
     team_id: Optional[str] = None
     player_id: Optional[str] = None
     player_handle: Optional[str] = None
+    game_id: Optional[str] = None
+    in_game_id: Optional[str] = None
     idempotency_key: Optional[str] = None
 
 class TournamentRegisterUpiResponse(BaseModel):
@@ -322,6 +324,8 @@ class SubmitTournamentUtrRequest(BaseModel):
     team_id: Optional[str] = None
     account_code: Optional[str] = None
     screenshot_url: Optional[str] = None
+    game_id: Optional[str] = None
+    in_game_id: Optional[str] = None
 
 class TournamentRegistrationStatusResponse(BaseModel):
     is_registered: bool
@@ -361,8 +365,10 @@ class MatchResponse(BaseModel):
     order: Optional[int] = 0
     status: str
     server_region: str
-    lobby_code: str
-    lobby_password: str
+    lobby_code: Optional[str] = None
+    lobby_password: Optional[str] = None
+    join_info_enabled: Optional[bool] = False
+    match_message: Optional[str] = None
     team_a: Optional[Dict[str, Any]] = None
     team_b: Optional[Dict[str, Any]] = None
     winner_team_id: Optional[str] = None
@@ -460,10 +466,30 @@ class AdminMarkMatchLivePayload(BaseModel):
     youtube_live_url: Optional[str] = None
 
 class AdminCompleteMatchPayload(BaseModel):
-    winner_team_id: str
+    winner_team_id: Optional[str] = None
+    winner_id: Optional[str] = None
     score_a: int = 0
     score_b: int = 0
+    team1_score: Optional[int] = None
+    team2_score: Optional[int] = None
     captain_notes: Optional[str] = None
+
+class TournamentCommunityUpdatePayload(BaseModel):
+    community_platform: Optional[str] = None  # "DISCORD" | "WHATSAPP" | None
+    community_link: Optional[str] = None
+
+class MatchJoinInfoUpdatePayload(BaseModel):
+    join_info_enabled: bool = False
+    join_info: Optional[Dict[str, str]] = None  # e.g. {"party_id": "...", "party_code": "..."}
+    match_message: Optional[str] = None
+
+class MatchReminderRequest(BaseModel):
+    reminder_type: str = "FIFTEEN_MINUTES"  # ONE_WEEK, TWO_DAYS, ONE_DAY, FIFTEEN_MINUTES, TEN_MINUTES, STARTING_NOW, STARTED, CUSTOM
+    custom_message: Optional[str] = None
+
+class CreateRoundPayload(BaseModel):
+    round_name: str
+    series_format: Optional[str] = "BO1"
 
 class AdminMatchScheduleUpdate(BaseModel):
     scheduled_at: Optional[str] = None

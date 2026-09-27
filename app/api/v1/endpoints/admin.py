@@ -34,6 +34,10 @@ from app.schemas import (
     TournamentStreamUpdatePayload,
     TournamentFormatUpdatePayload,
     AdminSendNotificationRequest,
+    TournamentCommunityUpdatePayload,
+    MatchJoinInfoUpdatePayload,
+    MatchReminderRequest,
+    CreateRoundPayload,
     WalletAuditSummaryResponse,
 )
 from app.services.audit import record_audit_log
@@ -1649,7 +1653,11 @@ async def close_tournament_registration_admin(
 
     await db.tournaments.update_one(
         {"_id": tourn["_id"]},
-        {"$set": {"status": "REGISTRATION_CLOSED"}}
+        {"$set": {
+            "status": "REGISTRATION_CLOSED",
+            "registration_status": "CLOSED",
+            "is_registration_closed": True,
+        }}
     )
 
     await record_audit_log(
@@ -2302,6 +2310,13 @@ async def update_match_details_admin(
 
     if update_fields:
         await db.matches.update_one({"_id": match["_id"]}, {"$set": update_fields})
+        if "scheduled_time" in update_fields or "scheduled_at" in update_fields:
+            try:
+                from app.services.match_notification_service import invalidate_reminders_on_schedule_change
+                new_time_str = update_fields.get("scheduled_time") or str(update_fields.get("scheduled_at", "New Time"))
+                await invalidate_reminders_on_schedule_change(id, new_time_str, update_fields.get("scheduled_at"), db)
+            except Exception as e:
+                print(f"[Match Schedule Invalidation Error]: {e}")
 
     await record_audit_log(
         db=db,
@@ -2507,11 +2522,12 @@ async def complete_match_admin(
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """
-    Rule 18: Admin completes match, records scores and winner.
-    Match status -> COMPLETED.
-    Advances winner/standings in tournament bracket.
+    Admin completes match, records scores and winner.
+    Supports both {winner_team_id, score_a, score_b} and {winner_id, team1_score, team2_score}.
+    Resolves custom winner names/placeholders (e.g. "Desert") and verifies registration state.
     """
     from app.services.bracket_engine import advance_bracket_match
+    from app.services.match_notification_service import send_match_reminder
     from app.core.ws import ws_manager
 
     match_doc = await db.matches.find_one({"$or": [{"_id": id}, {"id": id}]})
@@ -2519,30 +2535,76 @@ async def complete_match_admin(
         raise HTTPException(status_code=404, detail="Match not found")
 
     match = Match.from_mongo(match_doc)
-    winner_id = payload.winner_team_id
 
-    # Validate winner belongs to competing teams
-    valid_teams = {str(match.team_a_id), str(match.team_b_id)}
-    if winner_id not in valid_teams and match.team_a_id and match.team_b_id:
-        raise HTTPException(
-            status_code=400,
-            detail="The specified winner must be one of the two competing teams/contenders in this match.",
-        )
+    # 1. Resolve scores & winner from either payload format
+    winner_input = payload.winner_team_id or payload.winner_id
+    score_a = payload.score_a if payload.score_a != 0 else (payload.team1_score if payload.team1_score is not None else 0)
+    score_b = payload.score_b if payload.score_b != 0 else (payload.team2_score if payload.team2_score is not None else 0)
+
+    # 2. Check payment registration eligibility:
+    # Neither competing team should have a REJECTED or CANCELLED payment
+    for tid in [match.team_a_id, match.team_b_id]:
+        if tid:
+            rej_reg = await db.tournament_registrations.find_one({
+                "$or": [{"tournament_id": match.tournament_id}, {"tournament_id": str(match.tournament_id)}],
+                "$or": [{"team_id": tid}, {"player_id": tid}],
+                "payment_status": {"$in": ["REJECTED", "CANCELLED", "REFUNDED"]},
+            })
+            if rej_reg:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Registration or payment for contender {tid} was rejected or cancelled. Cannot finalize match score until payment is resolved.",
+                )
+
+    # 3. Resolve winner against IDs, names, or placeholders (e.g. "Desert")
+    team_a_name = match.team_a_name or match_doc.get("team_a_name")
+    team_b_name = match.team_b_name or match_doc.get("team_b_name")
+    team_a_ph = match.team_a_placeholder or match_doc.get("team_a_placeholder")
+    team_b_ph = match.team_b_placeholder or match_doc.get("team_b_placeholder")
+
+    winner_id = winner_input
+    if winner_input:
+        if winner_input in [team_a_name, team_a_ph] and match.team_a_id:
+            winner_id = str(match.team_a_id)
+        elif winner_input in [team_b_name, team_b_ph] and match.team_b_id:
+            winner_id = str(match.team_b_id)
+
+    # Fallback to score comparison if winner not explicitly chosen
+    if not winner_id and (score_a != 0 or score_b != 0):
+        winner_id = match.team_a_id if score_a >= score_b else match.team_b_id
+
+    valid_targets = {
+        str(match.team_a_id) if match.team_a_id else None,
+        str(match.team_b_id) if match.team_b_id else None,
+        team_a_name,
+        team_b_name,
+        team_a_ph,
+        team_b_ph,
+    }
+    valid_targets = {t for t in valid_targets if t}
+
+    if winner_id and valid_targets and winner_id not in valid_targets:
+        # Check if winner_id is a team ID in db whose name matches team_a or team_b
+        winner_team = await db.teams.find_one({"$or": [{"_id": winner_id}, {"id": winner_id}]})
+        if winner_team:
+            w_name = winner_team.get("name")
+            if w_name in valid_targets:
+                winner_id = str(winner_team.get("_id", winner_team.get("id")))
 
     await db.matches.update_one(
         {"_id": match_doc["_id"]},
         {"$set": {
             "status": "COMPLETED",
             "winner_team_id": winner_id,
-            "score_a": payload.score_a,
-            "score_b": payload.score_b,
+            "score_a": score_a,
+            "score_b": score_b,
             "captain_notes": payload.captain_notes,
         }}
     )
 
     match.winner_team_id = winner_id
-    match.score_a = payload.score_a
-    match.score_b = payload.score_b
+    match.score_a = score_a
+    match.score_b = score_b
     match.status = "COMPLETED"
 
     # Advance bracket
@@ -2561,9 +2623,15 @@ async def complete_match_admin(
         "match_id": match.id,
         "tournament_id": match.tournament_id,
         "winner_team_id": winner_id,
-        "score_a": payload.score_a,
-        "score_b": payload.score_b,
+        "score_a": score_a,
+        "score_b": score_b,
     })
+
+    # Send match completed notification to participants
+    try:
+        await send_match_reminder(match.id, "STARTED", db, custom_message=f"Match completed! Final Score: {score_a} - {score_b}.")
+    except Exception:
+        pass
 
     await record_audit_log(
         db=db,
@@ -2571,13 +2639,148 @@ async def complete_match_admin(
         role=admin_user.role,
         action="COMPLETE_MATCH",
         target=f"Match {match.id}",
-        details=f"Scores: {payload.score_a}-{payload.score_b} | Winner: {winner_id}",
+        details=f"Scores: {score_a}-{score_b} | Winner: {winner_id}",
     )
 
     return {
         "status": "success",
-        "message": f"Match completed successfully! Final score: {payload.score_a} - {payload.score_b}.",
+        "message": f"Match completed successfully! Final score: {score_a} - {score_b}.",
+        "match_id": match.id,
+        "score_a": score_a,
+        "score_b": score_b,
+        "winner_id": winner_id,
+        "winner_team_id": winner_id,
     }
+
+@router.post("/tournaments/{id}/rounds")
+async def add_custom_tournament_round(
+    id: str,
+    payload: CreateRoundPayload,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Rule 1: Admin dynamically creates and names a new tournament round.
+    """
+    tourn = await db.tournaments.find_one({"$or": [{"_id": id}, {"id": id}, {"slug": id}]})
+    if not tourn:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+
+    clean_name = payload.round_name.strip()
+    if not clean_name:
+        raise HTTPException(status_code=400, detail="Round name cannot be empty")
+
+    await db.tournaments.update_one(
+        {"_id": tourn["_id"]},
+        {"$addToSet": {"custom_rounds": clean_name}}
+    )
+
+    existing_rounds = list(tourn.get("custom_rounds") or [])
+    if clean_name not in existing_rounds:
+        existing_rounds.append(clean_name)
+
+    return {
+        "status": "success",
+        "message": f'Round "{clean_name}" created successfully.',
+        "round_name": clean_name,
+        "custom_rounds": existing_rounds,
+    }
+
+@router.patch("/tournaments/{id}/community")
+async def update_tournament_community(
+    id: str,
+    payload: TournamentCommunityUpdatePayload,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Rule 7: Admin configures one optional community platform (Discord OR WhatsApp) and 1 invite link.
+    """
+    tourn = await db.tournaments.find_one({"$or": [{"_id": id}, {"id": id}, {"slug": id}]})
+    if not tourn:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+
+    platform = payload.community_platform
+    if platform and platform.upper() in ["DISCORD", "WHATSAPP"]:
+        platform = platform.upper()
+    else:
+        platform = None
+
+    link = payload.community_link.strip() if payload.community_link else None
+
+    await db.tournaments.update_one(
+        {"_id": tourn["_id"]},
+        {"$set": {
+            "community_platform": platform,
+            "community_link": link,
+        }}
+    )
+
+    return {
+        "status": "success",
+        "message": "Tournament community settings updated successfully.",
+        "community_platform": platform,
+        "community_link": link,
+    }
+
+@router.patch("/matches/{id}/join-info")
+async def update_match_join_info(
+    id: str,
+    payload: MatchJoinInfoUpdatePayload,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Rules 10, 11, 12, 17: Admin configures optional game-specific join credentials
+    (Join Code, Party ID, Room ID, Lobby ID, Password, Join Link) and match instructions.
+    """
+    from app.services.match_notification_service import notify_join_info_updated
+
+    match_doc = await db.matches.find_one({"$or": [{"_id": id}, {"id": id}]})
+    if not match_doc:
+        raise HTTPException(status_code=404, detail="Match not found")
+
+    await db.matches.update_one(
+        {"_id": match_doc["_id"]},
+        {"$set": {
+            "join_info_enabled": payload.join_info_enabled,
+            "join_info": payload.join_info,
+            "match_message": payload.match_message,
+        }}
+    )
+
+    if payload.join_info_enabled and payload.join_info:
+        await notify_join_info_updated(id, db)
+
+    return {
+        "status": "success",
+        "message": "Match join information updated successfully.",
+        "match_id": id,
+        "join_info_enabled": payload.join_info_enabled,
+    }
+
+@router.post("/matches/{id}/send-reminder")
+async def trigger_match_reminder_admin(
+    id: str,
+    payload: MatchReminderRequest,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Rules 13, 14, 15, 16: Admin triggers or schedules countdown reminder for match participants.
+    """
+    from app.services.match_notification_service import send_match_reminder
+
+    res = await send_match_reminder(
+        match_id=id,
+        reminder_type=payload.reminder_type,
+        db=db,
+        custom_message=payload.custom_message,
+        force=False,
+    )
+    if res.get("status") == "skipped":
+        res["skipped"] = True
+    return res
 
 
 # ----------------- WALLET AUDIT LOGS -----------------

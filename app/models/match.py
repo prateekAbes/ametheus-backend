@@ -10,8 +10,8 @@ class Match(BaseModel):
     round_id: Optional[str] = None
     stage_name: Optional[str] = None
     round_name: Optional[str] = None
-    stage: str = "Quarterfinals"
-    match_type: str = "QUARTER_FINAL"  # QUALIFIER, PRELIMINARY, ROUND_OF_32, ROUND_OF_16, QUARTER_FINAL, SEMI_FINAL, THIRD_PLACE, FINAL, GRAND_FINAL, GROUP_STAGE, SWISS_ROUND, WINNERS_BRACKET, LOSERS_BRACKET
+    stage: str = "Round 1"
+    match_type: str = "MATCH"  # MATCH, QUALIFIER, ROUND_1, ROUND_2, etc.
     round_number: int = 1
     match_number: int = 1
     format: str = "BO1"
@@ -37,8 +37,12 @@ class Match(BaseModel):
     check_in_status: dict[str, bool] = Field(default_factory=lambda: {"team_a": False, "team_b": False})
 
     server_region: str = "AWS Mumbai (ap-south-1)"
-    lobby_code: str = "TBD"
-    lobby_password: str = "TBD"
+    lobby_code: Optional[str] = None
+    lobby_password: Optional[str] = None
+    join_info_enabled: bool = False
+    join_info: Optional[dict[str, str]] = None  # Game-specific: party_id, room_id, password, join_link, etc.
+    match_message: Optional[str] = None  # Custom match instructions from admin
+    sent_reminders: list[str] = Field(default_factory=list)  # Deduplication tracker for reminders
     evidence_url: Optional[str] = None
     captain_notes: Optional[str] = None
     dispute_notes: Optional[str] = None

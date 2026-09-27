@@ -109,6 +109,9 @@ class Tournament(BaseModel):
     schedule: List[Any] = Field(default_factory=list)
     prizes: List[Any] = Field(default_factory=list)
     bracket_rounds: List[Any] = Field(default_factory=list)
+    custom_rounds: List[str] = Field(default_factory=list)
+    community_platform: Optional[str] = None  # "DISCORD" | "WHATSAPP" | None
+    community_link: Optional[str] = None      # invite link URL
     created_at: datetime = Field(default_factory=get_utc_now)
     updated_at: datetime = Field(default_factory=get_utc_now)
 
@@ -190,6 +193,8 @@ class TournamentRegistration(BaseModel):
     utr: Optional[str] = None
     order_id: Optional[str] = None
     wallet_txn_id: Optional[str] = None
+    game_id: Optional[str] = None
+    in_game_id: Optional[str] = None
     check_in_status: str = "PENDING"  # PENDING, CHECKED_IN
     registered_at: datetime = Field(default_factory=get_utc_now)
     created_at: datetime = Field(default_factory=get_utc_now)
