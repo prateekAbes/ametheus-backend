@@ -1859,6 +1859,298 @@ async def get_tournament_registered_rosters(
         "rosters": teams_list,
     }
 
+# ----------------- BATTLE ROYALE MATCH BUILDER & CALCULATION -----------------
+
+class GenerateBRMatchesPayload(BaseModel):
+    stage_name: str = "Round 1"
+    round_name: str = "Round 1"
+    balanced: bool = False
+    custom_distribution: Optional[List[Dict[str, Any]]] = None
+
+class RebalanceBRMatchesPayload(BaseModel):
+    team_id: str
+    from_match_id: str
+    to_match_id: str
+
+@router.get("/tournaments/{id}/battle-royale-calc")
+async def get_battle_royale_calculation_admin(
+    id: str,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Authoritative Battle Royale calculation based strictly on confirmed registered teams in database.
+    Calculates Maximum Teams Per Match = floor(Room Capacity / Players Per Team)
+    and Required Matches = ceil(Actual Registered Teams / Maximum Teams Per Match).
+    """
+    from app.services.battle_royale_engine import (
+        get_confirmed_registered_teams,
+        get_battle_royale_specs,
+        calculate_battle_royale_parameters,
+        distribute_teams_into_matches,
+    )
+
+    tourn, teams_list = await get_confirmed_registered_teams(id, db)
+    if not tourn:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+
+    tid = str(tourn.get("_id", tourn.get("id")))
+    tslug = tourn.get("slug", tid)
+
+    game_slug_or_id = tourn.get("game_slug") or tourn.get("game_id", "")
+    game_doc = await db.games.find_one({"$or": [{"_id": game_slug_or_id}, {"id": game_slug_or_id}, {"slug": game_slug_or_id}]})
+
+    room_capacity, players_per_team = get_battle_royale_specs(
+        game_slug_or_name=game_slug_or_id,
+        tournament_doc=tourn,
+        game_doc=game_doc,
+    )
+
+    calc = calculate_battle_royale_parameters(
+        actual_registered_teams=len(teams_list),
+        room_capacity=room_capacity,
+        players_per_team=players_per_team,
+    )
+
+    chunks = distribute_teams_into_matches(
+        teams=teams_list,
+        max_teams_per_match=calc["max_teams_per_match"],
+        required_matches=calc["required_matches"],
+        balanced=False,
+    )
+
+    preview_distribution = []
+    for idx, chunk in enumerate(chunks):
+        preview_distribution.append({
+            "match_number": idx + 1,
+            "match_name": f"Match {idx + 1} Lobby",
+            "team_count": len(chunk),
+            "teams": chunk,
+        })
+
+    # Fetch existing BR matches in database for this tournament
+    existing_cursor = db.matches.find({
+        "$or": [{"tournament_id": tid}, {"tournament_id": tslug}],
+        "$or": [{"format": "Battle Royale"}, {"match_type": "BATTLE_ROYALE"}],
+    })
+    existing_matches_raw = await existing_cursor.to_list(length=100)
+    existing_matches = []
+    for em in existing_matches_raw:
+        m_obj = Match.from_mongo(em)
+        if m_obj:
+            existing_matches.append(m_obj.model_dump())
+
+    return {
+        "tournament_id": tid,
+        "tournament_title": tourn.get("title"),
+        "game_name": tourn.get("game_name") or (game_doc.get("name") if game_doc else "Esports"),
+        "game_slug": game_slug_or_id,
+        "registered_teams_count": calc["actual_registered_teams"],
+        "room_capacity": calc["room_capacity"],
+        "players_per_team": calc["players_per_team"],
+        "max_teams_per_match": calc["max_teams_per_match"],
+        "required_matches": calc["required_matches"],
+        "teams": teams_list,
+        "preview_distribution": preview_distribution,
+        "existing_matches": existing_matches,
+    }
+
+@router.post("/tournaments/{id}/generate-battle-royale-matches")
+async def generate_battle_royale_matches_admin(
+    id: str,
+    payload: Optional[GenerateBRMatchesPayload] = None,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Generates Battle Royale match lobbies distributing the actual registered teams.
+    Saves to db.matches and marks tournament format as Battle Royale.
+    """
+    from app.services.battle_royale_engine import (
+        get_confirmed_registered_teams,
+        get_battle_royale_specs,
+        calculate_battle_royale_parameters,
+        distribute_teams_into_matches,
+    )
+    from app.models.base import generate_uuid
+
+    if payload is None:
+        payload = GenerateBRMatchesPayload()
+
+    tourn, teams_list = await get_confirmed_registered_teams(id, db)
+    if not tourn:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+
+    tid = str(tourn.get("_id", tourn.get("id")))
+    tslug = tourn.get("slug", tid)
+
+    game_slug_or_id = tourn.get("game_slug") or tourn.get("game_id", "")
+    game_doc = await db.games.find_one({"$or": [{"_id": game_slug_or_id}, {"id": game_slug_or_id}, {"slug": game_slug_or_id}]})
+
+    room_capacity, players_per_team = get_battle_royale_specs(
+        game_slug_or_name=game_slug_or_id,
+        tournament_doc=tourn,
+        game_doc=game_doc,
+    )
+
+    calc = calculate_battle_royale_parameters(
+        actual_registered_teams=len(teams_list),
+        room_capacity=room_capacity,
+        players_per_team=players_per_team,
+    )
+
+    teams_by_id = {t["id"]: t for t in teams_list}
+
+    if payload.custom_distribution:
+        match_partitions: List[List[Dict[str, Any]]] = []
+        for custom_m in payload.custom_distribution:
+            part: List[Dict[str, Any]] = []
+            for t_id in custom_m.get("team_ids", []):
+                if t_id in teams_by_id:
+                    part.append(teams_by_id[t_id])
+            if part:
+                match_partitions.append(part)
+        if not match_partitions:
+            match_partitions = distribute_teams_into_matches(
+                teams=teams_list,
+                max_teams_per_match=calc["max_teams_per_match"],
+                required_matches=calc["required_matches"],
+                balanced=payload.balanced,
+            )
+    else:
+        match_partitions = distribute_teams_into_matches(
+            teams=teams_list,
+            max_teams_per_match=calc["max_teams_per_match"],
+            required_matches=calc["required_matches"],
+            balanced=payload.balanced,
+        )
+
+    stage_name = payload.stage_name or "Round 1"
+    round_name = payload.round_name or "Round 1"
+
+    # Delete existing scheduled Battle Royale matches for this round before recreating
+    await db.matches.delete_many({
+        "$or": [{"tournament_id": tid}, {"tournament_id": tslug}],
+        "round_name": round_name,
+        "status": "SCHEDULED",
+        "format": "Battle Royale",
+    })
+
+    created_matches: List[Dict[str, Any]] = []
+    for idx, chunk in enumerate(match_partitions):
+        match_num = idx + 1
+        m_id = generate_uuid()
+        team_ids = [t["id"] for t in chunk]
+        team_a_id = chunk[0]["id"] if len(chunk) > 0 else None
+        team_a_name = chunk[0]["name"] if len(chunk) > 0 else "Lobby"
+        team_b_id = chunk[1]["id"] if len(chunk) > 1 else None
+        team_b_name = f"+{len(chunk) - 1} Teams" if len(chunk) > 1 else None
+
+        match_doc = Match(
+            id=m_id,
+            tournament_id=tid,
+            stage_name=stage_name,
+            round_name=round_name,
+            stage=round_name,
+            match_type="BATTLE_ROYALE",
+            round_number=1,
+            match_number=match_num,
+            format="Battle Royale",
+            series_format="BO1",
+            status="SCHEDULED",
+            room_capacity=calc["room_capacity"],
+            players_per_team=calc["players_per_team"],
+            max_teams=calc["max_teams_per_match"],
+            teams=chunk,
+            team_ids=team_ids,
+            team_a_id=team_a_id,
+            team_a_name=team_a_name,
+            team_b_id=team_b_id,
+            team_b_name=team_b_name,
+            scheduled_time="TBD",
+            server_region=tourn.get("server_region", "AWS Mumbai (ap-south-1)"),
+        )
+        await db.matches.insert_one(match_doc.to_mongo())
+        created_matches.append(match_doc.model_dump())
+
+    # Update tournament format
+    await db.tournaments.update_one(
+        {"_id": tourn["_id"]},
+        {"$set": {
+            "match_format": "Battle Royale",
+            "tournament_type": "Battle Royale",
+            "format": "Battle Royale",
+            "room_capacity": calc["room_capacity"],
+            "players_per_team": calc["players_per_team"],
+        }}
+    )
+
+    return {
+        "status": "success",
+        "message": f"Successfully generated {len(created_matches)} Battle Royale match lobbies across {len(teams_list)} confirmed teams.",
+        "total_matches": len(created_matches),
+        "matches": created_matches,
+    }
+
+@router.post("/tournaments/{id}/rebalance-battle-royale-matches")
+async def rebalance_battle_royale_matches_admin(
+    id: str,
+    payload: RebalanceBRMatchesPayload,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Moves a confirmed team between Battle Royale match lobbies.
+    """
+    source_match = await db.matches.find_one({"$or": [{"_id": payload.from_match_id}, {"id": payload.from_match_id}]})
+    dest_match = await db.matches.find_one({"$or": [{"_id": payload.to_match_id}, {"id": payload.to_match_id}]})
+
+    if not source_match or not dest_match:
+        raise HTTPException(status_code=404, detail="Source or destination match not found")
+
+    src_teams = source_match.get("teams", [])
+    team_to_move = next((t for t in src_teams if str(t.get("id")) == payload.team_id or str(t.get("team_id")) == payload.team_id), None)
+    if not team_to_move:
+        raise HTTPException(status_code=404, detail="Team not found in source match")
+
+    # Remove from source
+    updated_src_teams = [t for t in src_teams if str(t.get("id")) != payload.team_id and str(t.get("team_id")) != payload.team_id]
+    updated_src_ids = [t.get("id") for t in updated_src_teams]
+
+    # Add to destination
+    dest_teams = dest_match.get("teams", [])
+    if not any(str(t.get("id")) == payload.team_id for t in dest_teams):
+        dest_teams.append(team_to_move)
+    updated_dest_ids = [t.get("id") for t in dest_teams]
+
+    await db.matches.update_one(
+        {"_id": source_match["_id"]},
+        {"$set": {
+            "teams": updated_src_teams,
+            "team_ids": updated_src_ids,
+            "team_a_id": updated_src_teams[0]["id"] if len(updated_src_teams) > 0 else None,
+            "team_a_name": updated_src_teams[0]["name"] if len(updated_src_teams) > 0 else "Lobby",
+            "team_b_id": updated_src_teams[1]["id"] if len(updated_src_teams) > 1 else None,
+            "team_b_name": f"+{len(updated_src_teams) - 1} Teams" if len(updated_src_teams) > 1 else None,
+        }}
+    )
+    await db.matches.update_one(
+        {"_id": dest_match["_id"]},
+        {"$set": {
+            "teams": dest_teams,
+            "team_ids": updated_dest_ids,
+            "team_a_id": dest_teams[0]["id"] if len(dest_teams) > 0 else None,
+            "team_a_name": dest_teams[0]["name"] if len(dest_teams) > 0 else "Lobby",
+            "team_b_id": dest_teams[1]["id"] if len(dest_teams) > 1 else None,
+            "team_b_name": f"+{len(dest_teams) - 1} Teams" if len(dest_teams) > 1 else None,
+        }}
+    )
+
+    return {
+        "status": "success",
+        "message": f"Team {team_to_move.get('name', 'Team')} moved to Match #{dest_match.get('match_number', '')} successfully",
+    }
+
 @router.post("/tournaments/{id}/generate-match-structure")
 async def generate_match_structure_admin(
     id: str,

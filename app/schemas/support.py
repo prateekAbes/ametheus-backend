@@ -52,8 +52,11 @@ class SupportTicketPublicResponse(BaseModel):
     ticket_id: str
     name: str
     category: str
+    payment_type: Optional[str] = None
     status: str
     created_at: str
+    email_status: str = "PENDING"
+    email_error: Optional[str] = None
     message: str = "Support ticket created successfully"
     model_config = ConfigDict(from_attributes=True, extra="ignore")
 

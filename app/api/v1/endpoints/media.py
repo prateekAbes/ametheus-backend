@@ -163,6 +163,15 @@ DEFAULT_PAGE_MEDIA = {
         "is_active": True,
         "opacity": 0.25,
     },
+    "games": {
+        "page_id": "games",
+        "title": "Games Directory",
+        "media_type": "image",
+        "media_url": "https://images.unsplash.com/photo-1511512578047-dfb367046420?auto=format&fit=crop&w=1600&q=80",
+        "fallback_url": "https://images.unsplash.com/photo-1542751371-adc38448a05e?auto=format&fit=crop&w=1600&q=80",
+        "is_active": True,
+        "opacity": 0.25,
+    },
 }
 
 @router.get("/pages")

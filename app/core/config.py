@@ -37,6 +37,50 @@ class Settings(BaseSettings):
     SMTP_FROM_NAME: str = "Ametheus Support Desk"
     ESCROW_SECRET_KEY: str = "ametheus_escrow_vault_secret_2026"
 
+    @field_validator("SMTP_HOST", mode="before")
+    @classmethod
+    def resolve_smtp_host(cls, v: Optional[str]) -> Optional[str]:
+        if v:
+            return v.strip().strip("'\"")
+        for key in ["EMAIL_HOST", "MAIL_SERVER", "SMTP_SERVER"]:
+            val = os.getenv(key)
+            if val:
+                return val.strip().strip("'\"")
+        return None
+
+    @field_validator("SMTP_USER", mode="before")
+    @classmethod
+    def resolve_smtp_user(cls, v: Optional[str]) -> Optional[str]:
+        if v:
+            return v.strip().strip("'\"")
+        for key in ["EMAIL_HOST_USER", "MAIL_USERNAME", "SMTP_USERNAME"]:
+            val = os.getenv(key)
+            if val:
+                return val.strip().strip("'\"")
+        return None
+
+    @field_validator("SMTP_PASSWORD", mode="before")
+    @classmethod
+    def resolve_smtp_password(cls, v: Optional[str]) -> Optional[str]:
+        if v:
+            return v.strip().strip("'\"")
+        for key in ["EMAIL_HOST_PASSWORD", "MAIL_PASSWORD", "SMTP_PASS"]:
+            val = os.getenv(key)
+            if val:
+                return val.strip().strip("'\"")
+        return None
+
+    @field_validator("SMTP_FROM_EMAIL", mode="before")
+    @classmethod
+    def resolve_smtp_from_email(cls, v: Optional[str]) -> str:
+        if v and v.strip():
+            return v.strip().strip("'\"")
+        for key in ["DEFAULT_FROM_EMAIL", "MAIL_FROM"]:
+            val = os.getenv(key)
+            if val:
+                return val.strip().strip("'\"")
+        return "support@ametheus.gg"
+
     @field_validator("DATABASE_URL", mode="before")
     @classmethod
     def assemble_db_url(cls, v: str) -> str:

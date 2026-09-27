@@ -91,6 +91,8 @@ class Tournament(BaseModel):
     max_teams: int = 16
     min_team_size: int = 1
     max_team_size: int = 5
+    room_capacity: Optional[int] = None  # Battle Royale room capacity (e.g. 100 players)
+    players_per_team: Optional[int] = None  # Active players per team/squad (e.g. 4)
     rank_requirement: str = "Open to All Ranks"
     format: str = "Single Elimination"
     tournament_type: str = "Single Elimination"

@@ -38,6 +38,11 @@ class Match(BaseModel):
     next_match_slot: Optional[str] = None  # "A" or "B"
     advancement_label: Optional[str] = None  # Human-readable destination label (e.g. "Round 2 Match 1 Slot A")
     check_in_status: dict[str, bool] = Field(default_factory=lambda: {"team_a": False, "team_b": False})
+    teams: list[dict] = Field(default_factory=list)  # For Battle Royale / multi-team matches
+    team_ids: list[str] = Field(default_factory=list)  # IDs of participating teams in this match lobby
+    room_capacity: Optional[int] = None
+    players_per_team: Optional[int] = None
+    max_teams: Optional[int] = None
 
     server_region: str = "AWS Mumbai (ap-south-1)"
     lobby_code: Optional[str] = None
@@ -93,6 +98,11 @@ class Match(BaseModel):
             d["stage_name"] = d.get("stage") or f"Stage {d.get('stage_id', 1)}"
         if not d.get("round_name"):
             d["round_name"] = f"Round {d.get('round_number', 1)}"
+
+        if "teams" not in d or d["teams"] is None:
+            d["teams"] = []
+        if "team_ids" not in d or d["team_ids"] is None:
+            d["team_ids"] = []
 
         return cls(**d)
 

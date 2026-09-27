@@ -11,38 +11,62 @@ logger = logging.getLogger("ametheus.email")
 
 def _send_smtp_email(to_email: str, subject: str, text_content: str, html_content: str) -> Tuple[bool, Optional[str]]:
     """Synchronous SMTP email delivery function executed in a background thread."""
-    if not settings.SMTP_HOST:
-        logger.info(
-            f"[Ametheus Email] SMTP not configured. Simulated email to <{to_email}> with subject: '{subject}'"
-        )
-        return True, "Simulated (SMTP host not configured in environment)"
+    to_email_clean = (to_email or "").strip().lower()
+    if not to_email_clean or "@" not in to_email_clean:
+        logger.warning(f"[Ametheus Email] Invalid recipient email address: '{to_email}'")
+        return False, f"Invalid recipient email address: '{to_email}'"
 
+    if not settings.SMTP_HOST:
+        logger.warning(
+            f"[Ametheus Email] SMTP not configured in environment (SMTP_HOST missing). Cannot deliver email to <{to_email_clean}> | Subject: '{subject}'"
+        )
+        return False, "SMTP service not configured in environment (SMTP_HOST is not set)"
+
+    server = None
     try:
+        # Determine sender address
+        sender_email = settings.SMTP_FROM_EMAIL or "support@ametheus.gg"
+        if settings.SMTP_USER and "@" in settings.SMTP_USER:
+            sender_email = settings.SMTP_USER.strip()
+
         msg = MIMEMultipart("alternative")
         msg["Subject"] = subject
-        msg["From"] = f"{settings.SMTP_FROM_NAME} <{settings.SMTP_FROM_EMAIL}>"
-        msg["To"] = to_email
+        msg["From"] = f"{settings.SMTP_FROM_NAME} <{sender_email}>"
+        msg["To"] = to_email_clean
 
         part1 = MIMEText(text_content, "plain", "utf-8")
         part2 = MIMEText(html_content, "html", "utf-8")
         msg.attach(part1)
         msg.attach(part2)
 
-        with smtplib.SMTP(settings.SMTP_HOST, settings.SMTP_PORT, timeout=15) as server:
+        port = int(settings.SMTP_PORT or 587)
+        host = settings.SMTP_HOST.strip()
+
+        if port == 465:
+            server = smtplib.SMTP_SSL(host, port, timeout=12)
+        else:
+            server = smtplib.SMTP(host, port, timeout=12)
             server.ehlo()
-            if settings.SMTP_PORT in (587, 25):
+            if port in (587, 25):
                 server.starttls()
                 server.ehlo()
-            if settings.SMTP_USER and settings.SMTP_PASSWORD:
-                server.login(settings.SMTP_USER, settings.SMTP_PASSWORD)
-            server.sendmail(settings.SMTP_FROM_EMAIL, [to_email], msg.as_string())
 
-        logger.info(f"[Ametheus Email] Successfully delivered email to <{to_email}> | Subject: '{subject}'")
+        if settings.SMTP_USER and settings.SMTP_PASSWORD:
+            server.login(settings.SMTP_USER.strip(), settings.SMTP_PASSWORD.strip())
+
+        server.sendmail(sender_email, [to_email_clean], msg.as_string())
+        logger.info(f"[Ametheus Email] Successfully delivered email to <{to_email_clean}> | Subject: '{subject}'")
         return True, None
     except Exception as e:
         err_msg = str(e)
-        logger.error(f"[Ametheus Email] Failed to send email to <{to_email}>: {err_msg}", exc_info=True)
+        logger.error(f"[Ametheus Email] Failed to send email to <{to_email_clean}>: {err_msg}", exc_info=True)
         return False, err_msg
+    finally:
+        if server:
+            try:
+                server.quit()
+            except Exception:
+                pass
 
 
 async def send_ticket_confirmation_email(ticket: dict) -> Tuple[bool, Optional[str]]:
@@ -53,7 +77,7 @@ async def send_ticket_confirmation_email(ticket: dict) -> Tuple[bool, Optional[s
     payment_type = ticket.get("payment_type")
     description = ticket.get("description", "")
     created_at = ticket.get("created_at", "Just now")
-    recipient = ticket.get("email")
+    recipient = (ticket.get("email") or "").strip().lower()
 
     if not recipient:
         return False, "Recipient email is missing"

@@ -113,7 +113,7 @@ async def create_support_ticket(
     await db.support_tickets.insert_one(doc)
     await db.support_logs.insert_one(init_log.to_mongo())
 
-    # Dispatch emails asynchronously
+    # Dispatch emails asynchronously with defensive error isolation
     ticket_dict = {
         "id": ticket_id,
         "ticket_id": ticket_id,
@@ -126,12 +126,32 @@ async def create_support_ticket(
         "created_at": now_iso,
     }
 
-    user_mail_ok, user_mail_err = await send_ticket_confirmation_email(ticket_dict)
-    admin_mail_ok, admin_mail_err = await send_admin_ticket_notification_email(ticket_dict)
+    user_mail_ok = False
+    user_mail_err = None
+    admin_mail_ok = False
+    admin_mail_err = None
 
-    email_status = "SENT" if (user_mail_ok and admin_mail_ok) else "FAILED"
+    try:
+        user_mail_ok, user_mail_err = await send_ticket_confirmation_email(ticket_dict)
+    except Exception as e:
+        user_mail_ok = False
+        user_mail_err = f"Exception sending user confirmation: {str(e)}"
+
+    try:
+        admin_mail_ok, admin_mail_err = await send_admin_ticket_notification_email(ticket_dict)
+    except Exception as e:
+        admin_mail_ok = False
+        admin_mail_err = f"Exception sending admin notification: {str(e)}"
+
+    if user_mail_ok and admin_mail_ok:
+        email_status = "SENT"
+    elif user_mail_ok or admin_mail_ok:
+        email_status = "PARTIAL"
+    else:
+        email_status = "FAILED"
+
     email_error_summary = None
-    if not user_mail_ok or not admin_mail_ok:
+    if email_status != "SENT":
         errs = []
         if user_mail_err:
             errs.append(f"User email: {user_mail_err}")
@@ -142,32 +162,38 @@ async def create_support_ticket(
     # Record email log entry
     email_log = SupportLogEntry(
         ticket_id=ticket_id,
-        action="EMAIL_SENT" if email_status == "SENT" else "EMAIL_FAILED",
+        action="EMAIL_SENT" if email_status == "SENT" else ("EMAIL_PARTIAL" if email_status == "PARTIAL" else "EMAIL_FAILED"),
         timestamp=datetime.now(timezone.utc).isoformat(),
         actor="SYSTEM",
         actor_role="SYSTEM",
-        details="Confirmation email delivered to user and admin" if email_status == "SENT" else f"Email delivery note: {email_error_summary}",
+        details="Confirmation email delivered to user and admin" if email_status == "SENT" else f"Email status: {email_status}. Notes: {email_error_summary}",
     )
 
-    await db.support_logs.insert_one(email_log.to_mongo())
-    await db.support_tickets.update_one(
-        {"_id": ticket_id},
-        {
-            "$set": {
-                "email_status": email_status,
-                "email_error": email_error_summary,
+    try:
+        await db.support_logs.insert_one(email_log.to_mongo())
+        await db.support_tickets.update_one(
+            {"_id": ticket_id},
+            {
+                "$set": {
+                    "email_status": email_status,
+                    "email_error": email_error_summary,
+                },
+                "$push": {"logs": email_log.to_mongo()},
             },
-            "$push": {"logs": email_log.to_mongo()},
-        },
-    )
+        )
+    except Exception:
+        pass
 
     return SupportTicketPublicResponse(
         id=ticket_id,
         ticket_id=ticket_id,
         name=ticket.name,
         category=cat_upper,
+        payment_type=payment_type,
         status="OPEN",
         created_at=now_iso,
+        email_status=email_status,
+        email_error=email_error_summary,
         message=f"Support ticket {ticket_id} created successfully.",
     )
 
