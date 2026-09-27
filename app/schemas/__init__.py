@@ -305,9 +305,22 @@ class TournamentRegisterUpiResponse(BaseModel):
     upi_uri: Optional[str] = None
     status: str = "INITIATED"
 
+class TournamentUpiDetailsResponse(BaseModel):
+    tournament_id: str
+    tournament_title: str
+    amount_inr: float
+    amount_paise: int
+    account_code: Optional[str] = None
+    upi_id: str
+    payee_name: str
+    qr_url: Optional[str] = None
+    upi_uri: str
+
 class SubmitTournamentUtrRequest(BaseModel):
-    payment_id: str
+    payment_id: Optional[str] = None
     utr: str
+    team_id: Optional[str] = None
+    account_code: Optional[str] = None
     screenshot_url: Optional[str] = None
 
 class TournamentRegistrationStatusResponse(BaseModel):
@@ -319,6 +332,16 @@ class TournamentStageFormatsUpdate(BaseModel):
     match_format: Optional[str] = None
     stage_formats: Optional[Dict[str, str]] = None
     registration_deadline: Optional[str] = None
+
+class TournamentFormatUpdatePayload(BaseModel):
+    format: str  # Knockout, Round Robin, Combination, Swiss System, Ladder Tournament
+
+class AdminSendNotificationRequest(BaseModel):
+    user_ids: List[str]
+    title: str
+    message: str
+    notification_type: Optional[str] = "ADMIN"
+    link: Optional[str] = None
 
 # Match
 class MatchResponse(BaseModel):
@@ -364,20 +387,39 @@ class AdminMatchPairRequest(BaseModel):
 
 class AdminMatchCreatePayload(BaseModel):
     tournament_id: str
-    team_a_id: str
-    team_b_id: str
-    match_type: str = "QUARTER_FINAL"
+    team_a_id: Optional[str] = None
+    team_b_id: Optional[str] = None
+    team_a_name: Optional[str] = None
+    team_b_name: Optional[str] = None
+    team_a_placeholder: Optional[str] = None
+    team_b_placeholder: Optional[str] = None
+    round_name: Optional[str] = "Round 1"
+    round_number: Optional[int] = 1
+    match_number: Optional[int] = 1
+    match_type: Optional[str] = "MATCH"
     stage: Optional[str] = None
     series_format: str = "BO1"
     match_format: Optional[str] = None
     scheduled_date: Optional[str] = None
     scheduled_time: Optional[str] = None
     scheduled_at: Optional[str] = None
+    status: Optional[str] = "SCHEDULED"
+    score_a: Optional[int] = None
+    score_b: Optional[int] = None
+    winner_team_id: Optional[str] = None
+    games: Optional[List[Dict[str, Any]]] = None
     youtube_live_url: Optional[str] = None
 
 class AdminMatchUpdatePayload(BaseModel):
     team_a_id: Optional[str] = None
     team_b_id: Optional[str] = None
+    team_a_name: Optional[str] = None
+    team_b_name: Optional[str] = None
+    team_a_placeholder: Optional[str] = None
+    team_b_placeholder: Optional[str] = None
+    round_name: Optional[str] = None
+    round_number: Optional[int] = None
+    match_number: Optional[int] = None
     match_type: Optional[str] = None
     stage: Optional[str] = None
     series_format: Optional[str] = None
@@ -385,9 +427,13 @@ class AdminMatchUpdatePayload(BaseModel):
     scheduled_date: Optional[str] = None
     scheduled_time: Optional[str] = None
     scheduled_at: Optional[str] = None
+    status: Optional[str] = None
+    score_a: Optional[int] = None
+    score_b: Optional[int] = None
+    winner_team_id: Optional[str] = None
+    games: Optional[List[Dict[str, Any]]] = None
     youtube_live_url: Optional[str] = None
     live_link: Optional[str] = None
-    status: Optional[str] = None
 
 class AdminMatchSetupItem(BaseModel):
     id: Optional[str] = None
@@ -411,7 +457,7 @@ class AdminSaveLiveStructurePayload(BaseModel):
     matches: List[AdminMatchSetupItem]
 
 class AdminMarkMatchLivePayload(BaseModel):
-    youtube_live_url: str
+    youtube_live_url: Optional[str] = None
 
 class AdminCompleteMatchPayload(BaseModel):
     winner_team_id: str

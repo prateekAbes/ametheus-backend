@@ -27,15 +27,18 @@ class Match(BaseModel):
     team_b_id: Optional[str] = None
     team_a_name: Optional[str] = None
     team_b_name: Optional[str] = None
+    team_a_placeholder: Optional[str] = None  # e.g., "Winner of Round 1 Match 1"
+    team_b_placeholder: Optional[str] = None  # e.g., "Winner of Round 1 Match 2"
     score_a: Optional[int] = None
     score_b: Optional[int] = None
     winner_team_id: Optional[str] = None
+    games: Optional[list[dict]] = None  # Individual game results for BO3 series
     advancement: Optional[dict] = None  # Tracks suggested and confirmed advancement destinations
     check_in_status: dict[str, bool] = Field(default_factory=lambda: {"team_a": False, "team_b": False})
 
     server_region: str = "AWS Mumbai (ap-south-1)"
-    lobby_code: str
-    lobby_password: str
+    lobby_code: str = "TBD"
+    lobby_password: str = "TBD"
     evidence_url: Optional[str] = None
     captain_notes: Optional[str] = None
     dispute_notes: Optional[str] = None

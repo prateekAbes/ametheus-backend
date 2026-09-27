@@ -32,6 +32,8 @@ from app.schemas import (
     MatchAdvancementPayload,
     MatchSwapPayload,
     TournamentStreamUpdatePayload,
+    TournamentFormatUpdatePayload,
+    AdminSendNotificationRequest,
     WalletAuditSummaryResponse,
 )
 from app.services.audit import record_audit_log
@@ -378,21 +380,32 @@ async def set_user_role(
 
 @router.get("/users")
 async def list_platform_users(
-    admin_user: User = Depends(require_super_admin),
+    search: Optional[str] = None,
+    admin_user: User = Depends(require_organizer),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """
-    List all platform users with role indicators for Super Admin dashboard.
+    List platform users with search support for admin/organizer dashboards and notification dispatcher.
     """
-    cursor = db.users.find()
+    query: dict[str, Any] = {}
+    if search and search.strip():
+        term = search.strip()
+        query = {
+            "$or": [
+                {"username": {"$regex": term, "$options": "i"}},
+                {"email": {"$regex": term, "$options": "i"}},
+                {"display_name": {"$regex": term, "$options": "i"}},
+            ]
+        }
+    cursor = db.users.find(query).sort("created_at", -1)
     users = await cursor.to_list(length=100)
     return [
         {
             "id": str(u.get("_id", u.get("id"))),
             "clerk_user_id": u.get("clerk_user_id"),
-            "username": u["username"],
+            "username": u.get("username", "user"),
             "display_name": u.get("display_name"),
-            "email": u["email"],
+            "email": u.get("email", ""),
             "role": u.get("role", "PLAYER"),
             "inr_balance": str(round(u.get("inr_balance_paise", 0) / 100, 2)) if "inr_balance_paise" in u else str(u.get("inr_balance", "0")),
             "created_at": str(u.get("created_at")),
@@ -814,8 +827,8 @@ async def approve_payment(
     from datetime import datetime, timezone
     now = datetime.now(timezone.utc)
 
-    # Transition from any pending status to APPROVED
-    valid_statuses = ["PENDING", "INITIATED", "PENDING_VERIFICATION", "SUBMITTED"]
+    # Transition from any valid pending status to APPROVED
+    valid_statuses = ["PENDING", "PENDING_VERIFICATION", "SUBMITTED"]
     update_res = await db.game_payments.update_one(
         {"_id": payment["_id"], "status": {"$in": valid_statuses}},
         {
@@ -1245,10 +1258,13 @@ async def get_live_matches_dashboard(
             "paired_count": len([x for x in registered_teams_list if x["is_paired"]]),
         })
 
-    async def enrich_match(m: dict) -> dict:
+    async def enrich_match(m: dict) -> Optional[dict]:
         mid = str(m.get("_id", m.get("id")))
         tourn_id = m.get("tournament_id")
         tourn = await db.tournaments.find_one({"$or": [{"_id": tourn_id}, {"id": tourn_id}, {"slug": tourn_id}]}) if tourn_id else None
+        if not tourn:
+            # Omit orphaned matches belonging to deleted tournaments
+            return None
 
         team_a_id = m.get("team_a_id")
         team_b_id = m.get("team_b_id")
@@ -1258,12 +1274,16 @@ async def get_live_matches_dashboard(
             user_a = await db.users.find_one({"$or": [{"_id": team_a_id}, {"id": team_a_id}]})
             if user_a:
                 team_a = {"name": user_a.get("username") or "Player A", "tag": "SOLO"}
+        if not team_a and m.get("team_a_placeholder"):
+            team_a = {"name": m.get("team_a_placeholder"), "tag": "TBD"}
 
         team_b = await db.teams.find_one({"$or": [{"_id": team_b_id}, {"id": team_b_id}]}) if team_b_id else None
         if not team_b and team_b_id:
             user_b = await db.users.find_one({"$or": [{"_id": team_b_id}, {"id": team_b_id}]})
             if user_b:
                 team_b = {"name": user_b.get("username") or "Player B", "tag": "SOLO"}
+        if not team_b and m.get("team_b_placeholder"):
+            team_b = {"name": m.get("team_b_placeholder"), "tag": "TBD"}
 
         scheduled_at = m.get("scheduled_at")
         scheduled_at_iso = scheduled_at.isoformat() if isinstance(scheduled_at, datetime) else scheduled_at
@@ -1272,8 +1292,11 @@ async def get_live_matches_dashboard(
             "id": mid,
             "tournament_id": tourn_id,
             "tournament_title": tourn.get("title") if tourn else "Tournament",
-            "stage": m.get("stage", "Quarterfinals"),
-            "match_type": m.get("match_type", "QUARTER_FINAL"),
+            "round_name": m.get("round_name") or m.get("stage", "Round 1"),
+            "round_number": m.get("round_number", 1),
+            "match_number": m.get("match_number", 1),
+            "stage": m.get("stage", "Round 1"),
+            "match_type": m.get("match_type", "MATCH"),
             "format": m.get("series_format") or m.get("format") or "BO1",
             "series_format": m.get("series_format") or m.get("format") or "BO1",
             "order": m.get("order", 0),
@@ -1284,21 +1307,26 @@ async def get_live_matches_dashboard(
             "youtube_live_url": m.get("youtube_live_url") or m.get("live_link"),
             "team_a": {"id": team_a_id, "name": team_a["name"], "tag": team_a.get("tag", "TEAM"), "score": m.get("score_a", 0)} if team_a else None,
             "team_b": {"id": team_b_id, "name": team_b["name"], "tag": team_b.get("tag", "TEAM"), "score": m.get("score_b", 0)} if team_b else None,
+            "team_a_placeholder": m.get("team_a_placeholder"),
+            "team_b_placeholder": m.get("team_b_placeholder"),
             "winner_team_id": m.get("winner_team_id"),
             "check_in_status": m.get("check_in_status") or {"team_a": False, "team_b": False},
+            "games": m.get("games", []),
+            "score_a": m.get("score_a", 0),
+            "score_b": m.get("score_b", 0),
         }
 
     sched_cursor = db.matches.find({"status": {"$in": ["SCHEDULED", "CHECK_IN_OPEN"]}}).sort("created_at", -1)
     sched_raw = await sched_cursor.to_list(length=100)
-    scheduled_matches = [await enrich_match(m) for m in sched_raw]
+    scheduled_matches = [res for res in [await enrich_match(m) for m in sched_raw] if res is not None]
 
     live_cursor = db.matches.find({"status": {"$in": ["LIVE", "PENDING_VERIFICATION", "DISPUTED"]}}).sort("created_at", -1)
     live_raw = await live_cursor.to_list(length=100)
-    live_matches = [await enrich_match(m) for m in live_raw]
+    live_matches = [res for res in [await enrich_match(m) for m in live_raw] if res is not None]
 
     comp_cursor = db.matches.find({"status": "COMPLETED"}).sort("updated_at", -1).limit(50)
     comp_raw = await comp_cursor.to_list(length=50)
-    completed_matches = [await enrich_match(m) for m in comp_raw]
+    completed_matches = [res for res in [await enrich_match(m) for m in comp_raw] if res is not None]
 
     return {
         "tournaments_ready": ready_tournaments,
@@ -2071,17 +2099,16 @@ async def create_match_admin(
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """
-    Rule 10: Matchup Builder endpoint.
-    Admin manually adds a match between two registered teams.
+    Matchup Builder endpoint.
+    Admin manually adds a match between two registered teams or previous round winners.
     Validates against:
     - Same team on both sides
-    - Duplicate matchups
-    - Overlapping schedule conflicts for either team
+    - Overlapping schedule conflicts for either team (when scheduled)
     """
     import uuid
     from datetime import datetime, timezone, timedelta
 
-    if payload.team_a_id == payload.team_b_id:
+    if payload.team_a_id and payload.team_b_id and payload.team_a_id == payload.team_b_id:
         raise HTTPException(status_code=400, detail="Cannot pair a team against itself. Please select two different teams.")
 
     tourn = await db.tournaments.find_one({
@@ -2092,21 +2119,35 @@ async def create_match_admin(
 
     tid = str(tourn.get("_id", tourn.get("id")))
 
-    # Verify both teams exist
-    team_a = await db.teams.find_one({"$or": [{"_id": payload.team_a_id}, {"id": payload.team_a_id}]})
-    if not team_a:
-        team_a = await db.users.find_one({"$or": [{"_id": payload.team_a_id}, {"id": payload.team_a_id}]})
-    if not team_a:
-        raise HTTPException(status_code=404, detail="Team/Contender A not found")
+    # Resolve Team A
+    name_a = payload.team_a_placeholder or "TBD"
+    if payload.team_a_id:
+        team_a = await db.teams.find_one({"$or": [{"_id": payload.team_a_id}, {"id": payload.team_a_id}]})
+        if not team_a:
+            team_a = await db.users.find_one({"$or": [{"_id": payload.team_a_id}, {"id": payload.team_a_id}]})
+        if team_a:
+            name_a = team_a.get("name") or team_a.get("username") or "Team A"
+        else:
+            name_a = payload.team_a_name or payload.team_a_placeholder or "Team A"
+    elif payload.team_a_name:
+        name_a = payload.team_a_name
+    elif not payload.team_a_placeholder:
+        raise HTTPException(status_code=400, detail="Team A ID, name, or placeholder is required.")
 
-    team_b = await db.teams.find_one({"$or": [{"_id": payload.team_b_id}, {"id": payload.team_b_id}]})
-    if not team_b:
-        team_b = await db.users.find_one({"$or": [{"_id": payload.team_b_id}, {"id": payload.team_b_id}]})
-    if not team_b:
-        raise HTTPException(status_code=404, detail="Team/Contender B not found")
-
-    name_a = team_a.get("name") or team_a.get("username") or "Team A"
-    name_b = team_b.get("name") or team_b.get("username") or "Team B"
+    # Resolve Team B
+    name_b = payload.team_b_placeholder or "TBD"
+    if payload.team_b_id:
+        team_b = await db.teams.find_one({"$or": [{"_id": payload.team_b_id}, {"id": payload.team_b_id}]})
+        if not team_b:
+            team_b = await db.users.find_one({"$or": [{"_id": payload.team_b_id}, {"id": payload.team_b_id}]})
+        if team_b:
+            name_b = team_b.get("name") or team_b.get("username") or "Team B"
+        else:
+            name_b = payload.team_b_name or payload.team_b_placeholder or "Team B"
+    elif payload.team_b_name:
+        name_b = payload.team_b_name
+    elif not payload.team_b_placeholder:
+        raise HTTPException(status_code=400, detail="Team B ID, name, or placeholder is required.")
 
     # Schedule parsing and conflict check
     scheduled_at_dt = None
@@ -2122,7 +2163,7 @@ async def create_match_admin(
         scheduled_time_str = f"{payload.scheduled_date} — {payload.scheduled_time}"
 
     # Conflict check: warn if either team already has an active or scheduled match at the same time
-    if scheduled_at_dt:
+    if scheduled_at_dt and payload.team_a_id and payload.team_b_id:
         window_start = scheduled_at_dt - timedelta(minutes=30)
         window_end = scheduled_at_dt + timedelta(minutes=30)
         conflict = await db.matches.find_one({
@@ -2142,29 +2183,37 @@ async def create_match_admin(
                 detail=f"Scheduling conflict: One of the teams ({name_a} or {name_b}) is already scheduled for another match within 30 minutes of this time slot.",
             )
 
-    series_fmt = payload.series_format or payload.match_format or "BO1"
-    if series_fmt.lower() in ["best of 1", "bo1"]:
-        series_fmt = "BO1"
-    elif series_fmt.lower() in ["best of 3", "bo3"]:
-        series_fmt = "BO3"
-    elif series_fmt.lower() in ["best of 5", "bo5"]:
-        series_fmt = "BO5"
+    # Strictly BO1 or BO3
+    raw_fmt = (payload.series_format or payload.match_format or "BO1").upper()
+    series_fmt = "BO3" if raw_fmt in ["BO3", "BEST OF 3"] else "BO1"
 
-    stage_name = payload.stage or payload.match_type.replace("_", " ").title()
+    round_name = payload.round_name or payload.stage or f"Round {payload.round_number or 1}"
+    round_num = payload.round_number or 1
+    match_num = payload.match_number or 1
 
     match = Match(
         tournament_id=tid,
-        stage=stage_name,
-        match_type=payload.match_type,
+        round_name=round_name,
+        round_number=round_num,
+        match_number=match_num,
+        stage=round_name,
+        match_type=payload.match_type or "MATCH",
         format=series_fmt,
         series_format=series_fmt,
         scheduled_at=scheduled_at_dt,
         scheduled_time=scheduled_time_str,
+        scheduled_date=payload.scheduled_date,
         live_link=payload.youtube_live_url,
         youtube_live_url=payload.youtube_live_url,
-        status="SCHEDULED",
+        status=payload.status or "SCHEDULED",
         team_a_id=payload.team_a_id,
         team_b_id=payload.team_b_id,
+        team_a_placeholder=payload.team_a_placeholder,
+        team_b_placeholder=payload.team_b_placeholder,
+        score_a=payload.score_a if payload.score_a is not None else 0,
+        score_b=payload.score_b if payload.score_b is not None else 0,
+        winner_team_id=payload.winner_team_id,
+        games=payload.games or [],
         server_region=tourn.get("server_region", "AWS Mumbai (ap-south-1)"),
         lobby_code=f"AMT-{uuid.uuid4().hex[:6].upper()}",
         lobby_password=f"PASS-{uuid.uuid4().hex[:6].upper()}",
@@ -2178,7 +2227,7 @@ async def create_match_admin(
         role=admin_user.role,
         action="CREATE_MATCH",
         target=f"Match {match.id} ({name_a} vs {name_b})",
-        details=f"Stage: {stage_name} | Series: {series_fmt} | Time: {scheduled_time_str}",
+        details=f"Round: {round_name} | Series: {series_fmt} | Time: {scheduled_time_str}",
     )
 
     return {
@@ -2195,7 +2244,7 @@ async def update_match_details_admin(
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """
-    Allows admin to modify match parameters: swap teams, change stage, series format, schedule, or YouTube URL.
+    Allows admin to modify match parameters: swap teams, placeholders, change stage/round, series format, schedule, scores, or YouTube URL.
     """
     match = await db.matches.find_one({"$or": [{"_id": id}, {"id": id}]})
     if not match:
@@ -2206,18 +2255,42 @@ async def update_match_details_admin(
         update_fields["team_a_id"] = payload.team_a_id
     if payload.team_b_id is not None:
         update_fields["team_b_id"] = payload.team_b_id
+    if payload.team_a_placeholder is not None:
+        update_fields["team_a_placeholder"] = payload.team_a_placeholder
+    if payload.team_b_placeholder is not None:
+        update_fields["team_b_placeholder"] = payload.team_b_placeholder
+    if payload.round_name is not None:
+        update_fields["round_name"] = payload.round_name
+        update_fields["stage"] = payload.round_name
+    if payload.round_number is not None:
+        update_fields["round_number"] = payload.round_number
+    if payload.match_number is not None:
+        update_fields["match_number"] = payload.match_number
     if payload.match_type is not None:
         update_fields["match_type"] = payload.match_type
-    if payload.stage is not None:
+    if payload.stage is not None and "stage" not in update_fields:
         update_fields["stage"] = payload.stage
     if payload.series_format is not None:
-        update_fields["series_format"] = payload.series_format
-        update_fields["format"] = payload.series_format
+        s_fmt = "BO3" if payload.series_format.upper() in ["BO3", "BEST OF 3"] else "BO1"
+        update_fields["series_format"] = s_fmt
+        update_fields["format"] = s_fmt
     if payload.youtube_live_url is not None:
         update_fields["youtube_live_url"] = payload.youtube_live_url
         update_fields["live_link"] = payload.youtube_live_url
     if payload.scheduled_time is not None:
         update_fields["scheduled_time"] = payload.scheduled_time
+    if payload.scheduled_date is not None:
+        update_fields["scheduled_date"] = payload.scheduled_date
+    if payload.status is not None:
+        update_fields["status"] = payload.status
+    if payload.score_a is not None:
+        update_fields["score_a"] = payload.score_a
+    if payload.score_b is not None:
+        update_fields["score_b"] = payload.score_b
+    if payload.winner_team_id is not None:
+        update_fields["winner_team_id"] = payload.winner_team_id
+    if payload.games is not None:
+        update_fields["games"] = payload.games
     if payload.scheduled_at is not None:
         from datetime import datetime
         try:
@@ -2266,6 +2339,106 @@ async def delete_match_admin(
     )
 
     return {"status": "success", "message": "Match removed successfully"}
+
+@router.post("/notifications/send")
+async def send_admin_notification(
+    payload: AdminSendNotificationRequest,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Send admin-directed announcements/notifications to targeted users.
+    """
+    from app.services.notification import create_notification
+    from app.core.ws import ws_manager
+
+    sent_count = 0
+    for uid in set(payload.user_ids):
+        user = await db.users.find_one({"$or": [{"_id": uid}, {"id": uid}]})
+        if not user:
+            user = await db.users.find_one({"_id": str(uid)})
+        if user:
+            u_id_str = str(user.get("_id", user.get("id")))
+            await create_notification(
+                db=db,
+                user_id=u_id_str,
+                title=payload.title,
+                message=payload.message,
+                notification_type=payload.notification_type or "ADMIN",
+                link=payload.link,
+            )
+            await ws_manager.broadcast({
+                "type": "NOTIFICATION_RECEIVED",
+                "user_id": u_id_str,
+                "title": payload.title,
+                "message": payload.message,
+                "link": payload.link,
+            })
+            sent_count += 1
+
+    await record_audit_log(
+        db=db,
+        operator=admin_user.username,
+        role=admin_user.role,
+        action="SEND_ADMIN_NOTIFICATION",
+        target=f"Targeted {len(payload.user_ids)} users ({sent_count} notified)",
+        details=f"Title: {payload.title} | Type: {payload.notification_type}",
+    )
+
+    return {
+        "status": "success",
+        "message": f"Successfully sent notifications to {sent_count} recipient(s)",
+        "sent_count": sent_count,
+    }
+
+@router.patch("/tournaments/{id}/format")
+async def update_tournament_format_admin(
+    id: str,
+    payload: TournamentFormatUpdatePayload,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Update tournament format mid-tournament without deleting existing completed matches or registrations.
+    Allowed formats: Knockout, Round Robin, Combination, Swiss System, Ladder Tournament.
+    """
+    tourn = await db.tournaments.find_one({"$or": [{"_id": id}, {"id": id}, {"slug": id}]})
+    if not tourn:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+
+    fmt_clean = payload.format.strip()
+    valid_formats = ["Knockout", "Round Robin", "Combination", "Swiss System", "Ladder Tournament"]
+    match_fmt = None
+    for vf in valid_formats:
+        if vf.lower() == fmt_clean.lower():
+            match_fmt = vf
+            break
+    if not match_fmt:
+        match_fmt = fmt_clean
+
+    await db.tournaments.update_one(
+        {"_id": tourn["_id"]},
+        {"$set": {
+            "format": match_fmt,
+            "tournament_type": match_fmt,
+            "match_format": match_fmt,
+        }}
+    )
+
+    await record_audit_log(
+        db=db,
+        operator=admin_user.username,
+        role=admin_user.role,
+        action="UPDATE_TOURNAMENT_FORMAT",
+        target=f"Tournament {tourn.get('title')}",
+        details=f"Format changed from {tourn.get('match_format') or tourn.get('format')} to {match_fmt}. Matches preserved.",
+    )
+
+    return {
+        "status": "success",
+        "message": f"Tournament format updated to {match_fmt}. Existing matches preserved.",
+        "format": match_fmt,
+    }
 
 @router.post("/matches/{id}/mark-live")
 async def mark_match_live_admin(

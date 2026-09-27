@@ -16,6 +16,7 @@ from app.schemas import (
     TournamentRegisterRequest,
     MatchResponse,
     TournamentRegisterUpiResponse,
+    TournamentUpiDetailsResponse,
     SubmitTournamentUtrRequest,
     TournamentRegistrationStatusResponse,
     TournamentStageFormatsUpdate,
@@ -518,45 +519,46 @@ async def register_team_for_tournament(
         if existing_reg:
             raise HTTPException(status_code=400, detail="You are already registered for this tournament")
 
-        # 1. Insert registration record first (PENDING if paid, FREE if free)
+        # 1. Debit wallet funds FIRST if paid
+        wallet_txn_id = None
+        reg_id = f"reg_{uuid.uuid4().hex[:12]}"
+        if fee_inr > 0:
+            fee_paise = int(round(fee_inr * 100))
+            wallet_txn_id = f"txn_tourn_{uuid.uuid4().hex[:12]}"
+            await debit_wallet_funds(
+                db=db,
+                user_id=current_user.id,
+                amount_paise=fee_paise,
+                txn_type="TOURNAMENT_ENTRY",
+                reference_id=reg_id,
+                description=f"Solo entry fee: {tourn.get('title', 'Tournament')}",
+            )
+
+        # 2. Insert registration record with PAID or FREE status
         reg = TournamentRegistration(
+            id=reg_id,
             tournament_id=tid,
             player_id=current_user.id,
             payment_method="WALLET" if fee_inr > 0 else "FREE",
-            payment_status="PENDING_WALLET" if fee_inr > 0 else "FREE",
-            order_id=f"reg_{uuid.uuid4().hex[:10]}",
+            payment_status="PAID" if fee_inr > 0 else "FREE",
+            order_id=wallet_txn_id or f"reg_{uuid.uuid4().hex[:10]}",
+            wallet_txn_id=wallet_txn_id,
             check_in_status="PENDING",
         )
         try:
             await db.tournament_registrations.insert_one(reg.to_mongo())
         except DuplicateKeyError:
-            raise HTTPException(status_code=400, detail="You are already registered for this tournament")
-
-        # 2. Debit wallet funds if paid
-        wallet_txn_id = None
-        if fee_inr > 0:
-            fee_paise = int(round(fee_inr * 100))
-            wallet_txn_id = f"txn_tourn_{uuid.uuid4().hex[:12]}"
-            try:
-                await debit_wallet_funds(
+            if fee_inr > 0:
+                from app.services.wallet_service import credit_wallet_funds
+                await credit_wallet_funds(
                     db=db,
                     user_id=current_user.id,
                     amount_paise=fee_paise,
-                    txn_type="TOURNAMENT_ENTRY",
-                    reference_id=reg.id,
-                    description=f"Solo entry fee: {tourn.get('title', 'Tournament')}",
+                    txn_type="REFUND",
+                    reference_id=wallet_txn_id,
+                    description="Refund duplicate tournament entry",
                 )
-                await db.tournament_registrations.update_one(
-                    {"_id": reg.id},
-                    {"$set": {"payment_status": "PAID", "wallet_txn_id": wallet_txn_id, "order_id": wallet_txn_id}}
-                )
-                reg.payment_status = "PAID"
-                reg.wallet_txn_id = wallet_txn_id
-                reg.order_id = wallet_txn_id
-            except Exception as e:
-                # Rollback registration if payment fails
-                await db.tournament_registrations.delete_one({"_id": reg.id})
-                raise e
+            raise HTTPException(status_code=400, detail="You are already registered for this tournament")
 
         if reg_count + 1 >= max_teams:
             await db.tournaments.update_one({"_id": tourn["_id"]}, {"$set": {"status": "REGISTRATION_CLOSED"}})
@@ -644,45 +646,46 @@ async def register_team_for_tournament(
     if existing_reg:
         raise HTTPException(status_code=400, detail="Team is already registered for this tournament")
 
-    # 7. Create registration record first (PENDING if paid, FREE if free)
+    # 7. Debit entry fee from captain wallet FIRST if paid tournament
+    wallet_txn_id = None
+    reg_id = f"reg_{uuid.uuid4().hex[:12]}"
+    if fee_inr > 0:
+        fee_paise = int(round(fee_inr * 100))
+        wallet_txn_id = f"txn_tourn_{uuid.uuid4().hex[:12]}"
+        await debit_wallet_funds(
+            db=db,
+            user_id=current_user.id,
+            amount_paise=fee_paise,
+            txn_type="TOURNAMENT_ENTRY",
+            reference_id=reg_id,
+            description=f"Team entry fee: {tourn.get('title', 'Tournament')} ({team.get('name')})",
+        )
+
+    # 8. Create registration record with PAID or FREE status
     reg = TournamentRegistration(
+        id=reg_id,
         tournament_id=tid,
         team_id=team_id,
         payment_method="WALLET" if fee_inr > 0 else "FREE",
-        payment_status="PENDING_WALLET" if fee_inr > 0 else "FREE",
-        order_id=f"reg_{uuid.uuid4().hex[:10]}",
+        payment_status="PAID" if fee_inr > 0 else "FREE",
+        order_id=wallet_txn_id or f"reg_{uuid.uuid4().hex[:10]}",
+        wallet_txn_id=wallet_txn_id,
         check_in_status="PENDING",
     )
     try:
         await db.tournament_registrations.insert_one(reg.to_mongo())
     except DuplicateKeyError:
-        raise HTTPException(status_code=400, detail="Team is already registered for this tournament")
-
-    # 8. Debit entry fee from captain wallet if paid tournament
-    wallet_txn_id = None
-    if fee_inr > 0:
-        fee_paise = int(round(fee_inr * 100))
-        wallet_txn_id = f"txn_tourn_{uuid.uuid4().hex[:12]}"
-        try:
-            await debit_wallet_funds(
+        if fee_inr > 0:
+            from app.services.wallet_service import credit_wallet_funds
+            await credit_wallet_funds(
                 db=db,
                 user_id=current_user.id,
                 amount_paise=fee_paise,
-                txn_type="TOURNAMENT_ENTRY",
-                reference_id=reg.id,
-                description=f"Team entry fee: {tourn.get('title', 'Tournament')} ({team.get('name')})",
+                txn_type="REFUND",
+                reference_id=wallet_txn_id,
+                description=f"Refund duplicate team entry ({team.get('name')})",
             )
-            await db.tournament_registrations.update_one(
-                {"_id": reg.id},
-                {"$set": {"payment_status": "PAID", "wallet_txn_id": wallet_txn_id, "order_id": wallet_txn_id}}
-            )
-            reg.payment_status = "PAID"
-            reg.wallet_txn_id = wallet_txn_id
-            reg.order_id = wallet_txn_id
-        except Exception as e:
-            # Rollback registration if payment fails
-            await db.tournament_registrations.delete_one({"_id": reg.id})
-            raise e
+        raise HTTPException(status_code=400, detail="Team is already registered for this tournament")
 
     if reg_count + 1 >= max_teams:
         await db.tournaments.update_one({"_id": tourn["_id"]}, {"$set": {"status": "REGISTRATION_CLOSED"}})
@@ -878,27 +881,13 @@ async def register_tournament_direct_upi(
         note=f"Tournament entry fee: {tourn.get('title', 'Tournament')[:25]}",
     )
 
-    reg = TournamentRegistration(
-        tournament_id=tid,
-        team_id=team_id,
-        player_id=current_user.id if not team_id else None,
-        payment_method="UPI",
-        payment_status="PENDING_VERIFICATION",
-        check_in_status="PENDING",
-        order_id=f"upi_tourn_{uuid.uuid4().hex[:10]}",
-    )
-    try:
-        await db.tournament_registrations.insert_one(reg.to_mongo())
-    except DuplicateKeyError:
-        raise HTTPException(status_code=400, detail="Already registered for this tournament")
-
     payment = GamePayment(
         payment_type="TOURNAMENT_ENTRY",
         user_id=current_user.id,
         game_id=tourn.get("game_id"),
         game_name=tourn.get("title"),
         tournament_id=tid,
-        registration_id=reg.id,
+        registration_id=None,
         team_id=team_id,
         team_name=team_name,
         amount_paise=fee_paise,
@@ -914,15 +903,9 @@ async def register_tournament_direct_upi(
     )
     await db.game_payments.insert_one(payment.to_mongo())
 
-    # Link payment to registration
-    await db.tournament_registrations.update_one(
-        {"_id": reg.id},
-        {"$set": {"payment_id": payment.id}}
-    )
-
     return TournamentRegisterUpiResponse(
         payment_id=payment.id,
-        registration_id=reg.id,
+        registration_id="",
         tournament_id=tid,
         tournament_title=tourn.get("title", "Tournament"),
         amount_inr=float(fee_inr),
@@ -935,6 +918,54 @@ async def register_tournament_direct_upi(
         status="INITIATED",
     )
 
+@router.get("/{id}/upi-details", response_model=TournamentUpiDetailsResponse)
+async def get_tournament_upi_details(
+    id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Returns active platform UPI payment details and QR code for a tournament
+    WITHOUT creating any registration or payment records in the database.
+    """
+    tourn = await find_tournament_by_id_or_slug(db, id)
+    if not tourn:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+
+    tid = str(tourn.get("_id", tourn.get("id")))
+    fee_inr = tourn.get("entry_fee_inr", 0)
+    fee_paise = int(round(fee_inr * 100))
+
+    upi_account = await get_next_active_upi_account(db)
+    if not upi_account:
+        raise HTTPException(
+            status_code=503,
+            detail="No active platform UPI payment accounts currently available. Please use wallet balance or contact support.",
+        )
+
+    upi_id_str = upi_account.get("upi_id")
+    payee_name_str = upi_account.get("payee_name", "Ametheus Esports")
+    account_code_str = upi_account.get("code", "UPI001")
+    qr_url_str = upi_account.get("qr_url")
+
+    upi_uri = build_upi_payment_uri(
+        upi_id=upi_id_str,
+        payee_name=payee_name_str,
+        amount_inr=float(fee_inr),
+        note=f"Tournament entry fee: {tourn.get('title', 'Tournament')[:25]}",
+    )
+
+    return TournamentUpiDetailsResponse(
+        tournament_id=tid,
+        tournament_title=tourn.get("title", "Tournament"),
+        amount_inr=float(fee_inr),
+        amount_paise=fee_paise,
+        account_code=account_code_str,
+        upi_id=upi_id_str,
+        payee_name=payee_name_str,
+        qr_url=qr_url_str,
+        upi_uri=upi_uri,
+    )
+
 @router.post("/{id}/submit-upi-utr")
 async def submit_tournament_upi_utr(
     id: str,
@@ -944,21 +975,21 @@ async def submit_tournament_upi_utr(
 ):
     """
     Submits 12-digit UTR reference for direct UPI tournament registration.
+    Only upon valid submission is a registration created with PENDING_VERIFICATION.
     """
-    payment = await db.game_payments.find_one({"$or": [{"_id": payload.payment_id}, {"id": payload.payment_id}]})
-    if not payment:
-        raise HTTPException(status_code=404, detail="Payment record not found")
-
-    if payment.get("user_id") != current_user.id and current_user.role != "SUPER_ADMIN":
-        raise HTTPException(status_code=403, detail="Not authorized to submit UTR for this payment")
-
-    clean_utr = payload.utr.strip()
+    clean_utr = payload.utr.strip() if payload.utr else ""
     if len(clean_utr) < 6:
         raise HTTPException(status_code=400, detail="Invalid UPI Transaction ID / UTR. Must be at least 6 characters.")
 
+    tourn = await find_tournament_by_id_or_slug(db, id)
+    if not tourn:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+    tid = str(tourn.get("_id", tourn.get("id")))
+
+    # Check for duplicate UTR across existing submitted payments
     existing_utr = await db.game_payments.find_one({
         "utr": clean_utr,
-        "$or": [{"_id": {"$ne": payment["_id"]}}, {"id": {"$ne": payment.get("id")}}]
+        "status": {"$in": ["PENDING", "PENDING_VERIFICATION", "APPROVED", "SUBMITTED"]}
     })
     if existing_utr:
         raise HTTPException(
@@ -966,34 +997,89 @@ async def submit_tournament_upi_utr(
             detail="This UPI Transaction ID / UTR has already been submitted for another payment.",
         )
 
-    try:
-        await db.game_payments.update_one(
-            {"_id": payment["_id"]},
-            {"$set": {
-                "utr": clean_utr,
-                "screenshot_url": payload.screenshot_url,
-                "status": "PENDING",
-            }}
+    payment = None
+    if payload.payment_id:
+        payment = await db.game_payments.find_one({"$or": [{"_id": payload.payment_id}, {"id": payload.payment_id}]})
+
+    if payment:
+        if payment.get("user_id") != current_user.id and current_user.role != "SUPER_ADMIN":
+            raise HTTPException(status_code=403, detail="Not authorized to submit UTR for this payment")
+        team_id = payment.get("team_id")
+        fee_inr = payment.get("amount_inr", tourn.get("entry_fee_inr", 0))
+    else:
+        team_id = payload.team_id
+        fee_inr = tourn.get("entry_fee_inr", 0)
+        upi_account = await get_next_active_upi_account(db)
+        account_id_str = str(upi_account.get("_id", upi_account.get("id"))) if upi_account else "default"
+        account_code_str = upi_account.get("code", "UPI001") if upi_account else "UPI001"
+        upi_id_str = upi_account.get("upi_id", "admin@upi") if upi_account else "admin@upi"
+        payee_name_str = upi_account.get("payee_name", "Ametheus Esports") if upi_account else "Ametheus Esports"
+        fee_paise = int(round(fee_inr * 100))
+
+        payment = GamePayment(
+            payment_type="TOURNAMENT_ENTRY",
+            user_id=current_user.id,
+            game_id=tourn.get("game_id"),
+            game_name=tourn.get("title"),
+            tournament_id=tid,
+            team_id=team_id,
+            amount_paise=fee_paise,
+            amount_inr=float(fee_inr),
+            payment_method="UPI",
+            payment_account_id=account_id_str,
+            payment_account_code=account_code_str,
+            upi_id=upi_id_str,
+            payee_name=payee_name_str,
+            status="PENDING",
+            utr=clean_utr,
         )
-    except DuplicateKeyError:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="This UPI Transaction ID / UTR has already been submitted for another payment.",
+        await db.game_payments.insert_one(payment.to_mongo())
+
+    # Create or update TournamentRegistration with PENDING_VERIFICATION
+    reg = await db.tournament_registrations.find_one({
+        "tournament_id": tid,
+        "$or": [{"team_id": team_id} if team_id else {"player_id": current_user.id}]
+    })
+
+    if not reg:
+        new_reg = TournamentRegistration(
+            tournament_id=tid,
+            team_id=team_id,
+            player_id=current_user.id if not team_id else None,
+            payment_method="UPI",
+            payment_status="PENDING_VERIFICATION",
+            payment_id=payment.id if hasattr(payment, "id") else str(payment.get("_id")),
+            utr=clean_utr,
+            order_id=f"upi_tourn_{uuid.uuid4().hex[:10]}",
+            check_in_status="PENDING",
+        )
+        await db.tournament_registrations.insert_one(new_reg.to_mongo())
+        reg_id = new_reg.id
+    else:
+        reg_id = str(reg.get("_id", reg.get("id")))
+        await db.tournament_registrations.update_one(
+            {"_id": reg["_id"]},
+            {"$set": {"utr": clean_utr, "payment_status": "PENDING_VERIFICATION", "payment_id": payment.id if hasattr(payment, "id") else str(payment.get("_id"))}}
         )
 
-    reg_id = payment.get("registration_id")
-    if reg_id:
-        await db.tournament_registrations.update_one(
-            {"$or": [{"_id": reg_id}, {"id": reg_id}]},
-            {"$set": {"utr": clean_utr, "payment_status": "PENDING_VERIFICATION"}}
-        )
+    # Update payment to PENDING with UTR
+    p_id = payment.id if hasattr(payment, "id") else str(payment.get("_id"))
+    await db.game_payments.update_one(
+        {"$or": [{"_id": p_id}, {"id": p_id}]},
+        {"$set": {
+            "utr": clean_utr,
+            "screenshot_url": payload.screenshot_url,
+            "status": "PENDING",
+            "registration_id": reg_id,
+        }}
+    )
 
     await record_audit_log(
         db=db,
         operator=current_user.username,
         role=current_user.role,
         action="SUBMIT_TOURNAMENT_UTR",
-        target=f"Payment {payment.get('id')} / Tourn {id}",
+        target=f"Payment {p_id} / Tourn {id}",
         details=f"Submitted UTR {clean_utr}",
     )
 
@@ -1009,8 +1095,10 @@ async def submit_tournament_upi_utr(
     return {
         "status": "PENDING",
         "message": "Payment UTR submitted successfully. Awaiting admin verification.",
-        "payment_id": payload.payment_id,
+        "payment_id": p_id,
         "utr": clean_utr,
+        "payment_status": "PENDING_VERIFICATION",
+        "registration_id": reg_id,
     }
 
 @router.patch("/admin/tournaments/{id}/stage-formats")

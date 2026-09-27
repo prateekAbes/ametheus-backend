@@ -10,6 +10,7 @@ from app.models.user import User
 from app.models.tournament import Tournament
 from app.services.audit import record_audit_log
 from app.schemas import TournamentResponse
+from app.core.ws import ws_manager
 
 router = APIRouter()
 
@@ -363,8 +364,28 @@ async def delete_tournament(
             detail="Forbidden: You do not have permission to delete this tournament",
         )
 
+    tid_str = str(tourn.get("_id", tourn.get("id")))
+    tslug = tourn.get("slug")
+    t_filter = {"$or": [{"tournament_id": id}, {"tournament_id": tid_str}, {"tournament_id": tslug}]}
+
+    # 1. Cascade delete all dependent matches (including in-progress LIVE matches)
+    await db.matches.delete_many(t_filter)
+
+    # 2. Delete all registrations
+    await db.tournament_registrations.delete_many(t_filter)
+
+    # 3. Delete tournament document
     await db.tournaments.delete_one({"_id": tourn["_id"]})
-    await db.tournament_registrations.delete_many({"$or": [{"tournament_id": id}, {"tournament_id": tourn.get("slug")}]})
+
+    # 4. Broadcast deletion event
+    try:
+        await ws_manager.broadcast({
+            "type": "TOURNAMENT_DELETED",
+            "tournament_id": tid_str,
+            "slug": tslug,
+        })
+    except Exception:
+        pass
 
     await record_audit_log(
         db=db,
