@@ -139,8 +139,61 @@ async def get_leaderboard_stats(db: AsyncIOMotorDatabase = Depends(get_db)):
     """Retrieve platform overview statistics for leaderboard header (calculated dynamically from real DB data)."""
     doc = await db.platform_settings.find_one({"_id": "leaderboard_stats"}) or {}
 
-    # Real counts from database
-    real_contenders = await db.users.count_documents({"is_dummy": {"$ne": True}})
+    # Real counts from database:
+    # An active contender is an athlete actively participating in open or active tournaments
+    # (either as an individual solo contender or through confirmed team lineups).
+    active_tournaments = await db.tournaments.find(
+        {
+            "status": {"$in": ["REGISTRATION_OPEN", "CHECK_IN_OPEN", "LIVE", "ACTIVE", "IN_PROGRESS"]},
+            "is_dummy": {"$ne": True},
+        },
+        {"_id": 1, "id": 1}
+    ).to_list(200)
+
+    active_tourn_ids = []
+    for t in active_tournaments:
+        if "_id" in t:
+            active_tourn_ids.append(str(t["_id"]))
+        if "id" in t and str(t["id"]) not in active_tourn_ids:
+            active_tourn_ids.append(str(t["id"]))
+
+    if not active_tourn_ids:
+        real_contenders = 0
+    else:
+        active_regs = await db.tournament_registrations.find({
+            "tournament_id": {"$in": active_tourn_ids},
+            "status": {"$ne": "CANCELLED"},
+            "payment_status": {"$in": ["PAID", "FREE", "CONFIRMED", "SUCCESS"]},
+            "is_dummy": {"$ne": True},
+        }).to_list(1000)
+
+        contender_user_ids = set()
+        team_ids_to_fetch = set()
+        for reg in active_regs:
+            if reg.get("player_id"):
+                contender_user_ids.add(str(reg["player_id"]))
+            if reg.get("team_id"):
+                team_ids_to_fetch.add(str(reg["team_id"]))
+
+        if team_ids_to_fetch:
+            teams = await db.teams.find({
+                "$or": [
+                    {"_id": {"$in": list(team_ids_to_fetch)}},
+                    {"id": {"$in": list(team_ids_to_fetch)}},
+                ],
+                "is_dummy": {"$ne": True},
+            }).to_list(500)
+            for team in teams:
+                if team.get("captain_id"):
+                    contender_user_ids.add(str(team["captain_id"]))
+                for p in team.get("players", []):
+                    if isinstance(p, dict) and p.get("user_id"):
+                        contender_user_ids.add(str(p["user_id"]))
+                    elif isinstance(p, str):
+                        contender_user_ids.add(p)
+
+        real_contenders = len(contender_user_ids)
+
     real_squads = await db.teams.count_documents({"is_dummy": {"$ne": True}})
 
     # Real total awarded prizes from completed payouts
@@ -148,7 +201,7 @@ async def get_leaderboard_stats(db: AsyncIOMotorDatabase = Depends(get_db)):
     total_prizes = sum(int(p.get("amount_paise", 0)) // 100 for p in paid_payouts)
 
     total_awarded_str = doc.get("total_awarded_prizes") or (f"₹{total_prizes:,}" if total_prizes > 0 else "₹0")
-    active_contenders_str = doc.get("active_contenders") or str(real_contenders)
+    active_contenders_str = str(real_contenders)
     verified_squads_str = doc.get("verified_squads") or str(real_squads)
     top_team_earnings_str = doc.get("top_team_earnings") or "₹0"
     top_team_name_str = doc.get("top_team_name") or ""
