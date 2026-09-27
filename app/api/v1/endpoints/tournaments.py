@@ -79,9 +79,11 @@ async def list_tournaments(
     status: Optional[str] = None,
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
-    filter_query = {}
+    filter_query = {"is_dummy": {"$ne": True}}
     if status:
         filter_query["status"] = status
+    else:
+        filter_query["status"] = {"$nin": ["DELETED", "CANCELLED", "HIDDEN", "DRAFT"]}
 
     cursor = db.tournaments.find(filter_query)
     tournaments = await cursor.to_list(length=100)
@@ -235,6 +237,41 @@ async def get_my_tournament_registrations(
         })
 
     return results
+ 
+@router.get("/summary")
+async def get_tournaments_summary(db: AsyncIOMotorDatabase = Depends(get_db)):
+    """Return live aggregate tournament figures for homepage and public promotional statistics."""
+    active_tournaments = await db.tournaments.find(
+        {
+            "status": {"$nin": ["DELETED", "CANCELLED", "HIDDEN", "DRAFT"]},
+            "is_dummy": {"$ne": True},
+        },
+        {"prize_pool_inr": 1, "status": 1, "title": 1}
+    ).to_list(length=200)
+
+    total_prize_pool_inr = sum(int(t.get("prize_pool_inr") or 0) for t in active_tournaments)
+    active_count = len(active_tournaments)
+
+    # Indian numbering format
+    s = str(total_prize_pool_inr)
+    if len(s) <= 3:
+        formatted = f"₹{s}"
+    else:
+        last_three = s[-3:]
+        remaining = s[:-3]
+        groups = []
+        while len(remaining) > 2:
+            groups.insert(0, remaining[-2:])
+            remaining = remaining[:-2]
+        if remaining:
+            groups.insert(0, remaining)
+        formatted = f"₹{','.join(groups)},{last_three}"
+
+    return {
+        "total_prize_pool_inr": total_prize_pool_inr,
+        "formatted_prize_pool": formatted,
+        "active_tournaments_count": active_count,
+    }
 
 @router.get("/{slug}", response_model=TournamentResponse)
 async def get_tournament_by_slug(slug: str, db: AsyncIOMotorDatabase = Depends(get_db)):
