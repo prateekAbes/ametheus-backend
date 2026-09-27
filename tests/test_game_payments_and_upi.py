@@ -175,3 +175,62 @@ async def test_legacy_upi_accounts_serialization_without_created_at(client, db_s
     assert legacy["created_at"] is None
     assert legacy["payment_count"] == 0
     assert legacy["status"] == "ACTIVE"
+
+@pytest.mark.asyncio
+async def test_upload_upi_qr_standalone_and_account(client, db_session):
+    import io
+    admin_headers = make_auth_headers("usr_super_admin")
+
+    # 1. Standalone QR upload
+    fake_png = io.BytesIO(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15c4")
+    res = await client.post(
+        "/api/v1/admin/upi-accounts/upload-qr",
+        files={"file": ("qr_code.png", fake_png, "image/png")},
+        headers=admin_headers,
+    )
+    assert res.status_code == 200
+    standalone_data = res.json()
+    assert standalone_data["status"] == "success"
+    assert standalone_data["qr_url"].startswith("/api/v1/media/img_")
+    media_id = standalone_data["media_id"]
+
+    # Verify media is in database
+    db_media = await db_session.media.find_one({"id": media_id})
+    assert db_media is not None
+
+    # 2. Create UPI account
+    create_res = await client.post(
+        "/api/v1/admin/upi-accounts",
+        json={
+            "code": "UPI_QR_TEST",
+            "upi_id": "qrtest@okaxis",
+            "payee_name": "Ametheus QR Test",
+            "status": "ACTIVE",
+        },
+        headers=admin_headers,
+    )
+    assert create_res.status_code in (200, 201)
+    acct_id = create_res.json()["id"]
+
+    # 3. Upload QR directly to this account
+    fake_png2 = io.BytesIO(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15c4")
+    upload_res = await client.post(
+        f"/api/v1/admin/upi-accounts/{acct_id}/qr",
+        files={"file": ("official_qr.png", fake_png2, "image/png")},
+        headers=admin_headers,
+    )
+    assert upload_res.status_code == 200
+    upload_data = upload_res.json()
+    assert upload_data["status"] == "success"
+    assert upload_data["qr_url"].startswith("/api/v1/media/img_")
+
+    # 4. Verify account in database has updated qr_url
+    updated_acct = await db_session.upi_accounts.find_one({"$or": [{"_id": acct_id}, {"id": acct_id}]})
+    assert updated_acct is not None
+    assert updated_acct.get("qr_url") == upload_data["qr_url"]
+
+    # 5. Verify media binary is fetchable
+    media_res = await client.get(upload_data["qr_url"])
+    assert media_res.status_code == 200
+    assert media_res.headers["content-type"] == "image/png"
+
