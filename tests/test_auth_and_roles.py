@@ -116,3 +116,157 @@ async def test_username_case_insensitive_uniqueness(client):
     assert res3.status_code == 200
     assert res3.json()["username"] == "unique_gamer_99"
 
+@pytest.mark.asyncio
+async def test_clerk_sync_preserves_custom_avatar_and_display_name(client):
+    uid = "clerk_avatar_preserve_user"
+    headers = make_auth_headers(uid)
+
+    # 1. Initial sync with default Clerk avatar
+    init_res = await client.post("/api/v1/auth/sync", json={
+        "clerk_user_id": uid,
+        "email": "avatar_tester@ametheus.gg",
+        "username": "avatar_tester",
+        "display_name": "Avatar Tester",
+        "avatar_url": "https://img.clerk.com/initial_avatar.png",
+    }, headers=headers)
+    assert init_res.status_code == 200
+    assert init_res.json()["avatar_url"] == "https://img.clerk.com/initial_avatar.png"
+
+    # 2. User updates profile with a custom avatar & display name
+    update_res = await client.put("/api/v1/auth/profile", json={
+        "display_name": "CUSTOM VORTEX ACE",
+        "avatar_url": "https://ametheus.gg/api/v1/media/img_custom_123.png",
+    }, headers=headers)
+    assert update_res.status_code == 200
+    assert update_res.json()["display_name"] == "CUSTOM VORTEX ACE"
+    assert update_res.json()["avatar_url"] == "https://ametheus.gg/api/v1/media/img_custom_123.png"
+
+    # 3. Clerk sync runs again (e.g. on page refresh) passing old Clerk image
+    resync_res = await client.post("/api/v1/auth/sync", json={
+        "clerk_user_id": uid,
+        "email": "avatar_tester@ametheus.gg",
+        "username": "avatar_tester",
+        "display_name": "Old Clerk Name",
+        "avatar_url": "https://img.clerk.com/initial_avatar.png",
+    }, headers=headers)
+    assert resync_res.status_code == 200
+    resync_data = resync_res.json()
+    # Must preserve the custom avatar and custom display name
+    assert resync_data["avatar_url"] == "https://ametheus.gg/api/v1/media/img_custom_123.png"
+    assert resync_data["display_name"] == "CUSTOM VORTEX ACE"
+
+    # 4. Verify GET /me also returns the custom avatar
+    me_res = await client.get("/api/v1/auth/me", headers=headers)
+    assert me_res.status_code == 200
+    assert me_res.json()["avatar_url"] == "https://ametheus.gg/api/v1/media/img_custom_123.png"
+
+@pytest.mark.asyncio
+async def test_multiple_sequential_avatar_uploads_and_persistence(client):
+    from bson import ObjectId
+    uid = "clerk_multi_avatar_user"
+    headers = make_auth_headers(uid)
+
+    # 1. Initial Sync
+    init_res = await client.post("/api/v1/auth/sync", json={
+        "clerk_user_id": uid,
+        "email": "multi_avatar@ametheus.gg",
+        "username": "multi_tester",
+        "display_name": "Multi Tester",
+        "avatar_url": "https://img.clerk.com/default.png",
+    }, headers=headers)
+    assert init_res.status_code == 200
+
+    # Cycle 1: Upload picture-A
+    p1_res = await client.put("/api/v1/auth/profile", json={
+        "avatar_url": "/api/v1/media/img_picture_A.png",
+    }, headers=headers)
+    assert p1_res.status_code == 200
+    assert p1_res.json()["avatar_url"] == "/api/v1/media/img_picture_A.png"
+
+    # Refresh simulation 1
+    ref1 = await client.post("/api/v1/auth/sync", json={
+        "clerk_user_id": uid,
+        "email": "multi_avatar@ametheus.gg",
+        "username": "multi_tester",
+        "display_name": "Multi Tester",
+        "avatar_url": "https://img.clerk.com/default.png",
+    }, headers=headers)
+    assert ref1.status_code == 200
+    assert ref1.json()["avatar_url"] == "/api/v1/media/img_picture_A.png"
+
+    # Cycle 2: Upload picture-B
+    p2_res = await client.put("/api/v1/auth/profile", json={
+        "avatar_url": "/api/v1/media/img_picture_B.png",
+    }, headers=headers)
+    assert p2_res.status_code == 200
+    assert p2_res.json()["avatar_url"] == "/api/v1/media/img_picture_B.png"
+
+    # Refresh simulation 2
+    ref2 = await client.get("/api/v1/auth/me", headers=headers)
+    assert ref2.status_code == 200
+    assert ref2.json()["avatar_url"] == "/api/v1/media/img_picture_B.png"
+
+    # Cycle 3: Upload picture-C
+    p3_res = await client.put("/api/v1/auth/profile", json={
+        "avatar_url": "/api/v1/media/img_picture_C.png",
+    }, headers=headers)
+    assert p3_res.status_code == 200
+    assert p3_res.json()["avatar_url"] == "/api/v1/media/img_picture_C.png"
+
+    # Refresh simulation 3
+    ref3 = await client.post("/api/v1/auth/sync", json={
+        "clerk_user_id": uid,
+        "email": "multi_avatar@ametheus.gg",
+        "username": "multi_tester",
+        "display_name": "Multi Tester",
+        "avatar_url": "https://img.clerk.com/default.png",
+    }, headers=headers)
+    assert ref3.status_code == 200
+    assert ref3.json()["avatar_url"] == "/api/v1/media/img_picture_C.png"
+
+    # Cycle 4: Change name ONLY (picture-C must remain)
+    name_res = await client.put("/api/v1/auth/profile", json={
+        "display_name": "RENAMED CONTENDER",
+    }, headers=headers)
+    assert name_res.status_code == 200
+    assert name_res.json()["display_name"] == "RENAMED CONTENDER"
+    assert name_res.json()["avatar_url"] == "/api/v1/media/img_picture_C.png"
+
+    # Cycle 5: Change name AND picture together
+    both_res = await client.put("/api/v1/auth/profile", json={
+        "display_name": "FINAL CHAMPION",
+        "avatar_url": "/api/v1/media/img_picture_D.png",
+    }, headers=headers)
+    assert both_res.status_code == 200
+    assert both_res.json()["display_name"] == "FINAL CHAMPION"
+    assert both_res.json()["avatar_url"] == "/api/v1/media/img_picture_D.png"
+
+    # Cycle 6: Verify user record with native ObjectId in MongoDB updates without failing
+    from app.core.database import get_db
+    from app.main import app
+    db = await anext(app.dependency_overrides[get_db]())
+    oid = ObjectId()
+    oid_uid = "clerk_oid_user"
+    oid_headers = make_auth_headers(oid_uid)
+    await db.users.insert_one({
+        "_id": oid,
+        "clerk_user_id": oid_uid,
+        "email": "oid_user@ametheus.gg",
+        "username": "oid_tester",
+        "display_name": "OID Tester",
+        "avatar_url": "old_avatar.png",
+        "role": "PLAYER",
+        "inr_balance_paise": 0,
+        "inr_balance": "0.00",
+    })
+    oid_update = await client.put("/api/v1/auth/profile", json={
+        "avatar_url": "/api/v1/media/img_oid_new.png",
+    }, headers=oid_headers)
+    assert oid_update.status_code == 200
+    assert oid_update.json()["avatar_url"] == "/api/v1/media/img_oid_new.png"
+    # Verify in DB directly by ObjectId
+    db_doc = await db.users.find_one({"_id": oid})
+    assert db_doc["avatar_url"] == "/api/v1/media/img_oid_new.png"
+
+
+

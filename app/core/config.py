@@ -1,5 +1,5 @@
 import os
-from typing import List, Union
+from typing import List, Union, Optional
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -28,6 +28,13 @@ class Settings(BaseSettings):
     SUPER_ADMIN_EMAIL: str = "admin@ametheus.gg"
     SUPPORT_PHONE: str = "+91 98765 43210"
     SUPPORT_EMAIL: str = "support@ametheus.gg"
+    SUPPORT_ADMIN_EMAIL: str = "ametheus.gg@gmail.com"
+    SMTP_HOST: Optional[str] = None
+    SMTP_PORT: int = 587
+    SMTP_USER: Optional[str] = None
+    SMTP_PASSWORD: Optional[str] = None
+    SMTP_FROM_EMAIL: str = "support@ametheus.gg"
+    SMTP_FROM_NAME: str = "Ametheus Support Desk"
     ESCROW_SECRET_KEY: str = "ametheus_escrow_vault_secret_2026"
 
     @field_validator("DATABASE_URL", mode="before")

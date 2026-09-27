@@ -84,9 +84,11 @@ async def sync_clerk_user(
     if user_doc:
         # Update metadata and ensure super admin role if designated email
         update_fields = {"clerk_user_id": payload.clerk_user_id}
-        if payload.display_name:
+        # Only populate display_name if not already present in the user's database record
+        if not user_doc.get("display_name") and payload.display_name:
             update_fields["display_name"] = payload.display_name
-        if payload.avatar_url:
+        # Only populate avatar_url if not already present in the user's database record (preserve custom user avatars)
+        if not user_doc.get("avatar_url") and payload.avatar_url:
             update_fields["avatar_url"] = payload.avatar_url
         if is_super_admin:
             update_fields["role"] = "SUPER_ADMIN"
@@ -208,7 +210,44 @@ async def update_user_profile(
         current_user.avatar_url = update_data["avatar_url"]
 
     if update_data:
-        await db.users.update_one({"_id": current_user.id}, {"$set": update_data})
+        from bson import ObjectId
+
+        # Resolve authoritative document in MongoDB preserving its native _id type
+        query_clauses = [
+            {"_id": current_user.id},
+            {"id": current_user.id},
+        ]
+        if current_user.clerk_user_id:
+            query_clauses.extend([
+                {"clerk_user_id": current_user.clerk_user_id},
+                {"_id": current_user.clerk_user_id},
+            ])
+        if current_user.email:
+            query_clauses.append({"email": current_user.email})
+        if ObjectId.is_valid(str(current_user.id)):
+            query_clauses.append({"_id": ObjectId(str(current_user.id))})
+
+        target_user_doc = await db.users.find_one({"$or": query_clauses})
+        if not target_user_doc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User account record not found in database",
+            )
+
+        target_mongo_id = target_user_doc["_id"]
+
+        update_res = await db.users.update_one(
+            {"_id": target_mongo_id},
+            {"$set": update_data}
+        )
+        if update_res.matched_count == 0:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to persist profile update to database",
+            )
+
+        fresh_doc = await db.users.find_one({"_id": target_mongo_id})
+        return User.from_mongo(fresh_doc)
 
     return current_user
 

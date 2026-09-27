@@ -1,0 +1,322 @@
+import re
+from datetime import datetime, timezone
+from typing import List, Optional
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from motor.motor_asyncio import AsyncIOMotorDatabase
+from app.api.deps import get_db, get_current_user, get_current_user_optional, require_organizer
+from app.models.user import User
+from app.models.support import SupportTicket, SupportLogEntry, generate_ticket_id
+from app.schemas.support import (
+    SupportTicketCreateRequest,
+    SupportTicketUpdateRequest,
+    SupportTicketResponse,
+    SupportTicketPublicResponse,
+    SupportTicketListResponse,
+    SupportLogResponse,
+)
+from app.services.email_service import (
+    send_ticket_confirmation_email,
+    send_admin_ticket_notification_email,
+)
+
+router = APIRouter()
+
+VALID_STATUSES = {"OPEN", "IN_PROGRESS", "WAITING_FOR_USER", "RESOLVED", "CLOSED"}
+VALID_CATEGORIES = {
+    "PAYMENT",
+    "WALLET",
+    "TOURNAMENT",
+    "REGISTRATION",
+    "TEAM",
+    "MATCH",
+    "ACCOUNT",
+    "TECHNICAL_ISSUE",
+    "GAME_ISSUE",
+    "OTHER",
+}
+
+
+def _clean_ticket_doc(doc: dict) -> dict:
+    item = dict(doc)
+    item["id"] = str(item.get("_id", item.get("id", "")))
+    if "_id" in item:
+        item["_id"] = str(item["_id"])
+    if not item.get("ticket_id"):
+        item["ticket_id"] = item["id"]
+    return item
+
+
+@router.post("/tickets", response_model=SupportTicketPublicResponse, status_code=status.HTTP_201_CREATED)
+async def create_support_ticket(
+    payload: SupportTicketCreateRequest,
+    current_user: Optional[User] = Depends(get_current_user_optional),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Creates a real support ticket in the database, generates a unique Ticket ID,
+
+    records an audit log, and dispatches confirmation emails.
+    """
+    email_clean = payload.email.strip().lower()
+    if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email_clean):
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid email format provided.",
+        )
+
+    # Normalize category
+    cat_upper = payload.category.strip().upper().replace(" ", "_").replace("-", "_")
+    if cat_upper not in VALID_CATEGORIES:
+        cat_upper = "OTHER"
+
+    # Payment type validation
+    payment_type = payload.payment_type.strip().upper() if payload.payment_type else None
+    if payment_type in ("NONE", "N/A", "NOT APPLICABLE", ""):
+        payment_type = "NOT_APPLICABLE"
+
+    ticket_id = generate_ticket_id()
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    # User attribution
+    user_id = current_user.id if current_user else None
+    user_handle = current_user.username if current_user else None
+    actor_name = current_user.display_name or current_user.username if current_user else payload.name.strip()
+    actor_role = "USER" if current_user else "GUEST"
+
+    # Initial creation log entry
+    init_log = SupportLogEntry(
+        ticket_id=ticket_id,
+        action="TICKET_CREATED",
+        timestamp=now_iso,
+        actor=actor_name,
+        actor_role=actor_role,
+        details=f"Support ticket created under category '{cat_upper}'.",
+    )
+
+    ticket = SupportTicket(
+        id=ticket_id,
+        ticket_id=ticket_id,
+        name=payload.name.strip(),
+        email=email_clean,
+        user_id=user_id,
+        user_handle=user_handle,
+        category=cat_upper,
+        payment_type=payment_type,
+        description=payload.description.strip(),
+        status="OPEN",
+        email_status="PENDING",
+        logs=[init_log],
+        created_at=now_iso,
+        updated_at=now_iso,
+    )
+
+    doc = ticket.to_mongo()
+    await db.support_tickets.insert_one(doc)
+    await db.support_logs.insert_one(init_log.to_mongo())
+
+    # Dispatch emails asynchronously
+    ticket_dict = {
+        "id": ticket_id,
+        "ticket_id": ticket_id,
+        "name": ticket.name,
+        "email": ticket.email,
+        "user_id": user_id,
+        "category": cat_upper,
+        "payment_type": payment_type,
+        "description": ticket.description,
+        "created_at": now_iso,
+    }
+
+    user_mail_ok, user_mail_err = await send_ticket_confirmation_email(ticket_dict)
+    admin_mail_ok, admin_mail_err = await send_admin_ticket_notification_email(ticket_dict)
+
+    email_status = "SENT" if (user_mail_ok and admin_mail_ok) else "FAILED"
+    email_error_summary = None
+    if not user_mail_ok or not admin_mail_ok:
+        errs = []
+        if user_mail_err:
+            errs.append(f"User email: {user_mail_err}")
+        if admin_mail_err:
+            errs.append(f"Admin email: {admin_mail_err}")
+        email_error_summary = "; ".join(errs)
+
+    # Record email log entry
+    email_log = SupportLogEntry(
+        ticket_id=ticket_id,
+        action="EMAIL_SENT" if email_status == "SENT" else "EMAIL_FAILED",
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        actor="SYSTEM",
+        actor_role="SYSTEM",
+        details="Confirmation email delivered to user and admin" if email_status == "SENT" else f"Email delivery note: {email_error_summary}",
+    )
+
+    await db.support_logs.insert_one(email_log.to_mongo())
+    await db.support_tickets.update_one(
+        {"_id": ticket_id},
+        {
+            "$set": {
+                "email_status": email_status,
+                "email_error": email_error_summary,
+            },
+            "$push": {"logs": email_log.to_mongo()},
+        },
+    )
+
+    return SupportTicketPublicResponse(
+        id=ticket_id,
+        ticket_id=ticket_id,
+        name=ticket.name,
+        category=cat_upper,
+        status="OPEN",
+        created_at=now_iso,
+        message=f"Support ticket {ticket_id} created successfully.",
+    )
+
+
+@router.get("/tickets", response_model=SupportTicketListResponse)
+async def list_support_tickets(
+    status_filter: Optional[str] = Query(None, alias="status"),
+    category: Optional[str] = None,
+    search: Optional[str] = None,
+    limit: int = Query(50, ge=1, le=200),
+    skip: int = Query(0, ge=0),
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Admin endpoint to retrieve and search support tickets with status and category filtering."""
+    query: dict = {}
+
+    if status_filter and status_filter.upper() != "ALL":
+        query["status"] = status_filter.upper()
+
+    if category and category.upper() != "ALL":
+        query["category"] = category.upper()
+
+    if search:
+        search_rgx = {"$regex": re.escape(search.strip()), "$options": "i"}
+        query["$or"] = [
+            {"ticket_id": search_rgx},
+            {"id": search_rgx},
+            {"name": search_rgx},
+            {"email": search_rgx},
+            {"description": search_rgx},
+        ]
+
+    total = await db.support_tickets.count_documents(query)
+    cursor = db.support_tickets.find(query).sort("created_at", -1).skip(skip).limit(limit)
+    docs = await cursor.to_list(length=limit)
+
+    tickets = [_clean_ticket_doc(d) for d in docs]
+    return SupportTicketListResponse(tickets=tickets, total=total)
+
+
+@router.get("/tickets/{ticket_id}", response_model=SupportTicketResponse)
+async def get_support_ticket_details(
+    ticket_id: str,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Admin endpoint to retrieve a full support ticket by Ticket ID along with its audit logs."""
+    doc = await db.support_tickets.find_one({"$or": [{"_id": ticket_id}, {"ticket_id": ticket_id}, {"id": ticket_id}]})
+    if not doc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Support ticket '{ticket_id}' not found.",
+        )
+
+    # Retrieve all standalone logs associated with this ticket
+    log_cursor = db.support_logs.find({"ticket_id": doc.get("ticket_id", ticket_id)}).sort("timestamp", 1)
+    db_logs = await log_cursor.to_list(length=100)
+
+    cleaned = _clean_ticket_doc(doc)
+    if db_logs:
+        # Merge logs cleanly
+        log_ids = {l["id"] for l in cleaned.get("logs", [])}
+        for l in db_logs:
+            if l.get("id") not in log_ids:
+                cleaned.setdefault("logs", []).append(l)
+
+    return SupportTicketResponse(**cleaned)
+
+
+@router.patch("/tickets/{ticket_id}", response_model=SupportTicketResponse)
+async def update_support_ticket(
+    ticket_id: str,
+    payload: SupportTicketUpdateRequest,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Admin endpoint to update ticket status or add internal administrative notes."""
+    doc = await db.support_tickets.find_one({"$or": [{"_id": ticket_id}, {"ticket_id": ticket_id}, {"id": ticket_id}]})
+    if not doc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Support ticket '{ticket_id}' not found.",
+        )
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    update_fields: dict = {"updated_at": now_iso}
+    new_logs: List[dict] = []
+    actor_name = admin_user.display_name or admin_user.username or "Admin Arbiter"
+
+    if payload.status:
+        st_upper = payload.status.strip().upper().replace(" ", "_")
+        if st_upper not in VALID_STATUSES:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid status '{payload.status}'. Allowed: {list(VALID_STATUSES)}",
+            )
+        old_status = doc.get("status", "OPEN")
+        if old_status != st_upper:
+            update_fields["status"] = st_upper
+            if st_upper in ("RESOLVED", "CLOSED"):
+                update_fields["resolved_at"] = now_iso
+
+            status_log = SupportLogEntry(
+                ticket_id=doc.get("ticket_id", ticket_id),
+                action="STATUS_CHANGED",
+                timestamp=now_iso,
+                actor=actor_name,
+                actor_role="ADMIN",
+                details=f"Status changed from {old_status} to {st_upper}.",
+            )
+            new_logs.append(status_log.to_mongo())
+
+    if payload.internal_notes is not None:
+        update_fields["internal_notes"] = payload.internal_notes.strip()
+        note_log = SupportLogEntry(
+            ticket_id=doc.get("ticket_id", ticket_id),
+            action="NOTE_ADDED",
+            timestamp=now_iso,
+            actor=actor_name,
+            actor_role="ADMIN",
+            details="Internal administrative notes updated.",
+        )
+        new_logs.append(note_log.to_mongo())
+
+    update_op: dict = {"$set": update_fields}
+    if new_logs:
+        update_op["$push"] = {"logs": {"$each": new_logs}}
+        for nl in new_logs:
+            await db.support_logs.insert_one(nl)
+
+    await db.support_tickets.update_one({"_id": doc["_id"]}, update_op)
+
+    updated_doc = await db.support_tickets.find_one({"_id": doc["_id"]})
+    return SupportTicketResponse(**_clean_ticket_doc(updated_doc))
+
+
+@router.get("/my-tickets", response_model=List[SupportTicketResponse])
+async def get_my_support_tickets(
+    current_user: User = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Retrieves tickets created by the authenticated user."""
+    query = {
+        "$or": [
+            {"user_id": current_user.id},
+            {"email": current_user.email.lower() if current_user.email else None},
+        ]
+    }
+    cursor = db.support_tickets.find(query).sort("created_at", -1)
+    docs = await cursor.to_list(length=50)
+    return [SupportTicketResponse(**_clean_ticket_doc(d)) for d in docs]

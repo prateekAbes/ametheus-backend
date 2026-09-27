@@ -1,4 +1,4 @@
-from typing import List, Union
+from typing import List, Union, Optional
 from fastapi import APIRouter, Depends, HTTPException, status
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
@@ -63,6 +63,29 @@ async def serialize_team(team: Union[dict, Team], db: AsyncIOMotorDatabase) -> T
         members=[map_member(m, "MEMBER") for m in raw_members],
         substitutes=[map_member(m, "SUBSTITUTE") for m in raw_substitutes],
     )
+
+@router.get("", response_model=List[TeamResponse])
+async def list_teams(
+    game_slug: Optional[str] = None,
+    search: Optional[str] = None,
+    limit: int = 50,
+    skip: int = 0,
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    query = {"is_dummy": {"$ne": True}}
+    if game_slug:
+        game = await db.games.find_one({"$or": [{"slug": game_slug}, {"_id": game_slug}, {"id": game_slug}]})
+        if game:
+            gid = str(game.get("_id", game.get("id")))
+            query["game_id"] = gid
+    if search:
+        query["$or"] = [
+            {"name": {"$regex": search, "$options": "i"}},
+            {"tag": {"$regex": search, "$options": "i"}},
+        ]
+    cursor = db.teams.find(query).skip(skip).limit(min(limit, 100))
+    teams = await cursor.to_list(length=limit)
+    return [await serialize_team(t, db) for t in teams]
 
 @router.post("", response_model=TeamResponse, status_code=status.HTTP_201_CREATED)
 async def create_team(

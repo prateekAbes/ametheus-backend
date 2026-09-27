@@ -27,22 +27,33 @@ async def get_current_user(
 
     target_id = payload["sub"]
 
+    from bson import ObjectId
+    user_or = [{"_id": target_id}, {"clerk_user_id": target_id}, {"id": target_id}]
+    if ObjectId.is_valid(str(target_id)):
+        user_or.append({"_id": ObjectId(str(target_id))})
+
     # Authoritative DB lookup by clerk_user_id or _id / id
-    user_doc = await db.users.find_one({
-        "$or": [{"_id": target_id}, {"clerk_user_id": target_id}, {"id": target_id}]
-    })
+    user_doc = await db.users.find_one({"$or": user_or})
+
+    email = payload.get("email") or payload.get("primary_email_address")
+    if not user_doc and email:
+        user_doc = await db.users.find_one({"email": email})
+        if user_doc:
+            await db.users.update_one({"_id": user_doc["_id"]}, {"$set": {"clerk_user_id": target_id}})
+            user_doc = await db.users.find_one({"_id": user_doc["_id"]})
+
     if not user_doc:
         # If cryptographically verified by Clerk but not yet synced in DB, auto-provision
         # This prevents 401 race conditions on initial page load (e.g. /notifications, /leaderboard)
-        email = payload.get("email") or payload.get("primary_email_address") or f"{target_id}@ametheus.gg"
+        user_email = email or f"{target_id}@ametheus.gg"
         admin_emails = {"pk.4081988@gmail.com", "admin@ametheus.gg"}
-        is_super_admin = email.lower() in admin_emails
+        is_super_admin = user_email.lower() in admin_emails
         initial_role = "SUPER_ADMIN" if is_super_admin else "PLAYER"
 
         new_user = User(
             id=target_id,
             clerk_user_id=target_id,
-            email=email,
+            email=user_email,
             username=payload.get("username") or payload.get("preferred_username") or target_id[:12],
             display_name=payload.get("name") or payload.get("username") or "Contender",
             avatar_url=payload.get("picture"),
@@ -58,6 +69,17 @@ async def get_current_user(
             user.role = "SUPER_ADMIN"
             await db.users.update_one({"_id": user.id}, {"$set": {"role": "SUPER_ADMIN"}})
     return user
+
+async def get_current_user_optional(
+    authorization: Optional[str] = Header(None),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+) -> Optional[User]:
+    if not authorization or not authorization.startswith("Bearer "):
+        return None
+    try:
+        return await get_current_user(authorization=authorization, db=db)
+    except HTTPException:
+        return None
 
 async def require_player(
     current_user: User = Depends(get_current_user),

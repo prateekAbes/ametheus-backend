@@ -13,6 +13,7 @@ from app.api.v1.endpoints import (
     organizer,
     tournaments,
     matches,
+    support,
 )
 
 api_router = APIRouter()
@@ -29,3 +30,4 @@ api_router.include_router(media.router, prefix="/media", tags=["Media & Image Up
 api_router.include_router(organizer.router, prefix="/organizer", tags=["Tournament Organizer"])
 api_router.include_router(tournaments.router, prefix="/tournaments", tags=["Tournaments"])
 api_router.include_router(matches.router, prefix="/matches", tags=["Matches"])
+api_router.include_router(support.router, prefix="/support", tags=["Support & Tickets"])

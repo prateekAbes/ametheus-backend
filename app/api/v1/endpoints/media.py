@@ -154,6 +154,15 @@ DEFAULT_PAGE_MEDIA = {
         "is_active": True,
         "opacity": 0.25,
     },
+    "teams": {
+        "page_id": "teams",
+        "title": "Teams & Squads Hub",
+        "media_type": "gif",
+        "media_url": "https://media.giphy.com/media/v1.Y2lkPTc5MGI3NjExM3Z0ZWFmNnN2cWJxeHoxbjlyM3cydXBnNDB1NnY2d2hkYWFxdG00MSZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/3oKIPnAiaMCws8nOsE/giphy.gif",
+        "fallback_url": "https://images.unsplash.com/photo-1542751371-adc38448a05e?auto=format&fit=crop&w=1600&q=80",
+        "is_active": True,
+        "opacity": 0.25,
+    },
 }
 
 @router.get("/pages")
