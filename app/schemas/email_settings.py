@@ -1,5 +1,5 @@
 import re
-from typing import Optional
+from typing import Optional, Dict
 from pydantic import BaseModel, Field, field_validator
 
 EMAIL_REGEX = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -20,25 +20,20 @@ class EmailSettingsResponse(BaseModel):
     updated_by: Optional[str] = None
 
 
-class EmailSettingsUpdateRequest(BaseModel):
-    official_email: str = Field(..., min_length=5, max_length=150, description="General official or business communication email")
-    support_email: str = Field(..., min_length=5, max_length=150, description="Public support destination email")
-    automated_email: str = Field(..., min_length=5, max_length=150, description="From sender identity for automated notifications")
+class EmailServiceStatusItem(BaseModel):
+    service: str
+    email: str
+    display_name: str
+    smtp_host: str
+    smtp_port: int
+    use_tls: bool
+    configured: bool
+    status: str  # "Configured" or "Not Configured"
 
-    @field_validator("official_email")
-    @classmethod
-    def check_official_email(cls, v: str) -> str:
-        return validate_email_format(v, "Official Email")
 
-    @field_validator("support_email")
-    @classmethod
-    def check_support_email(cls, v: str) -> str:
-        return validate_email_format(v, "Support Email")
-
-    @field_validator("automated_email")
-    @classmethod
-    def check_automated_email(cls, v: str) -> str:
-        return validate_email_format(v, "Automated Email")
+class EmailSystemStatusResponse(BaseModel):
+    email_enabled: bool
+    services: Dict[str, EmailServiceStatusItem]
 
 
 class SmtpStatusResponse(BaseModel):
@@ -46,6 +41,7 @@ class SmtpStatusResponse(BaseModel):
     connected: bool
     authenticated: bool
     sender: str
+    service: Optional[str] = "support"
     host: Optional[str] = None
     port: Optional[int] = 587
     secure: bool = False
@@ -54,6 +50,7 @@ class SmtpStatusResponse(BaseModel):
 
 
 class SendTestEmailRequest(BaseModel):
+    service: str = Field(default="support", description="Service identity to test: 'support', 'noreply', or 'official'")
     to_email: str = Field(..., min_length=5, max_length=150, description="Destination email address for the test message")
 
     @field_validator("to_email")
@@ -61,10 +58,24 @@ class SendTestEmailRequest(BaseModel):
     def check_to_email(cls, v: str) -> str:
         return validate_email_format(v, "Destination Email")
 
+    @field_validator("service")
+    @classmethod
+    def normalize_service(cls, v: str) -> str:
+        norm = (v or "support").strip().lower()
+        if norm in ("support", "help", "contact"):
+            return "support"
+        if norm in ("noreply", "no-reply", "automated", "system"):
+            return "noreply"
+        if norm in ("official", "business", "general"):
+            return "official"
+        raise ValueError("Service must be 'support', 'noreply', or 'official'")
+
 
 class SendTestEmailResponse(BaseModel):
     success: bool
+    service: str = "support"
     message_id: Optional[str] = None
     error_code: Optional[str] = None
     error_details: Optional[str] = None
     sender_used: Optional[str] = None
+    message: str = "Test email sent successfully"

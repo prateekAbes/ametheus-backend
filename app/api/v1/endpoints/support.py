@@ -60,48 +60,9 @@ def _clean_ticket_doc(doc: dict) -> dict:
 
 
 @router.get("/settings", response_model=SupportSettingsResponse)
-async def get_support_settings(
-    db: AsyncIOMotorDatabase = Depends(get_db),
-):
-    """Returns the currently configured support destination email."""
-    email_dest = await _get_configured_support_email(db)
-    return SupportSettingsResponse(support_email=email_dest)
-
-
-@router.put("/settings", response_model=SupportSettingsResponse)
-async def update_support_settings(
-    payload: SupportSettingsUpdateRequest,
-    admin_user: User = Depends(require_organizer),
-    db: AsyncIOMotorDatabase = Depends(get_db),
-):
-    """Updates the support destination email where admin notification copies are routed."""
-    clean_email = payload.support_email.strip().lower()
-    if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", clean_email):
-        raise HTTPException(status_code=400, detail="Invalid support email address format.")
-
-    now_iso = datetime.now(timezone.utc).isoformat()
-    await db.platform_settings.update_one(
-        {"_id": "support_settings"},
-        {
-            "$set": {
-                "support_email": clean_email,
-                "updated_at": now_iso,
-                "updated_by": admin_user.username,
-            }
-        },
-        upsert=True,
-    )
-
-    await record_audit_log(
-        db=db,
-        operator=admin_user.username,
-        role=admin_user.role,
-        action="UPDATE_SUPPORT_EMAIL",
-        target="Support Desk Configuration",
-        details=f"Configured support recipient updated to '{clean_email}'",
-    )
-
-    return SupportSettingsResponse(support_email=clean_email)
+async def get_support_settings():
+    """Returns the currently configured support destination email from server environment."""
+    return SupportSettingsResponse(support_email=settings.SUPPORT_EMAIL)
 
 
 @router.post("/tickets", response_model=SupportTicketPublicResponse, status_code=status.HTTP_201_CREATED)

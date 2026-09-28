@@ -26,33 +26,86 @@ class Settings(BaseSettings):
     ]
     CLERK_ISSUER: str = "https://clerk.ametheus.gg"
     SUPER_ADMIN_EMAIL: str = "admin@ametheus.gg"
-    OFFICIAL_EMAIL: str = "ametheus@gmail.com"
     SUPPORT_PHONE: str = "+91 98765 43210"
-    SUPPORT_EMAIL: str = "support@ametheus.gg"
-    SUPPORT_ADMIN_EMAIL: str = "ametheus.gg@gmail.com"
-    AUTOMATED_EMAIL: str = "ametheus.noreply@gmail.com"
+    SUPPORT_ADMIN_EMAIL: str = "support.ametheus@gmail.com"
+    ESCROW_SECRET_KEY: str = "ametheus_escrow_vault_secret_2026"
+
+    # =========================================================
+    # AMETHEUS 3 GMAIL SMTP IDENTITIES & EMAIL SYSTEM
+    # =========================================================
+    EMAIL_ENABLED: bool = True
+    EMAIL_REPLY_TO: str = "support.ametheus@gmail.com"
+
+    # ---------- 1. Support Email ----------
+    SUPPORT_EMAIL: str = "support.ametheus@gmail.com"
+    SUPPORT_EMAIL_NAME: str = "Ametheus Support"
+    SUPPORT_SMTP_HOST: str = "smtp.gmail.com"
+    SUPPORT_SMTP_PORT: int = 587
+    SUPPORT_SMTP_USERNAME: str = "support.ametheus@gmail.com"
+    SUPPORT_SMTP_PASSWORD: Optional[str] = None
+    SUPPORT_SMTP_USE_TLS: bool = True
+
+    # ---------- 2. No-Reply / Automated Email ----------
+    NOREPLY_EMAIL: str = "noreply.ametheus@gmail.com"
+    NOREPLY_EMAIL_NAME: str = "Ametheus"
+    NOREPLY_SMTP_HOST: str = "smtp.gmail.com"
+    NOREPLY_SMTP_PORT: int = 587
+    NOREPLY_SMTP_USERNAME: str = "noreply.ametheus@gmail.com"
+    NOREPLY_SMTP_PASSWORD: Optional[str] = None
+    NOREPLY_SMTP_USE_TLS: bool = True
+
+    # ---------- 3. Official Email ----------
+    OFFICIAL_EMAIL: str = "official.ametheus@gmail.com"
+    OFFICIAL_EMAIL_NAME: str = "Ametheus"
+    OFFICIAL_SMTP_HOST: str = "smtp.gmail.com"
+    OFFICIAL_SMTP_PORT: int = 587
+    OFFICIAL_SMTP_USERNAME: str = "official.ametheus@gmail.com"
+    OFFICIAL_SMTP_PASSWORD: Optional[str] = None
+    OFFICIAL_SMTP_USE_TLS: bool = True
+
+    # Compatibility fallbacks
+    AUTOMATED_EMAIL: str = "noreply.ametheus@gmail.com"
     SMTP_HOST: Optional[str] = None
     SMTP_PORT: int = 587
     SMTP_USER: Optional[str] = None
     SMTP_PASSWORD: Optional[str] = None
     SMTP_SECURE: bool = False
-    SMTP_FROM_EMAIL: str = "support@ametheus.gg"
-    SMTP_FROM_NAME: str = "Ametheus Support Desk"
-    ESCROW_SECRET_KEY: str = "ametheus_escrow_vault_secret_2026"
+    SMTP_FROM_EMAIL: str = "support.ametheus@gmail.com"
+    SMTP_FROM_NAME: str = "Ametheus"
 
-    @field_validator("SMTP_SECURE", mode="before")
+    @field_validator(
+        "EMAIL_ENABLED",
+        "SUPPORT_SMTP_USE_TLS",
+        "NOREPLY_SMTP_USE_TLS",
+        "OFFICIAL_SMTP_USE_TLS",
+        "SMTP_SECURE",
+        mode="before"
+    )
     @classmethod
-    def resolve_smtp_secure(cls, v: Union[bool, str, None]) -> bool:
+    def resolve_bool_flags(cls, v: Union[bool, str, None]) -> bool:
         if v is None:
-            val = os.getenv("SMTP_USE_TLS") or os.getenv("EMAIL_USE_TLS") or os.getenv("EMAIL_USE_SSL")
-            if val is not None:
-                return val.strip().lower() in ("true", "1", "yes", "on", "t")
-            return False
+            return True
         if isinstance(v, bool):
             return v
         if isinstance(v, str):
             return v.strip().lower() in ("true", "1", "yes", "on", "t")
         return bool(v)
+
+    @field_validator(
+        "SUPPORT_SMTP_PORT",
+        "NOREPLY_SMTP_PORT",
+        "OFFICIAL_SMTP_PORT",
+        "SMTP_PORT",
+        mode="before"
+    )
+    @classmethod
+    def resolve_smtp_ports(cls, v: Union[int, str, None]) -> int:
+        if v is None or v == "":
+            return 587
+        try:
+            return int(v)
+        except (ValueError, TypeError):
+            return 587
 
     @field_validator("SMTP_HOST", mode="before")
     @classmethod
@@ -96,7 +149,7 @@ class Settings(BaseSettings):
             val = os.getenv(key)
             if val:
                 return val.strip().strip("'\"")
-        return "support@ametheus.gg"
+        return "support.ametheus@gmail.com"
 
     @field_validator("DATABASE_URL", mode="before")
     @classmethod

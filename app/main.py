@@ -21,6 +21,12 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"[AMETHEUS Lifespan Warning]: {e}")
 
+    try:
+        from app.services.email_service import validate_email_configuration
+        validate_email_configuration()
+    except Exception as e:
+        print(f"[AMETHEUS Email Startup Warning]: {e}")
+
     yield
 
 app = FastAPI(

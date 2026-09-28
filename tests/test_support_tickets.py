@@ -124,27 +124,18 @@ async def test_support_settings_and_email_retry(client, db_session):
     admin_headers = make_auth_headers("usr_super_admin")
     player_headers = make_auth_headers("usr_vortex_lead")
 
-    # 1. Get default settings
+    # 1. Get environment-configured support destination email
     settings_res = await client.get("/api/v1/support/settings", headers=admin_headers)
     assert settings_res.status_code == 200
-    assert "support_email" in settings_res.json()
+    assert settings_res.json()["support_email"] == "support.ametheus@gmail.com"
 
-    # 2. Update support email settings
-    update_res = await client.put(
+    # 2. Verify PUT /support/settings is removed/blocked (infrastructure config cannot be mutated via API)
+    put_res = await client.put(
         "/api/v1/support/settings",
         json={"support_email": "custom-support@ametheus.gg"},
         headers=admin_headers,
     )
-    assert update_res.status_code == 200
-    assert update_res.json()["support_email"] == "custom-support@ametheus.gg"
-
-    # Non-admin cannot update settings
-    non_admin_res = await client.put(
-        "/api/v1/support/settings",
-        json={"support_email": "hacked@ametheus.gg"},
-        headers=player_headers,
-    )
-    assert non_admin_res.status_code == 403
+    assert put_res.status_code in (404, 405)
 
     # 3. Create a ticket to test retry functionality
     create_res = await client.post(

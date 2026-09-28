@@ -9,135 +9,160 @@ from typing import Optional, Tuple, Dict, Any
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from app.core.config import settings
-from app.schemas.email_settings import SendTestEmailResponse, SmtpStatusResponse
-from app.services.email_config_service import (
-    get_automated_email,
-    get_support_email,
-    get_official_email,
-    DEFAULT_AUTOMATED_EMAIL,
-    DEFAULT_SUPPORT_EMAIL,
+from app.schemas.email_settings import (
+    SendTestEmailResponse,
+    SmtpStatusResponse,
+    EmailSystemStatusResponse,
+    EmailServiceStatusItem,
 )
 
 logger = logging.getLogger("ametheus.email")
 
 
-def _send_smtp_email(
+def get_identity_config(identity: str) -> Dict[str, Any]:
+    """
+    Returns the fixed configuration dictionary for one of the three Gmail SMTP identities:
+    'support', 'noreply', or 'official'.
+    Credentials are drawn strictly from server environment variables.
+    """
+    norm = (identity or "").strip().lower()
+    if norm in ("support", "help", "contact"):
+        user = (settings.SUPPORT_SMTP_USERNAME or settings.SUPPORT_EMAIL).strip()
+        pwd = settings.SUPPORT_SMTP_PASSWORD or settings.SMTP_PASSWORD
+        return {
+            "key": "support",
+            "email": settings.SUPPORT_EMAIL.strip(),
+            "name": settings.SUPPORT_EMAIL_NAME.strip(),
+            "host": (settings.SUPPORT_SMTP_HOST or settings.SMTP_HOST or "smtp.gmail.com").strip(),
+            "port": int(settings.SUPPORT_SMTP_PORT or settings.SMTP_PORT or 587),
+            "username": user,
+            "password": pwd.strip() if pwd else None,
+            "use_tls": bool(settings.SUPPORT_SMTP_USE_TLS),
+            "reply_to": settings.SUPPORT_EMAIL.strip(),
+        }
+    elif norm in ("noreply", "no-reply", "automated", "system"):
+        user = (settings.NOREPLY_SMTP_USERNAME or settings.NOREPLY_EMAIL).strip()
+        pwd = settings.NOREPLY_SMTP_PASSWORD or settings.SMTP_PASSWORD
+        return {
+            "key": "noreply",
+            "email": settings.NOREPLY_EMAIL.strip(),
+            "name": settings.NOREPLY_EMAIL_NAME.strip(),
+            "host": (settings.NOREPLY_SMTP_HOST or settings.SMTP_HOST or "smtp.gmail.com").strip(),
+            "port": int(settings.NOREPLY_SMTP_PORT or settings.SMTP_PORT or 587),
+            "username": user,
+            "password": pwd.strip() if pwd else None,
+            "use_tls": bool(settings.NOREPLY_SMTP_USE_TLS),
+            "reply_to": settings.SUPPORT_EMAIL.strip(),
+        }
+    elif norm in ("official", "business", "general"):
+        user = (settings.OFFICIAL_SMTP_USERNAME or settings.OFFICIAL_EMAIL).strip()
+        pwd = settings.OFFICIAL_SMTP_PASSWORD or settings.SMTP_PASSWORD
+        return {
+            "key": "official",
+            "email": settings.OFFICIAL_EMAIL.strip(),
+            "name": settings.OFFICIAL_EMAIL_NAME.strip(),
+            "host": (settings.OFFICIAL_SMTP_HOST or settings.SMTP_HOST or "smtp.gmail.com").strip(),
+            "port": int(settings.OFFICIAL_SMTP_PORT or settings.SMTP_PORT or 587),
+            "username": user,
+            "password": pwd.strip() if pwd else None,
+            "use_tls": bool(settings.OFFICIAL_SMTP_USE_TLS),
+            "reply_to": settings.SUPPORT_EMAIL.strip(),
+        }
+    else:
+        raise ValueError(f"Unknown email identity: '{identity}'. Must be 'support', 'noreply', or 'official'.")
+
+
+def _send_identity_smtp_sync(
+    identity_key: str,
     to_email: str,
     subject: str,
     text_content: str,
     html_content: str,
-    sender_email: Optional[str] = None,
-    sender_name: Optional[str] = None,
     reply_to: Optional[str] = None,
 ) -> Tuple[bool, Optional[str], Optional[str], Optional[str], str]:
     """
-    Synchronous SMTP email delivery function executed in a background thread.
+    Synchronous SMTP delivery using the specified identity's isolated Gmail SMTP configuration.
     Returns:
         (success: bool, error_code: Optional[str], error_details: Optional[str], message_id: Optional[str], sender_used: str)
     """
     to_email_clean = (to_email or "").strip().lower()
     if not to_email_clean or "@" not in to_email_clean:
         logger.warning(f"[Ametheus Email] Invalid recipient email address: '{to_email}'")
-        return False, "RECIPIENT_REJECTED", f"Invalid recipient email address: '{to_email}'", None, sender_email or DEFAULT_AUTOMATED_EMAIL
+        return False, "RECIPIENT_REJECTED", f"Invalid recipient email address: '{to_email}'", None, ""
 
-    if not settings.SMTP_HOST:
+    cfg = get_identity_config(identity_key)
+    sender_used = cfg["email"]
+
+    if not settings.EMAIL_ENABLED:
+        logger.info(f"[Ametheus Email] Email delivery disabled (EMAIL_ENABLED=False). Mocking delivery to <{to_email_clean}> | Subject: '{subject}'")
+        return True, None, None, f"MOCK-{uuid.uuid4().hex[:8].upper()}", sender_used
+
+    if not cfg["password"] or not cfg["host"]:
         logger.warning(
-            f"[Ametheus Email] SMTP not configured in environment (SMTP_HOST missing). Cannot deliver email to <{to_email_clean}> | Subject: '{subject}'"
+            f"[Ametheus Email] {cfg['name']} ({identity_key}) SMTP is not configured in server environment (missing App Password or host). Cannot deliver email to <{to_email_clean}> | Subject: '{subject}'"
         )
-        return False, "SMTP_NOT_CONFIGURED", "SMTP service not configured in environment (SMTP_HOST is not set)", None, sender_email or DEFAULT_AUTOMATED_EMAIL
-
-    # Determine desired sender address and display name
-    from_addr = (sender_email or settings.SMTP_FROM_EMAIL or DEFAULT_AUTOMATED_EMAIL).strip()
-    from_name = (sender_name or settings.SMTP_FROM_NAME or "Ametheus").strip()
+        return False, "SMTP_NOT_CONFIGURED", f"{cfg['name']} SMTP service is not configured in environment.", None, sender_used
 
     msg_id = f"AMT-{uuid.uuid4().hex[:12].upper()}@ametheus.gg"
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
-    msg["From"] = f"{from_name} <{from_addr}>"
+    msg["From"] = f"{cfg['name']} <{cfg['email']}>"
     msg["To"] = to_email_clean
     msg["Message-ID"] = f"<{msg_id}>"
-
-    if reply_to:
-        msg["Reply-To"] = reply_to
-    elif settings.SUPPORT_EMAIL:
-        msg["Reply-To"] = settings.SUPPORT_EMAIL
+    msg["Reply-To"] = reply_to or cfg["reply_to"]
 
     part1 = MIMEText(text_content, "plain", "utf-8")
     part2 = MIMEText(html_content, "html", "utf-8")
     msg.attach(part1)
     msg.attach(part2)
 
-    port = int(settings.SMTP_PORT or 587)
-    host = settings.SMTP_HOST.strip()
-    is_ssl = (port == 465) or getattr(settings, "SMTP_SECURE", False)
+    host = cfg["host"]
+    port = cfg["port"]
+    is_ssl = (port == 465)
 
     server = None
-    envelope_sender = from_addr
-    sender_used = from_addr
-
     try:
         if is_ssl:
             server = smtplib.SMTP_SSL(host, port, timeout=12)
         else:
             server = smtplib.SMTP(host, port, timeout=12)
             server.ehlo()
-            if port in (587, 25) or getattr(settings, "SMTP_SECURE", False):
+            if cfg["use_tls"] or port in (587, 25):
                 server.starttls()
                 server.ehlo()
 
-        if settings.SMTP_USER and settings.SMTP_PASSWORD:
-            server.login(settings.SMTP_USER.strip(), settings.SMTP_PASSWORD.strip())
+        server.login(cfg["username"], cfg["password"])
 
-        # Attempt delivery with configured sender identity
-        try:
-            server.sendmail(envelope_sender, [to_email_clean], msg.as_string())
-            logger.info(f"[Ametheus Email] Successfully delivered email to <{to_email_clean}> from <{sender_used}> | Subject: '{subject}'")
-            return True, None, None, msg_id, sender_used
-        except (smtplib.SMTPSenderRefused, smtplib.SMTPResponseException) as sender_err:
-            # Check for sender mismatch restriction (e.g. Gmail / strict relays requiring envelope = authenticated user)
-            is_sender_refusal = (
-                isinstance(sender_err, smtplib.SMTPSenderRefused)
-                or (getattr(sender_err, "smtp_code", None) in (530, 550, 553, 554))
-            )
-            auth_account = (settings.SMTP_USER or "").strip()
-
-            if is_sender_refusal and auth_account and "@" in auth_account and envelope_sender.lower() != auth_account.lower():
-                logger.warning(
-                    f"[Ametheus Email] SMTP provider rejected envelope sender <{envelope_sender}>: {sender_err}. "
-                    f"Retrying with authenticated account <{auth_account}> for envelope delivery while preserving From header."
-                )
-                envelope_sender = auth_account
-                sender_used = f"{from_addr} (via {auth_account})"
-                server.sendmail(envelope_sender, [to_email_clean], msg.as_string())
-                logger.info(f"[Ametheus Email] Successfully delivered email to <{to_email_clean}> using envelope fallback <{auth_account}> | Subject: '{subject}'")
-                return True, None, None, msg_id, sender_used
-            else:
-                raise sender_err
+        # Envelope sender matches authenticated username for Gmail SMTP compliance
+        envelope_sender = cfg["username"]
+        server.sendmail(envelope_sender, [to_email_clean], msg.as_string())
+        logger.info(f"[Ametheus Email] Successfully delivered email via {identity_key.upper()} to <{to_email_clean}> from <{cfg['email']}> | Subject: '{subject}'")
+        return True, None, None, msg_id, sender_used
 
     except smtplib.SMTPAuthenticationError as e:
         err_msg = f"SMTP authentication failed: {e.smtp_error.decode(errors='replace') if isinstance(e.smtp_error, bytes) else str(e)}"
-        logger.error(f"[Ametheus Email] Authentication failed on {host}:{port}: {err_msg}")
-        return False, "SMTP_AUTHENTICATION_FAILED", "SMTP authentication failed. Verify username and password / App Password.", None, sender_used
+        logger.error(f"[Ametheus Email] Authentication failed on {host}:{port} for {identity_key}: {err_msg}")
+        return False, "SMTP_AUTHENTICATION_FAILED", "SMTP authentication failed. Verify Gmail App Password.", None, sender_used
 
     except (smtplib.SMTPServerDisconnected, smtplib.SMTPConnectError, ConnectionRefusedError, socket.gaierror, socket.error, TimeoutError) as e:
         err_msg = f"SMTP connection error: {e}"
-        logger.error(f"[Ametheus Email] Connection failed on {host}:{port}: {err_msg}")
-        return False, "SMTP_CONNECTION_FAILED", "Failed to connect to SMTP host. Connection timed out or server unreachable.", None, sender_used
+        logger.error(f"[Ametheus Email] Connection failed on {host}:{port} for {identity_key}: {err_msg}")
+        return False, "SMTP_CONNECTION_FAILED", "Failed to connect to SMTP server. Connection timed out or host unreachable.", None, sender_used
 
     except smtplib.SMTPRecipientsRefused as e:
         err_msg = f"Recipient rejected: {e}"
         logger.error(f"[Ametheus Email] Recipient rejected: {err_msg}")
-        return False, "RECIPIENT_REJECTED", f"Recipient address rejected by mail server: {to_email_clean}", None, sender_used
+        return False, "RECIPIENT_REJECTED", f"Recipient address rejected: {to_email_clean}", None, sender_used
 
     except smtplib.SMTPSenderRefused as e:
         err_msg = f"Sender rejected: {e}"
         logger.error(f"[Ametheus Email] Sender rejected: {err_msg}")
-        return False, "INVALID_SENDER", f"Sender address rejected by mail server: {envelope_sender}", None, sender_used
+        return False, "INVALID_SENDER", f"Sender address rejected: {cfg['email']}", None, sender_used
 
     except Exception as e:
         err_msg = str(e)
-        logger.error(f"[Ametheus Email] Failed to send email to <{to_email_clean}>: {err_msg}", exc_info=True)
+        logger.error(f"[Ametheus Email] Failed to deliver email via {identity_key} to <{to_email_clean}>: {err_msg}", exc_info=True)
         return False, "MESSAGE_SEND_FAILED", f"Failed to deliver email: {err_msg}", None, sender_used
 
     finally:
@@ -148,23 +173,166 @@ def _send_smtp_email(
                 pass
 
 
-def _check_smtp_health_sync() -> Dict[str, Any]:
-    """Synchronous test of SMTP connectivity and authentication."""
-    if not settings.SMTP_HOST:
+# =========================================================================
+# CENTRAL EMAIL SERVICE PUBLIC API
+# =========================================================================
+
+async def send_support_email(
+    to_email: str,
+    subject: str,
+    text_content: str,
+    html_content: str,
+    reply_to: Optional[str] = None,
+) -> Tuple[bool, Optional[str]]:
+    """
+    Sends an email using the SUPPORT identity (support.ametheus@gmail.com).
+    Used for contact/support messages, user support requests, help inquiries, and support ticket communication.
+    """
+    ok, err_code, err_det, _, _ = await asyncio.to_thread(
+        _send_identity_smtp_sync,
+        "support",
+        to_email,
+        subject,
+        text_content,
+        html_content,
+        reply_to or settings.SUPPORT_EMAIL,
+    )
+    return ok, err_det
+
+
+async def send_noreply_email(
+    to_email: str,
+    subject: str,
+    text_content: str,
+    html_content: str,
+    reply_to: Optional[str] = None,
+) -> Tuple[bool, Optional[str]]:
+    """
+    Sends an email using the NO-REPLY / AUTOMATED identity (noreply.ametheus@gmail.com).
+    Used for registration confirmations, account verification, password resets,
+    automated notifications, tournament/game notifications, match reminders, and system alerts.
+    """
+    ok, err_code, err_det, _, _ = await asyncio.to_thread(
+        _send_identity_smtp_sync,
+        "noreply",
+        to_email,
+        subject,
+        text_content,
+        html_content,
+        reply_to or settings.SUPPORT_EMAIL,
+    )
+    return ok, err_det
+
+
+async def send_official_email(
+    to_email: str,
+    subject: str,
+    text_content: str,
+    html_content: str,
+    reply_to: Optional[str] = None,
+) -> Tuple[bool, Optional[str]]:
+    """
+    Sends an email using the OFFICIAL identity (official.ametheus@gmail.com).
+    Used for official announcements, organizational correspondence, and administrative communications.
+    """
+    ok, err_code, err_det, _, _ = await asyncio.to_thread(
+        _send_identity_smtp_sync,
+        "official",
+        to_email,
+        subject,
+        text_content,
+        html_content,
+        reply_to or settings.SUPPORT_EMAIL,
+    )
+    return ok, err_det
+
+
+# =========================================================================
+# SYSTEM STATUS & STARTUP VALIDATION
+# =========================================================================
+
+def get_email_system_status() -> EmailSystemStatusResponse:
+    """
+    Returns the non-sensitive configuration status of all three email services.
+    Never exposes passwords, tokens, or raw secrets.
+    """
+    services_map: Dict[str, EmailServiceStatusItem] = {}
+
+    for key in ("support", "noreply", "official"):
+        cfg = get_identity_config(key)
+        is_configured = bool(cfg["password"] and cfg["host"])
+        services_map[key] = EmailServiceStatusItem(
+            service=key,
+            email=cfg["email"],
+            display_name=cfg["name"],
+            smtp_host=cfg["host"],
+            smtp_port=cfg["port"],
+            use_tls=cfg["use_tls"],
+            configured=is_configured,
+            status="Configured" if is_configured else "Not Configured",
+        )
+
+    return EmailSystemStatusResponse(
+        email_enabled=settings.EMAIL_ENABLED,
+        services=services_map,
+    )
+
+
+def validate_email_configuration() -> Dict[str, bool]:
+    """
+    Startup diagnostic validator called during FastAPI application lifespan.
+    Logs human-readable configuration status without printing passwords.
+    """
+    logger.info("[Ametheus Email] Validating 3 Gmail SMTP identities...")
+    status = {}
+    for key in ("support", "noreply", "official"):
+        cfg = get_identity_config(key)
+        is_configured = bool(cfg["password"] and cfg["host"])
+        status[key] = is_configured
+        if is_configured:
+            logger.info(f"[Ametheus Email] {cfg['name']} ({key} -> {cfg['email']}): Configured")
+            print(f"[AMETHEUS EMAIL] {cfg['name']} SMTP ({cfg['email']}): Configured")
+        else:
+            logger.warning(f"[Ametheus Email] {cfg['name']} ({key} -> {cfg['email']}): Not Configured (Password missing in environment).")
+            print(f"[AMETHEUS EMAIL] {cfg['name']} SMTP ({cfg['email']}): Not Configured")
+    return status
+
+
+def _check_smtp_health_sync(identity: str = "support") -> Dict[str, Any]:
+    """Synchronous test of SMTP connectivity and authentication for a specific identity."""
+    try:
+        cfg = get_identity_config(identity)
+    except ValueError as e:
         return {
             "configured": False,
             "connected": False,
             "authenticated": False,
-            "status_code": "SMTP_NOT_CONFIGURED",
-            "message": "SMTP host is not configured in environment variables.",
+            "sender": "Unknown",
+            "service": identity,
+            "status_code": "INVALID_SERVICE",
+            "message": str(e),
             "host": None,
-            "port": int(settings.SMTP_PORT or 587),
-            "secure": bool(getattr(settings, "SMTP_SECURE", False)),
+            "port": 587,
+            "secure": True,
         }
 
-    host = settings.SMTP_HOST.strip()
-    port = int(settings.SMTP_PORT or 587)
-    is_ssl = (port == 465) or getattr(settings, "SMTP_SECURE", False)
+    if not cfg["password"] or not cfg["host"]:
+        return {
+            "configured": False,
+            "connected": False,
+            "authenticated": False,
+            "sender": cfg["email"],
+            "service": identity,
+            "status_code": "NOT_CONFIGURED",
+            "message": f"{cfg['name']} SMTP credentials not set in server environment.",
+            "host": cfg["host"],
+            "port": cfg["port"],
+            "secure": cfg["use_tls"],
+        }
+
+    host = cfg["host"]
+    port = cfg["port"]
+    is_ssl = (port == 465)
 
     server = None
     try:
@@ -173,24 +341,23 @@ def _check_smtp_health_sync() -> Dict[str, Any]:
         else:
             server = smtplib.SMTP(host, port, timeout=10)
             server.ehlo()
-            if port in (587, 25) or getattr(settings, "SMTP_SECURE", False):
+            if cfg["use_tls"] or port in (587, 25):
                 server.starttls()
                 server.ehlo()
 
-        authenticated = False
-        if settings.SMTP_USER and settings.SMTP_PASSWORD:
-            server.login(settings.SMTP_USER.strip(), settings.SMTP_PASSWORD.strip())
-            authenticated = True
+        server.login(cfg["username"], cfg["password"])
 
         return {
             "configured": True,
             "connected": True,
-            "authenticated": authenticated,
+            "authenticated": True,
+            "sender": cfg["email"],
+            "service": identity,
             "status_code": "CONNECTED",
-            "message": "SMTP server is connected and authenticated successfully.",
+            "message": f"SMTP handshake and authentication succeeded for {cfg['email']}.",
             "host": host,
             "port": port,
-            "secure": is_ssl,
+            "secure": cfg["use_tls"],
         }
 
     except smtplib.SMTPAuthenticationError:
@@ -198,11 +365,13 @@ def _check_smtp_health_sync() -> Dict[str, Any]:
             "configured": True,
             "connected": True,
             "authenticated": False,
-            "status_code": "SMTP_AUTHENTICATION_FAILED",
-            "message": "SMTP authentication failed. Verify SMTP username and password / App Password.",
+            "sender": cfg["email"],
+            "service": identity,
+            "status_code": "AUTHENTICATION_FAILED",
+            "message": f"Authentication failed for {cfg['email']}. Check Gmail App Password.",
             "host": host,
             "port": port,
-            "secure": is_ssl,
+            "secure": cfg["use_tls"],
         }
 
     except (smtplib.SMTPServerDisconnected, smtplib.SMTPConnectError, ConnectionRefusedError, socket.gaierror, socket.error, TimeoutError) as e:
@@ -210,11 +379,13 @@ def _check_smtp_health_sync() -> Dict[str, Any]:
             "configured": True,
             "connected": False,
             "authenticated": False,
-            "status_code": "SMTP_CONNECTION_FAILED",
-            "message": f"Connection failed to {host}:{port}. Verify host address, port, and firewall rules.",
+            "sender": cfg["email"],
+            "service": identity,
+            "status_code": "CONNECTION_FAILED",
+            "message": f"Connection failed to {host}:{port}. Error: {str(e)}",
             "host": host,
             "port": port,
-            "secure": is_ssl,
+            "secure": cfg["use_tls"],
         }
 
     except Exception as e:
@@ -222,11 +393,13 @@ def _check_smtp_health_sync() -> Dict[str, Any]:
             "configured": True,
             "connected": False,
             "authenticated": False,
+            "sender": cfg["email"],
+            "service": identity,
             "status_code": "CONNECTION_FAILED",
-            "message": f"SMTP health check failed: {str(e)}",
+            "message": f"SMTP test failed: {str(e)}",
             "host": host,
             "port": port,
-            "secure": is_ssl,
+            "secure": cfg["use_tls"],
         }
 
     finally:
@@ -237,41 +410,43 @@ def _check_smtp_health_sync() -> Dict[str, Any]:
                 pass
 
 
-async def check_smtp_health(db: Optional[AsyncIOMotorDatabase] = None) -> SmtpStatusResponse:
+async def check_smtp_health(
+    identity: str = "support",
+    db: Optional[AsyncIOMotorDatabase] = None,
+) -> SmtpStatusResponse:
     """Asynchronous wrapper for live SMTP health check."""
-    status_dict = await asyncio.to_thread(_check_smtp_health_sync)
-    sender = await get_automated_email(db)
-
-    return SmtpStatusResponse(
-        configured=status_dict["configured"],
-        connected=status_dict["connected"],
-        authenticated=status_dict["authenticated"],
-        sender=sender,
-        host=status_dict["host"],
-        port=status_dict["port"],
-        secure=status_dict["secure"],
-        status_code=status_dict["status_code"],
-        message=status_dict["message"],
-    )
+    status_dict = await asyncio.to_thread(_check_smtp_health_sync, identity)
+    return SmtpStatusResponse(**status_dict)
 
 
-async def send_test_email(to_email: str, db: Optional[AsyncIOMotorDatabase] = None) -> SendTestEmailResponse:
-    """Sends a verification test email from the configured Automated Email to the specified destination."""
-    sender_addr = await get_automated_email(db)
-    subject = "Ametheus SMTP Test Email"
+async def send_test_email(
+    to_email: str,
+    service: str = "support",
+    db: Optional[AsyncIOMotorDatabase] = None,
+) -> SendTestEmailResponse:
+    """
+    Sends a test verification email using the explicitly chosen service ('support', 'noreply', or 'official').
+    """
+    norm_service = (service or "support").strip().lower()
+    if norm_service not in ("support", "noreply", "official"):
+        norm_service = "support"
 
-    text_body = f"""Ametheus Esports Platform — SMTP Diagnostic Test
+    cfg = get_identity_config(norm_service)
+    subject = f"Ametheus SMTP Test — {cfg['name']} ({cfg['email']})"
+
+    text_body = f"""Ametheus Esports Platform — SMTP Service Test
 ===================================================
 
-This is an automated test message sent from the Ametheus Admin Cockpit.
-If you are reading this email, your SMTP configuration and sender identity are working correctly.
+This is an administrative test message dispatched from the Ametheus Operations Cockpit.
+If you received this message, the {cfg['name']} ({norm_service.upper()}) email identity is functioning properly.
 
-Configured Automated Sender: {sender_addr}
-Destination Recipient: {to_email}
-Environment Host: {settings.SMTP_HOST or 'Not Configured'}
-Port: {settings.SMTP_PORT}
+Identity: {cfg['name']}
+Sender Email: {cfg['email']}
+Destination: {to_email}
+Relay Host: {cfg['host']}
+Relay Port: {cfg['port']}
 
-Competitive Integrity & Operations:
+Competitive Integrity:
 https://ametheus.gg
 """
 
@@ -286,36 +461,32 @@ https://ametheus.gg
   <table width="100%" border="0" cellspacing="0" cellpadding="0" style="max-width: 600px; margin: 0 auto; background-color: #111622; border-radius: 12px; border: 1px solid #242C3D; overflow: hidden; box-shadow: 0 4px 12px rgba(0,0,0,0.6);">
     <tr>
       <td style="background-color: #1A2234; padding: 20px 24px; border-bottom: 2px solid #E56A10;">
-        <h1 style="color: #FFFFFF; margin: 0; font-size: 20px; font-weight: 800; letter-spacing: 1px;">AMETHEUS <span style="color: #E56A10;">SMTP TEST</span></h1>
-        <p style="color: #94A3B8; margin: 4px 0 0 0; font-size: 11px; text-transform: uppercase; letter-spacing: 2px;">Email Subsystem Verification</p>
+        <h1 style="color: #FFFFFF; margin: 0; font-size: 20px; font-weight: 800; letter-spacing: 1px;">AMETHEUS <span style="color: #E56A10;">EMAIL TEST</span></h1>
+        <p style="color: #94A3B8; margin: 4px 0 0 0; font-size: 11px; text-transform: uppercase; letter-spacing: 2px;">Identity: {cfg['name']} ({norm_service.upper()})</p>
       </td>
     </tr>
     <tr>
       <td style="padding: 28px 24px;">
         <div style="background-color: #064E3B; border: 1px solid #059669; border-radius: 8px; padding: 14px 16px; margin-bottom: 20px; color: #A7F3D0; font-family: monospace; font-size: 12px; font-weight: bold;">
-          &#10004; SUCCESS: SMTP relay connection &amp; email delivery confirmed!
+          &#10004; SUCCESS: Gmail SMTP relay connection and delivery confirmed!
         </div>
 
         <p style="margin: 0 0 16px 0; font-size: 13px; color: #CBD5E1; line-height: 1.6;">
-          This is an official test email generated by the Super Admin from the <strong>Ametheus Email Settings Cockpit</strong>.
+          This verification email was triggered from the Super Admin diagnostic panel.
         </p>
 
         <table width="100%" border="0" cellspacing="0" cellpadding="8" style="font-size: 12px; font-family: monospace; background-color: #0B0E16; border-radius: 8px; border: 1px solid #242C3D; margin-bottom: 20px;">
           <tr style="border-bottom: 1px solid #242C3D;">
-            <td style="color: #94A3B8; width: 150px;">Automated Sender:</td>
-            <td style="color: #E56A10; font-weight: bold;">{sender_addr}</td>
+            <td style="color: #94A3B8; width: 140px;">Sender Identity:</td>
+            <td style="color: #E56A10; font-weight: bold;">{cfg['name']} &lt;{cfg['email']}&gt;</td>
           </tr>
           <tr style="border-bottom: 1px solid #242C3D;">
-            <td style="color: #94A3B8;">Destination:</td>
+            <td style="color: #94A3B8;">Recipient:</td>
             <td style="color: #FFFFFF;">{to_email}</td>
           </tr>
           <tr style="border-bottom: 1px solid #242C3D;">
-            <td style="color: #94A3B8;">SMTP Host:</td>
-            <td style="color: #94A3B8;">{settings.SMTP_HOST or 'N/A'}</td>
-          </tr>
-          <tr>
-            <td style="color: #94A3B8;">SMTP Port:</td>
-            <td style="color: #94A3B8;">{settings.SMTP_PORT}</td>
+            <td style="color: #94A3B8;">Relay Server:</td>
+            <td style="color: #94A3B8;">{cfg['host']}:{cfg['port']}</td>
           </tr>
         </table>
       </td>
@@ -331,26 +502,34 @@ https://ametheus.gg
 """
 
     ok, err_code, err_det, msg_id, sender_used = await asyncio.to_thread(
-        _send_smtp_email,
+        _send_identity_smtp_sync,
+        norm_service,
         to_email,
         subject,
         text_body,
         html_body,
-        sender_addr,
-        "Ametheus System Test",
     )
 
     return SendTestEmailResponse(
         success=ok,
+        service=norm_service,
         message_id=msg_id,
         error_code=err_code,
         error_details=err_det,
         sender_used=sender_used,
+        message="Test email sent successfully" if ok else (err_det or "Test email delivery failed"),
     )
 
 
+# =========================================================================
+# EXISTING APPLICATION EMAIL ROUTING IMPLEMENTATIONS
+# =========================================================================
+
 async def send_ticket_confirmation_email(ticket: dict, db: Optional[AsyncIOMotorDatabase] = None) -> Tuple[bool, Optional[str]]:
-    """Sends confirmation email to the user with their Ticket ID and issue summary."""
+    """
+    Sends confirmation receipt email to the user using the SUPPORT identity (support.ametheus@gmail.com).
+    Reply-To points directly to support.ametheus@gmail.com.
+    """
     ticket_id = ticket.get("ticket_id") or ticket.get("id") or "AMT-000000"
     user_name = ticket.get("name", "Contender")
     category = ticket.get("category", "General Inquiry").replace("_", " ").title()
@@ -362,9 +541,8 @@ async def send_ticket_confirmation_email(ticket: dict, db: Optional[AsyncIOMotor
     if not recipient:
         return False, "Recipient email is missing"
 
-    sender_addr = await get_automated_email(db)
-    support_addr = await get_support_email(db)
-
+    support_cfg = get_identity_config("support")
+    support_addr = support_cfg["email"]
     subject = f"Ametheus Support Ticket Created — {ticket_id}"
 
     payment_line_text = f"Payment Method / Type: {payment_type}\n" if payment_type and payment_type != "NOT_APPLICABLE" else ""
@@ -453,17 +631,7 @@ https://ametheus.gg
 </html>
 """
 
-    ok, err_code, err_det, msg_id, _ = await asyncio.to_thread(
-        _send_smtp_email,
-        recipient,
-        subject,
-        text_body,
-        html_body,
-        sender_addr,
-        "Ametheus Support Operations",
-        support_addr,
-    )
-    return ok, err_det
+    return await send_support_email(recipient, subject, text_body, html_body)
 
 
 async def send_admin_ticket_notification_email(
@@ -471,7 +639,10 @@ async def send_admin_ticket_notification_email(
     admin_recipient: Optional[str] = None,
     db: Optional[AsyncIOMotorDatabase] = None,
 ) -> Tuple[bool, Optional[str]]:
-    """Sends notification to the configured support email with complete ticket information."""
+    """
+    Sends notification to the configured support desk email with complete ticket information.
+    Routes via the SUPPORT email identity.
+    """
     ticket_id = ticket.get("ticket_id") or ticket.get("id") or "AMT-000000"
     user_name = ticket.get("name", "Unknown User")
     user_email = ticket.get("email", "unknown@email.com")
@@ -481,8 +652,7 @@ async def send_admin_ticket_notification_email(
     description = ticket.get("description", "")
     created_at = ticket.get("created_at", "Just now")
 
-    target_recipient = admin_recipient or await get_support_email(db)
-    sender_addr = await get_automated_email(db)
+    target_recipient = admin_recipient or settings.SUPPORT_EMAIL
 
     subject = f"New Ametheus Support Ticket — {ticket_id} — {category}"
 
@@ -530,7 +700,6 @@ https://ametheus.gg/admin
             <td style="color: #94A3B8;">{user_id}</td>
           </tr>
           <tr style="border-bottom: 1px solid #242C3D;">
-            <td style="color: #94A3B8;">Category:</td>
             <td style="color: #E56A10; font-weight: bold;">{category}</td>
           </tr>
           <tr style="border-bottom: 1px solid #242C3D;">
@@ -558,16 +727,7 @@ https://ametheus.gg/admin
 </html>
 """
 
-    ok, err_code, err_det, _, _ = await asyncio.to_thread(
-        _send_smtp_email,
-        target_recipient,
-        subject,
-        text_body,
-        html_body,
-        sender_addr,
-        "Ametheus Support Operations",
-    )
-    return ok, err_det
+    return await send_support_email(target_recipient, subject, text_body, html_body)
 
 
 async def send_notification_email(
@@ -578,12 +738,15 @@ async def send_notification_email(
     link: Optional[str] = None,
     db: Optional[AsyncIOMotorDatabase] = None,
 ) -> Tuple[bool, Optional[str]]:
-    """Sends an important website notification email to the user's registered email address."""
+    """
+    Sends an automated tournament/match notification email to the user.
+    Routes via the NO-REPLY identity (noreply.ametheus@gmail.com).
+    Reply-To points to support.ametheus@gmail.com.
+    """
     to_email_clean = (recipient or "").strip().lower()
     if not to_email_clean or "@" not in to_email_clean:
         return False, "Recipient email is invalid or missing"
 
-    sender_addr = await get_automated_email(db)
     display_name = user_name or "Contender"
     subject = f"AMETHEUS Alert: {title}"
 
@@ -652,13 +815,4 @@ https://ametheus.gg
 </html>
 """
 
-    ok, err_code, err_det, _, _ = await asyncio.to_thread(
-        _send_smtp_email,
-        to_email_clean,
-        subject,
-        text_body,
-        html_body,
-        sender_addr,
-        "Ametheus Alert",
-    )
-    return ok, err_det
+    return await send_noreply_email(to_email_clean, subject, text_body, html_body)
