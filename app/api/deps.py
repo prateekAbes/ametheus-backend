@@ -45,22 +45,54 @@ async def get_current_user(
     if not user_doc:
         # If cryptographically verified by Clerk but not yet synced in DB, auto-provision
         # This prevents 401 race conditions on initial page load (e.g. /notifications, /leaderboard)
-        user_email = email or f"{target_id}@ametheus.gg"
+        user_email = (email or f"{target_id}@ametheus.gg").strip().lower()
         admin_emails = {"pk.4081988@gmail.com", "admin@ametheus.gg"}
-        is_super_admin = user_email.lower() in admin_emails
+        from app.core.config import settings
+        admin_emails.add(settings.SUPER_ADMIN_EMAIL.lower())
+        is_super_admin = user_email in admin_emails
         initial_role = "SUPER_ADMIN" if is_super_admin else "PLAYER"
 
-        new_user = User(
-            id=target_id,
-            clerk_user_id=target_id,
-            email=user_email,
-            username=payload.get("username") or payload.get("preferred_username") or target_id[:12],
-            display_name=payload.get("name") or payload.get("username") or "Contender",
-            avatar_url=payload.get("picture"),
-            role=initial_role,
-        )
-        await db.users.insert_one(new_user.to_mongo())
-        user_doc = await db.users.find_one({"_id": target_id})
+        from app.models.base import get_utc_now
+        now = get_utc_now()
+        raw_username = payload.get("username") or payload.get("preferred_username") or target_id[:12]
+        clean_user = raw_username.strip().lower().replace(" ", "_")
+
+        set_on_insert_fields = {
+            "role": initial_role,
+            "username": clean_user,
+            "username_lower": clean_user.lower(),
+            "display_name": payload.get("name") or payload.get("username") or "Contender",
+            "avatar_url": payload.get("picture"),
+            "riot_id": None,
+            "steam_id": None,
+            "inr_balance_paise": 0,
+            "inr_reserved_paise": 0,
+            "inr_balance": "0.00",
+            "is_dummy": False,
+            "created_at": now,
+        }
+        set_fields = {
+            "clerk_user_id": target_id,
+            "email": user_email,
+            "updated_at": now,
+        }
+        if is_super_admin:
+            set_fields["role"] = "SUPER_ADMIN"
+
+        try:
+            await db.users.update_one(
+                {"_id": target_id},
+                {
+                    "$set": set_fields,
+                    "$setOnInsert": set_on_insert_fields,
+                },
+                upsert=True,
+            )
+        except Exception:
+            # Another request won the concurrent provisioning race
+            pass
+
+        user_doc = await db.users.find_one({"$or": user_or})
 
     user = User.from_mongo(user_doc)
     admin_emails = {"pk.4081988@gmail.com", "admin@ametheus.gg"}

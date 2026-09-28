@@ -63,74 +63,150 @@ async def sync_clerk_user(
             detail="Forbidden: Token subject does not match profile ID",
         )
 
+    clean_email = payload.email.strip().lower()
+
+    from app.core.config import settings
+    admin_emails = {
+        settings.SUPER_ADMIN_EMAIL.lower(),
+        "admin@ametheus.gg",
+        "pk.4081988@gmail.com",
+    }
+    is_super_admin = clean_email in admin_emails
+
+    # 1. Search for existing user record by Clerk user ID or email (case-insensitive)
     user_doc = await db.users.find_one({
         "$or": [
-            {"clerk_user_id": payload.clerk_user_id},
             {"_id": payload.clerk_user_id},
-            {"email": payload.email},
+            {"clerk_user_id": payload.clerk_user_id},
+            {"email": clean_email},
+            {"email": payload.email.strip()},
         ]
     })
 
-    from app.core.config import settings
-    admin_emails = {settings.SUPER_ADMIN_EMAIL.lower(), "admin@ametheus.gg", "pk.4081988@gmail.com"}
-    is_super_admin = payload.email.lower() in admin_emails
-
-    # Validate username — reserved names are only allowed for super-admin emails
-    clean_username = payload.username.strip().lower().replace(" ", "_")
-    if _is_reserved_username(clean_username) and not is_super_admin:
-        # Assign a safe username instead of failing sync (Clerk may pass 'admin' as username)
-        clean_username = f"player_{payload.clerk_user_id[-6:].lower()}"
+    from app.models.base import get_utc_now
+    now = get_utc_now()
 
     if user_doc:
-        # Update metadata and ensure super admin role if designated email
-        update_fields = {"clerk_user_id": payload.clerk_user_id}
+        target_id = user_doc["_id"]
+        # Update permitted fields only — PROTECT application fields (role, balances, teams, etc.)
+        update_fields = {
+            "clerk_user_id": payload.clerk_user_id,
+            "email": clean_email,
+            "updated_at": now,
+        }
         # Only populate display_name if not already present in the user's database record
         if not user_doc.get("display_name") and payload.display_name:
-            update_fields["display_name"] = payload.display_name
+            update_fields["display_name"] = payload.display_name.strip()
         # Only populate avatar_url if not already present in the user's database record (preserve custom user avatars)
         if not user_doc.get("avatar_url") and payload.avatar_url:
-            update_fields["avatar_url"] = payload.avatar_url
+            update_fields["avatar_url"] = payload.avatar_url.strip()
+        # Preserve designated super admin role if email matches
         if is_super_admin:
             update_fields["role"] = "SUPER_ADMIN"
         # Keep username_lower in sync
         existing_username = user_doc.get("username", "")
-        update_fields["username_lower"] = existing_username.lower()
-        await db.users.update_one({"_id": user_doc["_id"]}, {"$set": update_fields})
-        updated_doc = await db.users.find_one({"_id": user_doc["_id"]})
+        if existing_username:
+            update_fields["username_lower"] = existing_username.lower()
+
+        await db.users.update_one({"_id": target_id}, {"$set": update_fields})
+        updated_doc = await db.users.find_one({"_id": target_id})
         return User.from_mongo(updated_doc)
-    else:
-        # Assign SUPER_ADMIN for designated admin emails, PLAYER for everyone else
-        initial_role = "SUPER_ADMIN" if is_super_admin else "PLAYER"
-        user = User(
-            id=payload.clerk_user_id,
-            clerk_user_id=payload.clerk_user_id,
-            email=payload.email,
-            username=clean_username,
-            display_name=payload.display_name or clean_username,
-            avatar_url=payload.avatar_url,
-            role=initial_role,
+
+    # 2. New user flow — Validate username and prepare atomic upsert
+    clean_username = payload.username.strip().lower().replace(" ", "_")
+    if _is_reserved_username(clean_username) and not is_super_admin:
+        clean_username = f"player_{payload.clerk_user_id[-6:].lower()}"
+
+    # Check for username collisions with other existing users
+    username_taken = await db.users.find_one({
+        "username_lower": clean_username.lower(),
+        "_id": {"$ne": payload.clerk_user_id},
+    })
+    if username_taken:
+        clean_username = f"{clean_username[:18]}_{payload.clerk_user_id[-6:].lower()}"
+
+    initial_role = "SUPER_ADMIN" if is_super_admin else "PLAYER"
+
+    # Application fields set ONLY upon initial insertion
+    set_on_insert_fields = {
+        "role": initial_role,
+        "username": clean_username,
+        "username_lower": clean_username.lower(),
+        "display_name": payload.display_name or clean_username,
+        "avatar_url": payload.avatar_url,
+        "riot_id": None,
+        "steam_id": None,
+        "inr_balance_paise": 0,
+        "inr_reserved_paise": 0,
+        "inr_balance": "0.00",
+        "is_dummy": False,
+        "created_at": now,
+    }
+
+    # Permitted sync fields
+    set_fields = {
+        "clerk_user_id": payload.clerk_user_id,
+        "email": clean_email,
+        "updated_at": now,
+    }
+    if is_super_admin:
+        set_fields["role"] = "SUPER_ADMIN"
+
+    is_newly_created = False
+    try:
+        # Atomic update with upsert=True eliminates the find-then-insert race condition
+        upsert_res = await db.users.update_one(
+            {"_id": payload.clerk_user_id},
+            {
+                "$set": set_fields,
+                "$setOnInsert": set_on_insert_fields,
+            },
+            upsert=True,
         )
-        user_dict = user.to_mongo()
-        user_dict["username_lower"] = clean_username.lower()
-        await db.users.insert_one(user_dict)
-        await record_audit_log(
-            db=db,
-            operator=user.id,
-            role=initial_role,
-            action="USER_SYNCED",
-            target=user.id,
-            details=f"Clerk user {user.username} ({user.email}) registered as {initial_role}",
+        is_newly_created = (upsert_res.upserted_id is not None)
+    except Exception:
+        # In case a concurrent request completed the insert/upsert simultaneously
+        is_newly_created = False
+
+    # Fetch the authoritative document
+    final_doc = await db.users.find_one({
+        "$or": [
+            {"_id": payload.clerk_user_id},
+            {"clerk_user_id": payload.clerk_user_id},
+            {"email": clean_email},
+        ]
+    })
+
+    if not final_doc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to retrieve user profile after synchronization.",
         )
-        from app.services.notification import create_notification
-        await create_notification(
-            db=db,
-            user_id=user.id,
-            title="Welcome to AMETHEUS",
-            message="Your competitive account is active. Register your team and join active tournament brackets.",
-            notification_type="SYSTEM",
-            link="/tournaments",
-        )
-        return user
+
+    # Trigger audit log and welcome notification only for fresh registrations
+    if is_newly_created:
+        try:
+            await record_audit_log(
+                db=db,
+                operator=payload.clerk_user_id,
+                role=initial_role,
+                action="USER_SYNCED",
+                target=payload.clerk_user_id,
+                details=f"Clerk user {clean_username} ({clean_email}) registered as {initial_role}",
+            )
+            from app.services.notification import create_notification
+            await create_notification(
+                db=db,
+                user_id=payload.clerk_user_id,
+                title="Welcome to AMETHEUS",
+                message="Your competitive account is active. Register your team and join active tournament brackets.",
+                notification_type="SYSTEM",
+                link="/tournaments",
+            )
+        except Exception:
+            pass
+
+    return User.from_mongo(final_doc)
 
 @router.get("/me", response_model=UserResponse)
 async def get_current_user_profile(
