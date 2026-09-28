@@ -39,8 +39,10 @@ class SupportTicket(BaseModel):
     description: str
     status: str = "OPEN"  # OPEN, IN_PROGRESS, WAITING_FOR_USER, RESOLVED, CLOSED
     internal_notes: Optional[str] = None
-    email_status: str = "PENDING"  # PENDING, SENT, FAILED
+    email_status: str = "PENDING"  # PENDING, SENT, PARTIAL, FAILED
     email_error: Optional[str] = None
+    user_email_status: Optional[str] = "PENDING"  # PENDING, SENT, FAILED
+    support_email_status: Optional[str] = "PENDING"  # PENDING, SENT, FAILED
     logs: List[SupportLogEntry] = Field(default_factory=list)
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())

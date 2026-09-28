@@ -15,6 +15,7 @@ from app.api.v1.endpoints import (
     matches,
     support,
     regulations,
+    email_settings,
 )
 
 api_router = APIRouter()
@@ -25,6 +26,8 @@ api_router.include_router(payments.router, prefix="/payments", tags=["Payments"]
 api_router.include_router(upi_accounts.router, prefix="/admin/upi-accounts", tags=["Admin UPI Accounts"])
 api_router.include_router(wallet.router, prefix="/wallet", tags=["Wallet & Withdrawals"])
 api_router.include_router(admin.router, prefix="/admin", tags=["Admin Operations"])
+api_router.include_router(email_settings.admin_router, prefix="/admin/email", tags=["Admin Email & SMTP Settings"])
+api_router.include_router(email_settings.public_router, prefix="/platform", tags=["Platform Settings"])
 api_router.include_router(leaderboard.router, prefix="/leaderboard", tags=["Leaderboard"])
 api_router.include_router(notifications.router, prefix="/notifications", tags=["Notifications"])
 api_router.include_router(media.router, prefix="/media", tags=["Media & Image Uploads"])

@@ -15,6 +15,23 @@ class SupportTicketUpdateRequest(BaseModel):
     internal_notes: Optional[str] = None
 
 
+class SupportEmailStatus(BaseModel):
+    status: str  # "sent" or "failed" or "pending"
+    error: Optional[str] = None
+
+
+class SupportSettingsResponse(BaseModel):
+    support_email: str
+
+
+class SupportSettingsUpdateRequest(BaseModel):
+    support_email: str = Field(..., min_length=5, max_length=150)
+
+
+class SupportEmailRetryRequest(BaseModel):
+    target: str = Field("ALL", description="'USER', 'SUPPORT', or 'ALL'")
+
+
 class SupportLogResponse(BaseModel):
     id: str
     ticket_id: str
@@ -40,6 +57,8 @@ class SupportTicketResponse(BaseModel):
     internal_notes: Optional[str] = None
     email_status: str = "PENDING"
     email_error: Optional[str] = None
+    user_email_status: Optional[str] = None
+    support_email_status: Optional[str] = None
     logs: List[SupportLogResponse] = Field(default_factory=list)
     created_at: str
     updated_at: str
@@ -57,6 +76,9 @@ class SupportTicketPublicResponse(BaseModel):
     created_at: str
     email_status: str = "PENDING"
     email_error: Optional[str] = None
+    user_email: Optional[SupportEmailStatus] = None
+    support_email: Optional[SupportEmailStatus] = None
+    ticket_created: bool = True
     message: str = "Support ticket created successfully"
     model_config = ConfigDict(from_attributes=True, extra="ignore")
 
@@ -64,3 +86,4 @@ class SupportTicketPublicResponse(BaseModel):
 class SupportTicketListResponse(BaseModel):
     tickets: List[SupportTicketResponse]
     total: int
+

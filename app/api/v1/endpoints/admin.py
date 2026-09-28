@@ -918,6 +918,8 @@ async def reject_payment(
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     from bson import ObjectId
+    from datetime import datetime, timezone
+
     p_query = {"$or": [{"_id": payment_id}, {"id": payment_id}]}
     if ObjectId.is_valid(payment_id):
         p_query["$or"].append({"_id": ObjectId(payment_id)})
@@ -926,53 +928,96 @@ async def reject_payment(
     if not payment:
         raise HTTPException(status_code=404, detail="Payment record not found")
 
-    reason = payload.rejection_reason or "Invalid transaction details"
+    # Idempotency: Prevent duplicate rejection
+    if payment.get("status") == "REJECTED":
+        return {"status": "success", "message": "Payment is already rejected.", "payment_id": payment_id, "new_status": "REJECTED"}
 
-    await db.game_payments.update_one(
-        {"_id": payment["_id"]},
+    # Business rule: Cannot reject already approved payments
+    if payment.get("status") == "APPROVED":
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot reject an already approved payment. Please issue an administrative adjustment if required.",
+        )
+
+    reason = payload.rejection_reason or "Invalid transaction details"
+    now_utc = datetime.now(timezone.utc)
+
+    # Atomic transition to REJECTED
+    update_res = await db.game_payments.update_one(
+        {"_id": payment["_id"], "status": {"$ne": "REJECTED"}},
         {
             "$set": {
                 "status": "REJECTED",
                 "rejection_reason": reason,
                 "verified_by": admin_user.username,
+                "verified_at": now_utc,
             }
         }
     )
 
+    if update_res.modified_count == 0 and payment.get("status") == "REJECTED":
+        return {"status": "success", "message": "Payment is already rejected.", "payment_id": payment_id, "new_status": "REJECTED"}
+
+    # Tournament entry registration state transition
     if payment.get("payment_type") == "TOURNAMENT_ENTRY":
         reg_id = payment.get("registration_id")
-        reg_query = {"$or": [{"_id": reg_id}, {"id": reg_id}]} if reg_id else {"payment_id": payment_id}
+        reg_or = []
+        if reg_id:
+            reg_or.extend([{"_id": reg_id}, {"id": reg_id}])
+            if ObjectId.is_valid(str(reg_id)):
+                reg_or.append({"_id": ObjectId(str(reg_id))})
+        reg_or.append({"payment_id": payment_id})
         await db.tournament_registrations.update_one(
-            reg_query,
+            {"$or": reg_or},
             {"$set": {"payment_status": "REJECTED"}}
         )
 
+    # Game entry team state transition
     if payment.get("payment_type") == "GAME_ENTRY" and payment.get("team_id"):
+        t_id = payment.get("team_id")
+        team_or = [{"_id": t_id}, {"id": t_id}]
+        if ObjectId.is_valid(str(t_id)):
+            team_or.append({"_id": ObjectId(str(t_id))})
         await db.teams.update_one(
-            {"$or": [{"_id": payment["team_id"]}, {"id": payment["team_id"]}]},
+            {"$or": team_or},
             {"$set": {"payment_status": "PAYMENT_REJECTED"}}
         )
 
-    from app.services.notification import create_notification
-    await create_notification(
-        db=db,
-        user_id=payment["user_id"],
-        title="Payment Rejected",
-        message=f"Your payment of ₹{payment.get('amount_inr', 0)} was rejected: {reason}",
-        notification_type="PAYMENT",
-        link="/dashboard",
-    )
+    # Asynchronously trigger user notification and audit log
+    try:
+        from app.services.notification import create_notification
+        await create_notification(
+            db=db,
+            user_id=payment["user_id"],
+            title="Payment Rejected",
+            message=f"Your payment of ₹{payment.get('amount_inr', 0)} was rejected: {reason}",
+            notification_type="PAYMENT",
+            link="/dashboard",
+        )
+    except Exception as e:
+        import logging
+        logging.getLogger("ametheus.admin").warning(f"Failed to create rejection notification: {e}")
 
-    await record_audit_log(
-        db=db,
-        operator=admin_user.username,
-        role="SUPER_ADMIN",
-        action="REJECT_PAYMENT",
-        target=f"Payment {payment_id}",
-        details=f"Rejected: {reason}",
-    )
+    try:
+        await record_audit_log(
+            db=db,
+            operator=admin_user.username,
+            role="SUPER_ADMIN",
+            action="REJECT_PAYMENT",
+            target=f"Payment {payment_id}",
+            details=f"Rejected: {reason}",
+        )
+    except Exception as e:
+        import logging
+        logging.getLogger("ametheus.admin").warning(f"Failed to record audit log for payment rejection: {e}")
 
-    return {"status": "success", "message": "Payment rejected."}
+    return {
+        "status": "success",
+        "message": "Payment rejected successfully.",
+        "payment_id": payment_id,
+        "new_status": "REJECTED",
+    }
+
 
 @router.get("/payouts")
 async def list_admin_payouts(

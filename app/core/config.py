@@ -26,16 +26,33 @@ class Settings(BaseSettings):
     ]
     CLERK_ISSUER: str = "https://clerk.ametheus.gg"
     SUPER_ADMIN_EMAIL: str = "admin@ametheus.gg"
+    OFFICIAL_EMAIL: str = "ametheus@gmail.com"
     SUPPORT_PHONE: str = "+91 98765 43210"
     SUPPORT_EMAIL: str = "support@ametheus.gg"
     SUPPORT_ADMIN_EMAIL: str = "ametheus.gg@gmail.com"
+    AUTOMATED_EMAIL: str = "ametheus.noreply@gmail.com"
     SMTP_HOST: Optional[str] = None
     SMTP_PORT: int = 587
     SMTP_USER: Optional[str] = None
     SMTP_PASSWORD: Optional[str] = None
+    SMTP_SECURE: bool = False
     SMTP_FROM_EMAIL: str = "support@ametheus.gg"
     SMTP_FROM_NAME: str = "Ametheus Support Desk"
     ESCROW_SECRET_KEY: str = "ametheus_escrow_vault_secret_2026"
+
+    @field_validator("SMTP_SECURE", mode="before")
+    @classmethod
+    def resolve_smtp_secure(cls, v: Union[bool, str, None]) -> bool:
+        if v is None:
+            val = os.getenv("SMTP_USE_TLS") or os.getenv("EMAIL_USE_TLS") or os.getenv("EMAIL_USE_SSL")
+            if val is not None:
+                return val.strip().lower() in ("true", "1", "yes", "on", "t")
+            return False
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, str):
+            return v.strip().lower() in ("true", "1", "yes", "on", "t")
+        return bool(v)
 
     @field_validator("SMTP_HOST", mode="before")
     @classmethod

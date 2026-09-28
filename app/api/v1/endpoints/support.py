@@ -13,11 +13,17 @@ from app.schemas.support import (
     SupportTicketPublicResponse,
     SupportTicketListResponse,
     SupportLogResponse,
+    SupportSettingsResponse,
+    SupportSettingsUpdateRequest,
+    SupportEmailRetryRequest,
+    SupportEmailStatus,
 )
 from app.services.email_service import (
     send_ticket_confirmation_email,
     send_admin_ticket_notification_email,
 )
+from app.services.audit import record_audit_log
+from app.core.config import settings
 
 router = APIRouter()
 
@@ -36,6 +42,13 @@ VALID_CATEGORIES = {
 }
 
 
+from app.services.email_config_service import get_support_email
+
+async def _get_configured_support_email(db: AsyncIOMotorDatabase) -> str:
+    """Returns the platform-configured support destination email from centralized config service."""
+    return await get_support_email(db)
+
+
 def _clean_ticket_doc(doc: dict) -> dict:
     item = dict(doc)
     item["id"] = str(item.get("_id", item.get("id", "")))
@@ -44,6 +57,51 @@ def _clean_ticket_doc(doc: dict) -> dict:
     if not item.get("ticket_id"):
         item["ticket_id"] = item["id"]
     return item
+
+
+@router.get("/settings", response_model=SupportSettingsResponse)
+async def get_support_settings(
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Returns the currently configured support destination email."""
+    email_dest = await _get_configured_support_email(db)
+    return SupportSettingsResponse(support_email=email_dest)
+
+
+@router.put("/settings", response_model=SupportSettingsResponse)
+async def update_support_settings(
+    payload: SupportSettingsUpdateRequest,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Updates the support destination email where admin notification copies are routed."""
+    clean_email = payload.support_email.strip().lower()
+    if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", clean_email):
+        raise HTTPException(status_code=400, detail="Invalid support email address format.")
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    await db.platform_settings.update_one(
+        {"_id": "support_settings"},
+        {
+            "$set": {
+                "support_email": clean_email,
+                "updated_at": now_iso,
+                "updated_by": admin_user.username,
+            }
+        },
+        upsert=True,
+    )
+
+    await record_audit_log(
+        db=db,
+        operator=admin_user.username,
+        role=admin_user.role,
+        action="UPDATE_SUPPORT_EMAIL",
+        target="Support Desk Configuration",
+        details=f"Configured support recipient updated to '{clean_email}'",
+    )
+
+    return SupportSettingsResponse(support_email=clean_email)
 
 
 @router.post("/tickets", response_model=SupportTicketPublicResponse, status_code=status.HTTP_201_CREATED)
@@ -126,6 +184,8 @@ async def create_support_ticket(
         "created_at": now_iso,
     }
 
+    configured_support_email = await _get_configured_support_email(db)
+
     user_mail_ok = False
     user_mail_err = None
     admin_mail_ok = False
@@ -138,7 +198,10 @@ async def create_support_ticket(
         user_mail_err = f"Exception sending user confirmation: {str(e)}"
 
     try:
-        admin_mail_ok, admin_mail_err = await send_admin_ticket_notification_email(ticket_dict)
+        admin_mail_ok, admin_mail_err = await send_admin_ticket_notification_email(
+            ticket_dict,
+            admin_recipient=configured_support_email,
+        )
     except Exception as e:
         admin_mail_ok = False
         admin_mail_err = f"Exception sending admin notification: {str(e)}"
@@ -149,6 +212,9 @@ async def create_support_ticket(
         email_status = "PARTIAL"
     else:
         email_status = "FAILED"
+
+    user_email_status = "SENT" if user_mail_ok else "FAILED"
+    support_email_status = "SENT" if admin_mail_ok else "FAILED"
 
     email_error_summary = None
     if email_status != "SENT":
@@ -177,6 +243,8 @@ async def create_support_ticket(
                 "$set": {
                     "email_status": email_status,
                     "email_error": email_error_summary,
+                    "user_email_status": user_email_status,
+                    "support_email_status": support_email_status,
                 },
                 "$push": {"logs": email_log.to_mongo()},
             },
@@ -194,8 +262,18 @@ async def create_support_ticket(
         created_at=now_iso,
         email_status=email_status,
         email_error=email_error_summary,
+        user_email=SupportEmailStatus(
+            status="sent" if user_mail_ok else "failed",
+            error=user_mail_err,
+        ),
+        support_email=SupportEmailStatus(
+            status="sent" if admin_mail_ok else "failed",
+            error=admin_mail_err,
+        ),
+        ticket_created=True,
         message=f"Support ticket {ticket_id} created successfully.",
     )
+
 
 
 @router.get("/tickets", response_model=SupportTicketListResponse)
@@ -329,6 +407,111 @@ async def update_support_ticket(
 
     updated_doc = await db.support_tickets.find_one({"_id": doc["_id"]})
     return SupportTicketResponse(**_clean_ticket_doc(updated_doc))
+
+
+@router.post("/tickets/{ticket_id}/retry-email", response_model=SupportTicketResponse)
+async def retry_support_ticket_email(
+    ticket_id: str,
+    payload: SupportEmailRetryRequest,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Retries sending confirmation and/or notification email for a ticket without duplicating the ticket."""
+    doc = await db.support_tickets.find_one({"$or": [{"_id": ticket_id}, {"ticket_id": ticket_id}, {"id": ticket_id}]})
+    if not doc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Support ticket '{ticket_id}' not found.",
+        )
+
+    t_dict = _clean_ticket_doc(doc)
+    target = payload.target.strip().upper()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    actor_name = admin_user.display_name or admin_user.username or "Admin Arbiter"
+
+    user_mail_ok = None
+    user_mail_err = None
+    admin_mail_ok = None
+    admin_mail_err = None
+    log_entries = []
+
+    # 1. User Email retry
+    if target in ("USER", "ALL"):
+        try:
+            user_mail_ok, user_mail_err = await send_ticket_confirmation_email(t_dict)
+        except Exception as e:
+            user_mail_ok = False
+            user_mail_err = str(e)
+
+        log_user = SupportLogEntry(
+            ticket_id=t_dict.get("ticket_id", ticket_id),
+            action="EMAIL_RETRY_USER",
+            timestamp=now_iso,
+            actor=actor_name,
+            actor_role="ADMIN",
+            details="User confirmation email resent successfully." if user_mail_ok else f"User email retry failed: {user_mail_err}",
+        )
+        log_entries.append(log_user.to_mongo())
+
+    # 2. Support / Admin Notification retry
+    if target in ("SUPPORT", "ALL"):
+        configured_email = await _get_configured_support_email(db)
+        try:
+            admin_mail_ok, admin_mail_err = await send_admin_ticket_notification_email(
+                t_dict,
+                admin_recipient=configured_email,
+            )
+        except Exception as e:
+            admin_mail_ok = False
+            admin_mail_err = str(e)
+
+        log_admin = SupportLogEntry(
+            ticket_id=t_dict.get("ticket_id", ticket_id),
+            action="EMAIL_RETRY_SUPPORT",
+            timestamp=now_iso,
+            actor=actor_name,
+            actor_role="ADMIN",
+            details=f"Admin alert email resent to {configured_email}." if admin_mail_ok else f"Admin email retry failed: {admin_mail_err}",
+        )
+        log_entries.append(log_admin.to_mongo())
+
+    # Calculate overall status
+    current_user_status = "SENT" if user_mail_ok else ("FAILED" if user_mail_ok is False else doc.get("user_email_status", "PENDING"))
+    current_admin_status = "SENT" if admin_mail_ok else ("FAILED" if admin_mail_ok is False else doc.get("support_email_status", "PENDING"))
+
+    if current_user_status == "SENT" and current_admin_status == "SENT":
+        overall_status = "SENT"
+    elif current_user_status == "SENT" or current_admin_status == "SENT":
+        overall_status = "PARTIAL"
+    else:
+        overall_status = "FAILED"
+
+    errs = []
+    if user_mail_err:
+        errs.append(f"User email: {user_mail_err}")
+    if admin_mail_err:
+        errs.append(f"Admin email: {admin_mail_err}")
+    err_summary = "; ".join(errs) if errs else doc.get("email_error")
+
+    update_fields = {
+        "email_status": overall_status,
+        "email_error": err_summary,
+        "user_email_status": current_user_status,
+        "support_email_status": current_admin_status,
+        "updated_at": now_iso,
+    }
+
+    update_op = {"$set": update_fields}
+    if log_entries:
+        update_op["$push"] = {"logs": {"$each": log_entries}}
+        for le in log_entries:
+            await db.support_logs.insert_one(le)
+
+    await db.support_tickets.update_one({"_id": doc["_id"]}, update_op)
+
+    updated_doc = await db.support_tickets.find_one({"_id": doc["_id"]})
+    return SupportTicketResponse(**_clean_ticket_doc(updated_doc))
+
 
 
 @router.get("/my-tickets", response_model=List[SupportTicketResponse])

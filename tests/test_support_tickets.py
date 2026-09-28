@@ -117,3 +117,92 @@ async def test_support_ticket_lifecycle_and_audit(client, db_session):
     assert my_res.status_code == 200
     my_tickets = my_res.json()
     assert any(t["ticket_id"] == ticket_id for t in my_tickets)
+
+
+@pytest.mark.asyncio
+async def test_support_settings_and_email_retry(client, db_session):
+    admin_headers = make_auth_headers("usr_super_admin")
+    player_headers = make_auth_headers("usr_vortex_lead")
+
+    # 1. Get default settings
+    settings_res = await client.get("/api/v1/support/settings", headers=admin_headers)
+    assert settings_res.status_code == 200
+    assert "support_email" in settings_res.json()
+
+    # 2. Update support email settings
+    update_res = await client.put(
+        "/api/v1/support/settings",
+        json={"support_email": "custom-support@ametheus.gg"},
+        headers=admin_headers,
+    )
+    assert update_res.status_code == 200
+    assert update_res.json()["support_email"] == "custom-support@ametheus.gg"
+
+    # Non-admin cannot update settings
+    non_admin_res = await client.put(
+        "/api/v1/support/settings",
+        json={"support_email": "hacked@ametheus.gg"},
+        headers=player_headers,
+    )
+    assert non_admin_res.status_code == 403
+
+    # 3. Create a ticket to test retry functionality
+    create_res = await client.post(
+        "/api/v1/support/tickets",
+        json={
+            "name": "Retry Tester",
+            "email": "tester@ametheus.gg",
+            "category": "ACCOUNT",
+            "description": "Testing email retry functionality",
+        },
+    )
+    assert create_res.status_code == 201
+    ticket_data = create_res.json()
+    t_id = ticket_data["ticket_id"]
+    assert "user_email" in ticket_data
+    assert "support_email" in ticket_data
+
+    # 4. Retry email endpoint - target USER
+    retry_user_res = await client.post(
+        f"/api/v1/support/tickets/{t_id}/retry-email",
+        json={"target": "USER"},
+        headers=admin_headers,
+    )
+    assert retry_user_res.status_code == 200
+    user_retry_data = retry_user_res.json()
+    assert user_retry_data["ticket_id"] == t_id
+    assert "user_email_status" in user_retry_data
+
+    # 5. Retry email endpoint - target SUPPORT
+    retry_support_res = await client.post(
+        f"/api/v1/support/tickets/{t_id}/retry-email",
+        json={"target": "SUPPORT"},
+        headers=admin_headers,
+    )
+    assert retry_support_res.status_code == 200
+    support_retry_data = retry_support_res.json()
+    assert support_retry_data["ticket_id"] == t_id
+    assert "support_email_status" in support_retry_data
+
+    # 6. Retry email endpoint - target ALL
+    retry_all_res = await client.post(
+        f"/api/v1/support/tickets/{t_id}/retry-email",
+        json={"target": "ALL"},
+        headers=admin_headers,
+    )
+    assert retry_all_res.status_code == 200
+    all_retry_data = retry_all_res.json()
+    assert all_retry_data["ticket_id"] == t_id
+    assert all_retry_data["email_status"] in ["SENT", "PARTIAL", "FAILED"]
+
+    # 7. Verify zero ticket duplication: exactly one ticket exists with this ID
+    matching_tickets = await db_session.support_tickets.count_documents({"ticket_id": t_id})
+    assert matching_tickets == 1
+
+    # 8. Verify audit logs record retries
+    retry_logs = await db_session.support_logs.find({
+        "ticket_id": t_id,
+        "action": {"$in": ["EMAIL_RETRY_USER", "EMAIL_RETRY_SUPPORT"]}
+    }).to_list(10)
+    assert len(retry_logs) >= 3
+
