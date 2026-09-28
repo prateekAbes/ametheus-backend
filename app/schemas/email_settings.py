@@ -79,3 +79,49 @@ class SendTestEmailResponse(BaseModel):
     error_details: Optional[str] = None
     sender_used: Optional[str] = None
     message: str = "Test email sent successfully"
+
+
+class OfficialEmailSendRequest(BaseModel):
+    recipient_type: str = Field(
+        ...,
+        description="Target audience: 'ALL_USERS', 'SELECTED_USERS', 'SELECTED_TEAMS', or 'CUSTOM_EMAILS'",
+    )
+    user_ids: Optional[list[str]] = Field(default=None, description="List of user IDs when recipient_type is 'SELECTED_USERS'")
+    team_ids: Optional[list[str]] = Field(default=None, description="List of team IDs when recipient_type is 'SELECTED_TEAMS'")
+    custom_emails: Optional[list[str]] = Field(default=None, description="List of direct emails when recipient_type is 'CUSTOM_EMAILS'")
+    subject: str = Field(..., min_length=3, max_length=200, description="Email subject line")
+    message: str = Field(..., min_length=5, max_length=20000, description="Email message body (markdown/plain text)")
+
+    @field_validator("recipient_type")
+    @classmethod
+    def validate_type(cls, v: str) -> str:
+        clean = (v or "").strip().upper()
+        if clean not in ("ALL_USERS", "SELECTED_USERS", "SELECTED_TEAMS", "CUSTOM_EMAILS"):
+            raise ValueError("recipient_type must be one of: 'ALL_USERS', 'SELECTED_USERS', 'SELECTED_TEAMS', 'CUSTOM_EMAILS'")
+        return clean
+
+
+class OfficialEmailLogItem(BaseModel):
+    id: str
+    sender: str
+    recipient_type: str
+    recipient_count: int
+    recipients_sample: list[str] = []
+    subject: str
+    status: str
+    created_at: str
+    operator_id: Optional[str] = None
+    error_summary: Optional[str] = None
+
+
+class OfficialEmailSendResponse(BaseModel):
+    success: bool
+    message: str
+    recipient_count: int
+    log_id: str
+
+
+class OfficialEmailHistoryResponse(BaseModel):
+    total: int
+    items: list[OfficialEmailLogItem]
+

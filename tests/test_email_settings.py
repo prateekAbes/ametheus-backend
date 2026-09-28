@@ -131,3 +131,49 @@ async def test_centralized_email_identities_and_validation():
     assert "support" in status
     assert "noreply" in status
     assert "official" in status
+
+
+@pytest.mark.asyncio
+async def test_official_email_sending_and_history(client, db_session):
+    admin_headers = make_auth_headers("usr_super_admin")
+    player_headers = make_auth_headers("usr_vortex_lead")
+
+    # 1. Non-admin cannot send official mail (403 Forbidden)
+    payload = {
+        "recipient_type": "CUSTOM_EMAILS",
+        "custom_emails": ["partner@ametheus.gg"],
+        "subject": "Platform Partner Update",
+        "message": "We are expanding tournament sponsorships.",
+    }
+    player_res = await client.post(
+        "/api/v1/admin/email/official/send",
+        json=payload,
+        headers=player_headers,
+    )
+    assert player_res.status_code == 403
+
+    # 2. Super Admin can send official email broadcast
+    admin_res = await client.post(
+        "/api/v1/admin/email/official/send",
+        json=payload,
+        headers=admin_headers,
+    )
+    assert admin_res.status_code == 200
+    send_data = admin_res.json()
+    assert send_data["success"] is True
+    assert send_data["recipient_count"] == 1
+    assert "log_id" in send_data
+
+    # 3. Super Admin can retrieve history
+    hist_res = await client.get("/api/v1/admin/email/official/history", headers=admin_headers)
+    assert hist_res.status_code == 200
+    hist_data = hist_res.json()
+    assert hist_data["total"] >= 1
+    assert len(hist_data["items"]) >= 1
+    latest = hist_data["items"][0]
+    assert latest["sender"] == "official.ametheus@gmail.com"
+    assert latest["subject"] == "Platform Partner Update"
+    assert latest["recipient_type"] == "CUSTOM_EMAILS"
+    # Never expose credentials in logs
+    assert "password" not in str(hist_data).lower()
+

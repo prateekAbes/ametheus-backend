@@ -11,6 +11,10 @@ from app.schemas.email_settings import (
     SmtpStatusResponse,
     SendTestEmailRequest,
     SendTestEmailResponse,
+    OfficialEmailSendRequest,
+    OfficialEmailSendResponse,
+    OfficialEmailHistoryResponse,
+    OfficialEmailLogItem,
 )
 from app.services.email_service import (
     get_email_system_status,
@@ -101,3 +105,220 @@ async def send_diagnostic_test_email(
         service=str(payload.service),
         db=db,
     )
+
+
+async def _dispatch_official_broadcast(
+    db: AsyncIOMotorDatabase,
+    log_id: str,
+    target_recipients: list[dict],  # list of {"email": str, "name": str}
+    subject: str,
+    message: str,
+):
+    """
+    Asynchronously broadcasts official email to recipients respecting rate limits
+    and updates the database delivery log.
+    """
+    from app.services.email_service import send_official_announcement_to_recipient
+    import asyncio
+    from datetime import datetime, timezone
+
+    sent_count = 0
+    fail_count = 0
+    errors = []
+
+    for r in target_recipients:
+        email = r["email"]
+        name = r.get("name") or "Ametheus Member"
+        try:
+            ok, err = await send_official_announcement_to_recipient(
+                to_email=email,
+                subject=subject,
+                message=message,
+                recipient_name=name,
+            )
+            if ok:
+                sent_count += 1
+            else:
+                fail_count += 1
+                if err and len(errors) < 5:
+                    errors.append(f"{email}: {err}")
+        except Exception as e:
+            fail_count += 1
+            if len(errors) < 5:
+                errors.append(f"{email}: {str(e)}")
+
+        # Respect Gmail rate limits: brief pause between sends in batch
+        if len(target_recipients) > 1:
+            await asyncio.sleep(0.3)
+
+    status = "COMPLETED" if fail_count == 0 else ("PARTIAL" if sent_count > 0 else "FAILED")
+    error_summary = "; ".join(errors) if errors else None
+
+    await db.official_email_logs.update_one(
+        {"_id": log_id},
+        {
+            "$set": {
+                "status": status,
+                "sent_count": sent_count,
+                "fail_count": fail_count,
+                "error_summary": error_summary,
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+            }
+        },
+    )
+
+
+@admin_router.post("/official/send", response_model=OfficialEmailSendResponse)
+async def send_official_admin_email(
+    payload: OfficialEmailSendRequest,
+    admin_user: User = Depends(require_super_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Super Admin endpoint to broadcast official platform communication via official.ametheus@gmail.com.
+    Audience modes:
+    - ALL_USERS: broadcasts to all active registered platform users.
+    - SELECTED_USERS: broadcasts to selected user IDs.
+    - SELECTED_TEAMS: broadcasts to all members belonging to selected team IDs.
+    - CUSTOM_EMAILS: broadcasts to explicit email addresses.
+    """
+    import asyncio
+    import uuid
+    from datetime import datetime, timezone
+    from app.schemas.email_settings import EMAIL_REGEX
+
+    target_recipients: list[dict] = []
+    seen_emails: set[str] = set()
+
+    def add_recipient(email: Optional[str], name: Optional[str] = None):
+        if not email:
+            return
+        clean = email.strip().lower()
+        if clean and EMAIL_REGEX.match(clean) and clean not in seen_emails:
+            seen_emails.add(clean)
+            target_recipients.append({"email": clean, "name": name or "Contender"})
+
+    rec_type = payload.recipient_type.upper()
+
+    if rec_type == "ALL_USERS":
+        cursor = db.users.find({"email": {"$exists": True, "$ne": None}}, {"email": 1, "display_name": 1, "username": 1})
+        async for u in cursor:
+            add_recipient(u.get("email"), u.get("display_name") or u.get("username"))
+
+    elif rec_type == "SELECTED_USERS":
+        if not payload.user_ids:
+            raise HTTPException(status_code=400, detail="user_ids cannot be empty when recipient_type is 'SELECTED_USERS'")
+        cursor = db.users.find(
+            {"$or": [{"_id": {"$in": payload.user_ids}}, {"id": {"$in": payload.user_ids}}]},
+            {"email": 1, "display_name": 1, "username": 1}
+        )
+        async for u in cursor:
+            add_recipient(u.get("email"), u.get("display_name") or u.get("username"))
+
+    elif rec_type == "SELECTED_TEAMS":
+        if not payload.team_ids:
+            raise HTTPException(status_code=400, detail="team_ids cannot be empty when recipient_type is 'SELECTED_TEAMS'")
+        cursor = db.teams.find(
+            {"$or": [{"_id": {"$in": payload.team_ids}}, {"id": {"$in": payload.team_ids}}]}
+        )
+        team_user_ids = set()
+        async for team in cursor:
+            if team.get("captain_id"):
+                team_user_ids.add(team["captain_id"])
+            for m in team.get("members", []):
+                uid = m.get("user_id") if isinstance(m, dict) else m
+                if uid:
+                    team_user_ids.add(uid)
+
+        if team_user_ids:
+            u_cursor = db.users.find(
+                {"$or": [{"_id": {"$in": list(team_user_ids)}}, {"id": {"$in": list(team_user_ids)}}]},
+                {"email": 1, "display_name": 1, "username": 1}
+            )
+            async for u in u_cursor:
+                add_recipient(u.get("email"), u.get("display_name") or u.get("username"))
+
+    elif rec_type == "CUSTOM_EMAILS":
+        if not payload.custom_emails:
+            raise HTTPException(status_code=400, detail="custom_emails cannot be empty when recipient_type is 'CUSTOM_EMAILS'")
+        for ce in payload.custom_emails:
+            add_recipient(ce)
+
+    if not target_recipients:
+        raise HTTPException(
+            status_code=400,
+            detail="No valid recipient email addresses found for the selected criteria."
+        )
+
+    log_id = f"OFFICIAL-{uuid.uuid4().hex[:12].upper()}"
+    now_iso = datetime.now(timezone.utc).isoformat()
+    sample_recipients = [r["email"] for r in target_recipients[:10]]
+
+    log_doc = {
+        "_id": log_id,
+        "id": log_id,
+        "sender": "official.ametheus@gmail.com",
+        "recipient_type": rec_type,
+        "recipient_count": len(target_recipients),
+        "recipients_sample": sample_recipients,
+        "subject": payload.subject.strip(),
+        "message": payload.message.strip(),
+        "status": "QUEUED",
+        "created_at": now_iso,
+        "operator_id": admin_user.id,
+        "sent_count": 0,
+        "fail_count": 0,
+        "error_summary": None,
+    }
+    await db.official_email_logs.insert_one(log_doc)
+
+    # Launch asynchronous broadcast in background
+    asyncio.create_task(
+        _dispatch_official_broadcast(
+            db=db,
+            log_id=log_id,
+            target_recipients=target_recipients,
+            subject=payload.subject.strip(),
+            message=payload.message.strip(),
+        )
+    )
+
+    return OfficialEmailSendResponse(
+        success=True,
+        message=f"Official broadcast scheduled for {len(target_recipients)} recipient(s).",
+        recipient_count=len(target_recipients),
+        log_id=log_id,
+    )
+
+
+@admin_router.get("/official/history", response_model=OfficialEmailHistoryResponse)
+async def get_official_email_history(
+    limit: int = Query(50, ge=1, le=100),
+    admin_user: User = Depends(require_super_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Returns history of official email broadcasts dispatched by Super Admins.
+    """
+    total = await db.official_email_logs.count_documents({})
+    cursor = db.official_email_logs.find({}).sort("created_at", -1).limit(limit)
+
+    items = []
+    async for doc in cursor:
+        items.append(
+            OfficialEmailLogItem(
+                id=str(doc.get("id") or doc.get("_id")),
+                sender=doc.get("sender") or "official.ametheus@gmail.com",
+                recipient_type=doc.get("recipient_type") or "UNKNOWN",
+                recipient_count=int(doc.get("recipient_count") or 0),
+                recipients_sample=doc.get("recipients_sample") or [],
+                subject=doc.get("subject") or "",
+                status=doc.get("status") or "UNKNOWN",
+                created_at=doc.get("created_at") or "",
+                operator_id=doc.get("operator_id"),
+                error_summary=doc.get("error_summary"),
+            )
+        )
+
+    return OfficialEmailHistoryResponse(total=total, items=items)
+

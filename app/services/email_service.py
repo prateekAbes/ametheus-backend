@@ -816,3 +816,91 @@ https://ametheus.gg
 """
 
     return await send_noreply_email(to_email_clean, subject, text_body, html_body)
+
+
+def render_official_announcement_email(
+    subject: str,
+    message: str,
+    recipient_name: Optional[str] = None,
+) -> tuple[str, str]:
+    """
+    Renders professional plain text and HTML templates for Official Ametheus communications.
+    """
+    name = (recipient_name or "Ametheus Member").strip()
+    clean_msg = message.strip()
+
+    text_body = f"""Ametheus Official Communication
+===================================================
+
+Dear {name},
+
+{clean_msg}
+
+--
+AMETHEUS Esports Platform
+Official Operations
+https://ametheus.gg
+"""
+
+    html_message = clean_msg.replace("\n\n", "</p><p style='margin: 0 0 16px 0; font-size: 14px; line-height: 1.7; color: #E2E8F0;'>").replace("\n", "<br/>")
+
+    html_body = f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>{subject}</title>
+</head>
+<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background-color: #0B0E16; margin: 0; padding: 24px; color: #F8FAFC;">
+  <table width="100%" border="0" cellspacing="0" cellpadding="0" style="max-width: 620px; margin: 0 auto; background-color: #111622; border-radius: 12px; border: 1px solid #242C3D; overflow: hidden; box-shadow: 0 4px 14px rgba(0,0,0,0.6);">
+    <tr>
+      <td style="background-color: #1A2234; padding: 24px 28px; border-bottom: 2px solid #E56A10;">
+        <h1 style="color: #FFFFFF; margin: 0; font-size: 20px; font-weight: 800; letter-spacing: 1px;">AMETHEUS <span style="color: #E56A10;">OFFICIAL</span></h1>
+        <p style="color: #94A3B8; margin: 4px 0 0 0; font-size: 11px; text-transform: uppercase; letter-spacing: 2px;">Official Platform Announcement</p>
+      </td>
+    </tr>
+    <tr>
+      <td style="padding: 32px 28px;">
+        <p style="margin: 0 0 18px 0; font-size: 14px; color: #94A3B8;">
+          Dear <strong style="color: #FFFFFF;">{name}</strong>,
+        </p>
+
+        <h2 style="margin: 0 0 20px 0; font-size: 18px; color: #E56A10; font-weight: 700;">{subject}</h2>
+
+        <div style="background-color: #0B0E16; border-left: 3px solid #E56A10; padding: 20px; border-radius: 6px; margin-bottom: 28px;">
+          <p style="margin: 0 0 16px 0; font-size: 14px; line-height: 1.7; color: #E2E8F0;">
+            {html_message}
+          </p>
+        </div>
+
+        <div style="text-align: center; margin: 28px 0 12px 0;">
+          <a href="https://ametheus.gg" style="display: inline-block; background-color: #E56A10; color: #FFFFFF; padding: 12px 28px; font-family: monospace; font-size: 13px; font-weight: bold; text-transform: uppercase; text-decoration: none; border-radius: 8px; letter-spacing: 0.5px;">
+            Visit Ametheus Platform &rarr;
+          </a>
+        </div>
+      </td>
+    </tr>
+    <tr>
+      <td style="background-color: #0B0E16; padding: 18px 28px; text-align: center; border-top: 1px solid #242C3D; font-size: 11px; color: #64748B;">
+        Sent by Ametheus Official Communications &bull; official.ametheus@gmail.com<br/>
+        &copy; 2026 AMETHEUS Esports Platform. All competitive integrity rights reserved.
+      </td>
+    </tr>
+  </table>
+</body>
+</html>
+"""
+    return text_body, html_body
+
+
+async def send_official_announcement_to_recipient(
+    to_email: str,
+    subject: str,
+    message: str,
+    recipient_name: Optional[str] = None,
+) -> tuple[bool, Optional[str]]:
+    """
+    Sends an official announcement using official.ametheus@gmail.com.
+    """
+    text_body, html_body = render_official_announcement_email(subject, message, recipient_name)
+    return await send_official_email(to_email, subject, text_body, html_body)
+

@@ -183,7 +183,7 @@ async def sync_clerk_user(
             detail="Failed to retrieve user profile after synchronization.",
         )
 
-    # Trigger audit log and welcome notification only for fresh registrations
+    # Trigger audit log for fresh registrations
     if is_newly_created:
         try:
             await record_audit_log(
@@ -194,17 +194,15 @@ async def sync_clerk_user(
                 target=payload.clerk_user_id,
                 details=f"Clerk user {clean_username} ({clean_email}) registered as {initial_role}",
             )
-            from app.services.notification import create_notification
-            await create_notification(
-                db=db,
-                user_id=payload.clerk_user_id,
-                title="Welcome to AMETHEUS",
-                message="Your competitive account is active. Register your team and join active tournament brackets.",
-                notification_type="SYSTEM",
-                link="/tournaments",
-            )
         except Exception:
             pass
+
+    # Ensure welcome notification is issued reliably for any new user or user lacking it
+    try:
+        from app.services.notification import ensure_welcome_notification
+        await ensure_welcome_notification(db=db, user_id=payload.clerk_user_id)
+    except Exception:
+        pass
 
     return User.from_mongo(final_doc)
 

@@ -121,3 +121,42 @@ async def create_notification(
             logger.warning(f"[Ametheus Notification] Email trigger failed silently: {e}")
 
     return notif
+
+
+WELCOME_NOTIFICATION_TITLE = "Welcome to Ametheus! 🎮"
+WELCOME_NOTIFICATION_MESSAGE = "Your account has been created successfully.\nExplore games, join teams, and participate in upcoming events."
+
+
+async def ensure_welcome_notification(
+    db: AsyncIOMotorDatabase,
+    user_id: str,
+) -> Optional[Notification]:
+    """
+    Ensures that a user receives the official Welcome Notification exactly once upon joining.
+    Checks whether a welcome notification has already been created for the user.
+    If not, creates it reliably as an unread notification with link to /tournaments.
+    Execution is strictly isolated from SMTP failures.
+    """
+    if not user_id:
+        return None
+
+    try:
+        # Check if already issued
+        existing = await db.notifications.find_one({
+            "user_id": user_id,
+            "title": {"$in": [WELCOME_NOTIFICATION_TITLE, "Welcome to AMETHEUS"]},
+        })
+        if existing:
+            return Notification.from_mongo(existing)
+
+        return await create_notification(
+            db=db,
+            user_id=user_id,
+            title=WELCOME_NOTIFICATION_TITLE,
+            message=WELCOME_NOTIFICATION_MESSAGE,
+            notification_type="SYSTEM",
+            link="/tournaments",
+        )
+    except Exception as e:
+        logger.warning(f"[Ametheus Notification] ensure_welcome_notification failed safely: {e}")
+        return None
