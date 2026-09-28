@@ -23,9 +23,9 @@ async def test_public_email_settings(client, db_session):
     res = await client.get("/api/v1/platform/email-settings")
     assert res.status_code == 200
     data = res.json()
-    assert data["official_email"] == "official.ametheus@gmail.com"
-    assert data["support_email"] == "support.ametheus@gmail.com"
-    assert data["automated_email"] == "noreply.ametheus@gmail.com"
+    assert data["official_email"] == "official@ametheus.games"
+    assert data["support_email"] == "support@ametheus.games"
+    assert data["automated_email"] == "noreply@ametheus.games"
     # Operator details must never leak publicly
     assert data.get("updated_by") is None
 
@@ -47,9 +47,10 @@ async def test_admin_email_settings_read_only_and_rbac(client, db_session):
     assert "support" in st_data["services"]
     assert "noreply" in st_data["services"]
     assert "official" in st_data["services"]
-    assert st_data["services"]["support"]["email"] == "support.ametheus@gmail.com"
-    assert st_data["services"]["noreply"]["email"] == "noreply.ametheus@gmail.com"
-    assert st_data["services"]["official"]["email"] == "official.ametheus@gmail.com"
+    assert st_data["services"]["support"]["email"] == "support@ametheus.games"
+    assert st_data["services"]["noreply"]["email"] == "noreply@ametheus.games"
+    assert st_data["services"]["official"]["email"] == "official@ametheus.games"
+    assert st_data["services"]["support"]["smtp_host"] == "smtp-relay.brevo.com"
     # Never expose passwords or raw secrets
     assert "password" not in str(st_data).lower()
     assert "app_password" not in str(st_data).lower()
@@ -80,7 +81,7 @@ async def test_smtp_diagnostics_and_test_email(client, db_session):
     assert "configured" in st_data
     assert "connected" in st_data
     assert "authenticated" in st_data
-    assert st_data["sender"] == "support.ametheus@gmail.com"
+    assert st_data["sender"] == "support@ametheus.games"
     assert "status_code" in st_data
     # Must never expose secrets
     assert "password" not in st_data
@@ -111,20 +112,20 @@ async def test_smtp_diagnostics_and_test_email(client, db_session):
 
 @pytest.mark.asyncio
 async def test_centralized_email_identities_and_validation():
-    # 1. Verify identities config isolation
+    # 1. Verify identities config isolation using Brevo SMTP
     supp_cfg = get_identity_config("support")
-    assert supp_cfg["email"] == "support.ametheus@gmail.com"
-    assert supp_cfg["host"] == "smtp.gmail.com"
+    assert supp_cfg["email"] == "support@ametheus.games"
+    assert supp_cfg["host"] == "smtp-relay.brevo.com"
     assert supp_cfg["port"] == 587
     assert supp_cfg["use_tls"] is True
 
     noreply_cfg = get_identity_config("noreply")
-    assert noreply_cfg["email"] == "noreply.ametheus@gmail.com"
-    assert noreply_cfg["host"] == "smtp.gmail.com"
+    assert noreply_cfg["email"] == "noreply@ametheus.games"
+    assert noreply_cfg["host"] == "smtp-relay.brevo.com"
 
     official_cfg = get_identity_config("official")
-    assert official_cfg["email"] == "official.ametheus@gmail.com"
-    assert official_cfg["host"] == "smtp.gmail.com"
+    assert official_cfg["email"] == "official@ametheus.games"
+    assert official_cfg["host"] == "smtp-relay.brevo.com"
 
     # 2. Validation function runs cleanly on startup
     status = validate_email_configuration()
@@ -171,9 +172,10 @@ async def test_official_email_sending_and_history(client, db_session):
     assert hist_data["total"] >= 1
     assert len(hist_data["items"]) >= 1
     latest = hist_data["items"][0]
-    assert latest["sender"] == "official.ametheus@gmail.com"
+    assert latest["sender"] == "official@ametheus.games"
     assert latest["subject"] == "Platform Partner Update"
     assert latest["recipient_type"] == "CUSTOM_EMAILS"
     # Never expose credentials in logs
     assert "password" not in str(hist_data).lower()
+
 

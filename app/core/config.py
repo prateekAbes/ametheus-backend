@@ -27,58 +27,40 @@ class Settings(BaseSettings):
     CLERK_ISSUER: str = "https://clerk.ametheus.gg"
     SUPER_ADMIN_EMAIL: str = "admin@ametheus.gg"
     SUPPORT_PHONE: str = "+91 98765 43210"
-    SUPPORT_ADMIN_EMAIL: str = "support.ametheus@gmail.com"
+    SUPPORT_ADMIN_EMAIL: str = "support@ametheus.games"
     ESCROW_SECRET_KEY: str = "ametheus_escrow_vault_secret_2026"
 
     # =========================================================
-    # AMETHEUS 3 GMAIL SMTP IDENTITIES & EMAIL SYSTEM
+    # EMAIL CONFIGURATION (BREVO SMTP & SENDER IDENTITIES)
     # =========================================================
     EMAIL_ENABLED: bool = True
-    EMAIL_REPLY_TO: str = "support.ametheus@gmail.com"
 
-    # ---------- 1. Support Email ----------
-    SUPPORT_EMAIL: str = "support.ametheus@gmail.com"
-    SUPPORT_EMAIL_NAME: str = "Ametheus Support"
-    SUPPORT_SMTP_HOST: str = "smtp.gmail.com"
-    SUPPORT_SMTP_PORT: int = 587
-    SUPPORT_SMTP_USERNAME: str = "support.ametheus@gmail.com"
-    SUPPORT_SMTP_PASSWORD: Optional[str] = None
-    SUPPORT_SMTP_USE_TLS: bool = True
-
-    # ---------- 2. No-Reply / Automated Email ----------
-    NOREPLY_EMAIL: str = "noreply.ametheus@gmail.com"
-    NOREPLY_EMAIL_NAME: str = "Ametheus"
-    NOREPLY_SMTP_HOST: str = "smtp.gmail.com"
-    NOREPLY_SMTP_PORT: int = 587
-    NOREPLY_SMTP_USERNAME: str = "noreply.ametheus@gmail.com"
-    NOREPLY_SMTP_PASSWORD: Optional[str] = None
-    NOREPLY_SMTP_USE_TLS: bool = True
-
-    # ---------- 3. Official Email ----------
-    OFFICIAL_EMAIL: str = "official.ametheus@gmail.com"
-    OFFICIAL_EMAIL_NAME: str = "Ametheus"
-    OFFICIAL_SMTP_HOST: str = "smtp.gmail.com"
-    OFFICIAL_SMTP_PORT: int = 587
-    OFFICIAL_SMTP_USERNAME: str = "official.ametheus@gmail.com"
-    OFFICIAL_SMTP_PASSWORD: Optional[str] = None
-    OFFICIAL_SMTP_USE_TLS: bool = True
-
-    # Compatibility fallbacks
-    AUTOMATED_EMAIL: str = "noreply.ametheus@gmail.com"
-    SMTP_HOST: Optional[str] = None
+    # Brevo Shared Outgoing SMTP
+    SMTP_HOST: str = "smtp-relay.brevo.com"
     SMTP_PORT: int = 587
-    SMTP_USER: Optional[str] = None
+    SMTP_USERNAME: Optional[str] = None
     SMTP_PASSWORD: Optional[str] = None
-    SMTP_SECURE: bool = False
-    SMTP_FROM_EMAIL: str = "support.ametheus@gmail.com"
-    SMTP_FROM_NAME: str = "Ametheus"
+    SMTP_USE_TLS: bool = True
+
+    # Sender Identities
+    OFFICIAL_EMAIL: str = "official@ametheus.games"
+    OFFICIAL_EMAIL_NAME: str = "Ametheus Official"
+
+    SUPPORT_EMAIL: str = "support@ametheus.games"
+    SUPPORT_EMAIL_NAME: str = "Ametheus Support"
+
+    NOREPLY_EMAIL: str = "noreply@ametheus.games"
+    NOREPLY_EMAIL_NAME: str = "Ametheus"
+
+    # Default reply-to address
+    EMAIL_REPLY_TO: str = "support@ametheus.games"
+
+    # Compatibility alias
+    AUTOMATED_EMAIL: str = "noreply@ametheus.games"
 
     @field_validator(
         "EMAIL_ENABLED",
-        "SUPPORT_SMTP_USE_TLS",
-        "NOREPLY_SMTP_USE_TLS",
-        "OFFICIAL_SMTP_USE_TLS",
-        "SMTP_SECURE",
+        "SMTP_USE_TLS",
         mode="before"
     )
     @classmethod
@@ -91,15 +73,9 @@ class Settings(BaseSettings):
             return v.strip().lower() in ("true", "1", "yes", "on", "t")
         return bool(v)
 
-    @field_validator(
-        "SUPPORT_SMTP_PORT",
-        "NOREPLY_SMTP_PORT",
-        "OFFICIAL_SMTP_PORT",
-        "SMTP_PORT",
-        mode="before"
-    )
+    @field_validator("SMTP_PORT", mode="before")
     @classmethod
-    def resolve_smtp_ports(cls, v: Union[int, str, None]) -> int:
+    def resolve_smtp_port(cls, v: Union[int, str, None]) -> int:
         if v is None or v == "":
             return 587
         try:
@@ -109,47 +85,36 @@ class Settings(BaseSettings):
 
     @field_validator("SMTP_HOST", mode="before")
     @classmethod
-    def resolve_smtp_host(cls, v: Optional[str]) -> Optional[str]:
-        if v:
+    def resolve_smtp_host(cls, v: Optional[str]) -> str:
+        if v and v.strip():
             return v.strip().strip("'\"")
         for key in ["EMAIL_HOST", "MAIL_SERVER", "SMTP_SERVER"]:
             val = os.getenv(key)
-            if val:
+            if val and val.strip():
                 return val.strip().strip("'\"")
-        return None
+        return "smtp-relay.brevo.com"
 
-    @field_validator("SMTP_USER", mode="before")
+    @field_validator("SMTP_USERNAME", mode="before")
     @classmethod
-    def resolve_smtp_user(cls, v: Optional[str]) -> Optional[str]:
-        if v:
+    def resolve_smtp_username(cls, v: Optional[str]) -> Optional[str]:
+        if v and v.strip():
             return v.strip().strip("'\"")
-        for key in ["EMAIL_HOST_USER", "MAIL_USERNAME", "SMTP_USERNAME"]:
+        for key in ["SMTP_USER", "EMAIL_HOST_USER", "MAIL_USERNAME"]:
             val = os.getenv(key)
-            if val:
+            if val and val.strip():
                 return val.strip().strip("'\"")
         return None
 
     @field_validator("SMTP_PASSWORD", mode="before")
     @classmethod
     def resolve_smtp_password(cls, v: Optional[str]) -> Optional[str]:
-        if v:
+        if v and v.strip():
             return v.strip().strip("'\"")
         for key in ["EMAIL_HOST_PASSWORD", "MAIL_PASSWORD", "SMTP_PASS"]:
             val = os.getenv(key)
-            if val:
+            if val and val.strip():
                 return val.strip().strip("'\"")
         return None
-
-    @field_validator("SMTP_FROM_EMAIL", mode="before")
-    @classmethod
-    def resolve_smtp_from_email(cls, v: Optional[str]) -> str:
-        if v and v.strip():
-            return v.strip().strip("'\"")
-        for key in ["DEFAULT_FROM_EMAIL", "MAIL_FROM"]:
-            val = os.getenv(key)
-            if val:
-                return val.strip().strip("'\"")
-        return "support.ametheus@gmail.com"
 
     @field_validator("DATABASE_URL", mode="before")
     @classmethod

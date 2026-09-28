@@ -127,7 +127,7 @@ async def test_support_settings_and_email_retry(client, db_session):
     # 1. Get environment-configured support destination email
     settings_res = await client.get("/api/v1/support/settings", headers=admin_headers)
     assert settings_res.status_code == 200
-    assert settings_res.json()["support_email"] == "support.ametheus@gmail.com"
+    assert settings_res.json()["support_email"] == "support@ametheus.games"
 
     # 2. Verify PUT /support/settings is removed/blocked (infrastructure config cannot be mutated via API)
     put_res = await client.put(

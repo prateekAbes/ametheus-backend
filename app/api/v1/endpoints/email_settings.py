@@ -54,8 +54,8 @@ async def get_admin_email_system_status(
 ):
     """
     Super Admin endpoint to inspect the read-only configuration status of all three
-    Gmail SMTP identities (support, noreply, official).
-    Credentials, App Passwords, and raw tokens are NEVER returned.
+    Brevo SMTP identities (official, support, noreply).
+    Credentials, passwords, and raw tokens are NEVER returned.
     """
     return get_email_system_status()
 
@@ -84,8 +84,8 @@ async def get_smtp_health_status(
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """
-    Live diagnostic health check of the backend Gmail SMTP connection for a specific identity.
-    Verifies TCP connectivity and App Password authentication without exposing credentials.
+    Live diagnostic health check of the backend Brevo SMTP connection for a specific identity.
+    Verifies TCP connectivity and Brevo authentication without exposing credentials.
     """
     return await check_smtp_health(service, db)
 
@@ -98,7 +98,7 @@ async def send_diagnostic_test_email(
 ):
     """
     Sends a live diagnostic test message using the specified service identity ('support', 'noreply', or 'official')
-    to the designated destination address.
+    to the designated destination address via Brevo SMTP.
     """
     return await send_test_email(
         to_email=str(payload.to_email),
@@ -147,9 +147,9 @@ async def _dispatch_official_broadcast(
             if len(errors) < 5:
                 errors.append(f"{email}: {str(e)}")
 
-        # Respect Gmail rate limits: brief pause between sends in batch
+        # Respect Brevo rate limits: brief pause between sends in batch
         if len(target_recipients) > 1:
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.1)
 
     status = "COMPLETED" if fail_count == 0 else ("PARTIAL" if sent_count > 0 else "FAILED")
     error_summary = "; ".join(errors) if errors else None
@@ -175,7 +175,7 @@ async def send_official_admin_email(
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """
-    Super Admin endpoint to broadcast official platform communication via official.ametheus@gmail.com.
+    Super Admin endpoint to broadcast official platform communication via official@ametheus.games.
     Audience modes:
     - ALL_USERS: broadcasts to all active registered platform users.
     - SELECTED_USERS: broadcasts to selected user IDs.
@@ -257,7 +257,7 @@ async def send_official_admin_email(
     log_doc = {
         "_id": log_id,
         "id": log_id,
-        "sender": "official.ametheus@gmail.com",
+        "sender": settings.OFFICIAL_EMAIL,
         "recipient_type": rec_type,
         "recipient_count": len(target_recipients),
         "recipients_sample": sample_recipients,
@@ -308,7 +308,7 @@ async def get_official_email_history(
         items.append(
             OfficialEmailLogItem(
                 id=str(doc.get("id") or doc.get("_id")),
-                sender=doc.get("sender") or "official.ametheus@gmail.com",
+                sender=doc.get("sender") or settings.OFFICIAL_EMAIL,
                 recipient_type=doc.get("recipient_type") or "UNKNOWN",
                 recipient_count=int(doc.get("recipient_count") or 0),
                 recipients_sample=doc.get("recipients_sample") or [],
@@ -321,4 +321,5 @@ async def get_official_email_history(
         )
 
     return OfficialEmailHistoryResponse(total=total, items=items)
+
 

@@ -21,55 +21,57 @@ logger = logging.getLogger("ametheus.email")
 
 def get_identity_config(identity: str) -> Dict[str, Any]:
     """
-    Returns the fixed configuration dictionary for one of the three Gmail SMTP identities:
-    'support', 'noreply', or 'official'.
-    Credentials are drawn strictly from server environment variables.
+    Returns the fixed configuration dictionary for one of the three Ametheus sender identities:
+    'official', 'support', or 'noreply'.
+    All three identities utilize the shared Brevo SMTP infrastructure.
     """
     norm = (identity or "").strip().lower()
+
+    # Shared Brevo SMTP connection parameters
+    host = settings.SMTP_HOST.strip() if settings.SMTP_HOST else "smtp-relay.brevo.com"
+    port = int(settings.SMTP_PORT or 587)
+    username = settings.SMTP_USERNAME.strip() if settings.SMTP_USERNAME else None
+    password = settings.SMTP_PASSWORD.strip() if settings.SMTP_PASSWORD else None
+    use_tls = bool(settings.SMTP_USE_TLS)
+
     if norm in ("support", "help", "contact"):
-        user = (settings.SUPPORT_SMTP_USERNAME or settings.SUPPORT_EMAIL).strip()
-        pwd = settings.SUPPORT_SMTP_PASSWORD or settings.SMTP_PASSWORD
         return {
             "key": "support",
             "email": settings.SUPPORT_EMAIL.strip(),
             "name": settings.SUPPORT_EMAIL_NAME.strip(),
-            "host": (settings.SUPPORT_SMTP_HOST or settings.SMTP_HOST or "smtp.gmail.com").strip(),
-            "port": int(settings.SUPPORT_SMTP_PORT or settings.SMTP_PORT or 587),
-            "username": user,
-            "password": pwd.strip() if pwd else None,
-            "use_tls": bool(settings.SUPPORT_SMTP_USE_TLS),
+            "host": host,
+            "port": port,
+            "username": username,
+            "password": password,
+            "use_tls": use_tls,
             "reply_to": settings.SUPPORT_EMAIL.strip(),
         }
     elif norm in ("noreply", "no-reply", "automated", "system"):
-        user = (settings.NOREPLY_SMTP_USERNAME or settings.NOREPLY_EMAIL).strip()
-        pwd = settings.NOREPLY_SMTP_PASSWORD or settings.SMTP_PASSWORD
         return {
             "key": "noreply",
             "email": settings.NOREPLY_EMAIL.strip(),
             "name": settings.NOREPLY_EMAIL_NAME.strip(),
-            "host": (settings.NOREPLY_SMTP_HOST or settings.SMTP_HOST or "smtp.gmail.com").strip(),
-            "port": int(settings.NOREPLY_SMTP_PORT or settings.SMTP_PORT or 587),
-            "username": user,
-            "password": pwd.strip() if pwd else None,
-            "use_tls": bool(settings.NOREPLY_SMTP_USE_TLS),
-            "reply_to": settings.SUPPORT_EMAIL.strip(),
+            "host": host,
+            "port": port,
+            "username": username,
+            "password": password,
+            "use_tls": use_tls,
+            "reply_to": settings.EMAIL_REPLY_TO.strip(),
         }
     elif norm in ("official", "business", "general"):
-        user = (settings.OFFICIAL_SMTP_USERNAME or settings.OFFICIAL_EMAIL).strip()
-        pwd = settings.OFFICIAL_SMTP_PASSWORD or settings.SMTP_PASSWORD
         return {
             "key": "official",
             "email": settings.OFFICIAL_EMAIL.strip(),
             "name": settings.OFFICIAL_EMAIL_NAME.strip(),
-            "host": (settings.OFFICIAL_SMTP_HOST or settings.SMTP_HOST or "smtp.gmail.com").strip(),
-            "port": int(settings.OFFICIAL_SMTP_PORT or settings.SMTP_PORT or 587),
-            "username": user,
-            "password": pwd.strip() if pwd else None,
-            "use_tls": bool(settings.OFFICIAL_SMTP_USE_TLS),
+            "host": host,
+            "port": port,
+            "username": username,
+            "password": password,
+            "use_tls": use_tls,
             "reply_to": settings.SUPPORT_EMAIL.strip(),
         }
     else:
-        raise ValueError(f"Unknown email identity: '{identity}'. Must be 'support', 'noreply', or 'official'.")
+        raise ValueError(f"Unknown email identity: '{identity}'. Must be 'official', 'support', or 'noreply'.")
 
 
 def _send_identity_smtp_sync(
@@ -81,7 +83,7 @@ def _send_identity_smtp_sync(
     reply_to: Optional[str] = None,
 ) -> Tuple[bool, Optional[str], Optional[str], Optional[str], str]:
     """
-    Synchronous SMTP delivery using the specified identity's isolated Gmail SMTP configuration.
+    Synchronous SMTP delivery through Brevo SMTP using the selected sender identity.
     Returns:
         (success: bool, error_code: Optional[str], error_details: Optional[str], message_id: Optional[str], sender_used: str)
     """
@@ -97,13 +99,13 @@ def _send_identity_smtp_sync(
         logger.info(f"[Ametheus Email] Email delivery disabled (EMAIL_ENABLED=False). Mocking delivery to <{to_email_clean}> | Subject: '{subject}'")
         return True, None, None, f"MOCK-{uuid.uuid4().hex[:8].upper()}", sender_used
 
-    if not cfg["password"] or not cfg["host"]:
+    if not cfg["password"] or not cfg["username"] or not cfg["host"]:
         logger.warning(
-            f"[Ametheus Email] {cfg['name']} ({identity_key}) SMTP is not configured in server environment (missing App Password or host). Cannot deliver email to <{to_email_clean}> | Subject: '{subject}'"
+            f"[Ametheus Email] Brevo SMTP is not configured in server environment (missing SMTP_USERNAME, SMTP_PASSWORD, or SMTP_HOST). Cannot deliver email to <{to_email_clean}> | Subject: '{subject}'"
         )
-        return False, "SMTP_NOT_CONFIGURED", f"{cfg['name']} SMTP service is not configured in environment.", None, sender_used
+        return False, "SMTP_NOT_CONFIGURED", "Brevo SMTP service is not configured in environment.", None, sender_used
 
-    msg_id = f"AMT-{uuid.uuid4().hex[:12].upper()}@ametheus.gg"
+    msg_id = f"AMT-{uuid.uuid4().hex[:12].upper()}@ametheus.games"
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
@@ -134,21 +136,21 @@ def _send_identity_smtp_sync(
 
         server.login(cfg["username"], cfg["password"])
 
-        # Envelope sender matches authenticated username for Gmail SMTP compliance
-        envelope_sender = cfg["username"]
+        # Envelope sender matches sender email for Brevo relay
+        envelope_sender = cfg["email"]
         server.sendmail(envelope_sender, [to_email_clean], msg.as_string())
         logger.info(f"[Ametheus Email] Successfully delivered email via {identity_key.upper()} to <{to_email_clean}> from <{cfg['email']}> | Subject: '{subject}'")
         return True, None, None, msg_id, sender_used
 
     except smtplib.SMTPAuthenticationError as e:
         err_msg = f"SMTP authentication failed: {e.smtp_error.decode(errors='replace') if isinstance(e.smtp_error, bytes) else str(e)}"
-        logger.error(f"[Ametheus Email] Authentication failed on {host}:{port} for {identity_key}: {err_msg}")
-        return False, "SMTP_AUTHENTICATION_FAILED", "SMTP authentication failed. Verify Gmail App Password.", None, sender_used
+        logger.error(f"[Ametheus Email] Brevo authentication failed on {host}:{port}: {err_msg}")
+        return False, "SMTP_AUTHENTICATION_FAILED", "SMTP authentication failed. Verify Brevo SMTP credentials.", None, sender_used
 
     except (smtplib.SMTPServerDisconnected, smtplib.SMTPConnectError, ConnectionRefusedError, socket.gaierror, socket.error, TimeoutError) as e:
         err_msg = f"SMTP connection error: {e}"
-        logger.error(f"[Ametheus Email] Connection failed on {host}:{port} for {identity_key}: {err_msg}")
-        return False, "SMTP_CONNECTION_FAILED", "Failed to connect to SMTP server. Connection timed out or host unreachable.", None, sender_used
+        logger.error(f"[Ametheus Email] Connection failed on {host}:{port}: {err_msg}")
+        return False, "SMTP_CONNECTION_FAILED", "Failed to connect to Brevo SMTP server. Connection timed out or host unreachable.", None, sender_used
 
     except smtplib.SMTPRecipientsRefused as e:
         err_msg = f"Recipient rejected: {e}"
@@ -177,6 +179,31 @@ def _send_identity_smtp_sync(
 # CENTRAL EMAIL SERVICE PUBLIC API
 # =========================================================================
 
+async def send_email(
+    sender_type: str,
+    recipient: str,
+    subject: str,
+    text_content: str,
+    html_content: str,
+    reply_to: Optional[str] = None,
+) -> Tuple[bool, Optional[str]]:
+    """
+    Centralized email dispatcher:
+    sender_type must be 'official', 'support', or 'noreply'.
+    Routes through Brevo SMTP using the chosen identity.
+    """
+    ok, err_code, err_det, _, _ = await asyncio.to_thread(
+        _send_identity_smtp_sync,
+        sender_type,
+        recipient,
+        subject,
+        text_content,
+        html_content,
+        reply_to,
+    )
+    return ok, err_det
+
+
 async def send_support_email(
     to_email: str,
     subject: str,
@@ -185,19 +212,17 @@ async def send_support_email(
     reply_to: Optional[str] = None,
 ) -> Tuple[bool, Optional[str]]:
     """
-    Sends an email using the SUPPORT identity (support.ametheus@gmail.com).
+    Sends an email using the SUPPORT identity (support@ametheus.games).
     Used for contact/support messages, user support requests, help inquiries, and support ticket communication.
     """
-    ok, err_code, err_det, _, _ = await asyncio.to_thread(
-        _send_identity_smtp_sync,
-        "support",
-        to_email,
-        subject,
-        text_content,
-        html_content,
-        reply_to or settings.SUPPORT_EMAIL,
+    return await send_email(
+        sender_type="support",
+        recipient=to_email,
+        subject=subject,
+        text_content=text_content,
+        html_content=html_content,
+        reply_to=reply_to or settings.SUPPORT_EMAIL,
     )
-    return ok, err_det
 
 
 async def send_noreply_email(
@@ -208,20 +233,18 @@ async def send_noreply_email(
     reply_to: Optional[str] = None,
 ) -> Tuple[bool, Optional[str]]:
     """
-    Sends an email using the NO-REPLY / AUTOMATED identity (noreply.ametheus@gmail.com).
+    Sends an email using the NO-REPLY / AUTOMATED identity (noreply@ametheus.games).
     Used for registration confirmations, account verification, password resets,
     automated notifications, tournament/game notifications, match reminders, and system alerts.
     """
-    ok, err_code, err_det, _, _ = await asyncio.to_thread(
-        _send_identity_smtp_sync,
-        "noreply",
-        to_email,
-        subject,
-        text_content,
-        html_content,
-        reply_to or settings.SUPPORT_EMAIL,
+    return await send_email(
+        sender_type="noreply",
+        recipient=to_email,
+        subject=subject,
+        text_content=text_content,
+        html_content=html_content,
+        reply_to=reply_to or settings.EMAIL_REPLY_TO,
     )
-    return ok, err_det
 
 
 async def send_official_email(
@@ -232,19 +255,17 @@ async def send_official_email(
     reply_to: Optional[str] = None,
 ) -> Tuple[bool, Optional[str]]:
     """
-    Sends an email using the OFFICIAL identity (official.ametheus@gmail.com).
+    Sends an email using the OFFICIAL identity (official@ametheus.games).
     Used for official announcements, organizational correspondence, and administrative communications.
     """
-    ok, err_code, err_det, _, _ = await asyncio.to_thread(
-        _send_identity_smtp_sync,
-        "official",
-        to_email,
-        subject,
-        text_content,
-        html_content,
-        reply_to or settings.SUPPORT_EMAIL,
+    return await send_email(
+        sender_type="official",
+        recipient=to_email,
+        subject=subject,
+        text_content=text_content,
+        html_content=html_content,
+        reply_to=reply_to or settings.SUPPORT_EMAIL,
     )
-    return ok, err_det
 
 
 # =========================================================================
@@ -253,14 +274,14 @@ async def send_official_email(
 
 def get_email_system_status() -> EmailSystemStatusResponse:
     """
-    Returns the non-sensitive configuration status of all three email services.
+    Returns the non-sensitive configuration status of the three Brevo email identities.
     Never exposes passwords, tokens, or raw secrets.
     """
     services_map: Dict[str, EmailServiceStatusItem] = {}
 
     for key in ("support", "noreply", "official"):
         cfg = get_identity_config(key)
-        is_configured = bool(cfg["password"] and cfg["host"])
+        is_configured = bool(cfg["password"] and cfg["username"] and cfg["host"])
         services_map[key] = EmailServiceStatusItem(
             service=key,
             email=cfg["email"],
@@ -283,23 +304,24 @@ def validate_email_configuration() -> Dict[str, bool]:
     Startup diagnostic validator called during FastAPI application lifespan.
     Logs human-readable configuration status without printing passwords.
     """
-    logger.info("[Ametheus Email] Validating 3 Gmail SMTP identities...")
+    logger.info("[Ametheus Email] Validating Brevo SMTP configuration & sender identities...")
     status = {}
+    is_brevo_configured = bool(settings.SMTP_USERNAME and settings.SMTP_PASSWORD and settings.SMTP_HOST)
+
     for key in ("support", "noreply", "official"):
         cfg = get_identity_config(key)
-        is_configured = bool(cfg["password"] and cfg["host"])
-        status[key] = is_configured
-        if is_configured:
-            logger.info(f"[Ametheus Email] {cfg['name']} ({key} -> {cfg['email']}): Configured")
-            print(f"[AMETHEUS EMAIL] {cfg['name']} SMTP ({cfg['email']}): Configured")
+        status[key] = is_brevo_configured
+        if is_brevo_configured:
+            logger.info(f"[Ametheus Email] {cfg['name']} ({key} -> {cfg['email']}): Configured via Brevo SMTP ({cfg['host']}:{cfg['port']})")
+            print(f"[AMETHEUS EMAIL] {cfg['name']} ({cfg['email']}): Configured (Brevo)")
         else:
-            logger.warning(f"[Ametheus Email] {cfg['name']} ({key} -> {cfg['email']}): Not Configured (Password missing in environment).")
-            print(f"[AMETHEUS EMAIL] {cfg['name']} SMTP ({cfg['email']}): Not Configured")
+            logger.warning(f"[Ametheus Email] {cfg['name']} ({key} -> {cfg['email']}): Not Configured (SMTP_PASSWORD or SMTP_USERNAME missing in environment).")
+            print(f"[AMETHEUS EMAIL] {cfg['name']} ({cfg['email']}): Not Configured (Brevo)")
     return status
 
 
 def _check_smtp_health_sync(identity: str = "support") -> Dict[str, Any]:
-    """Synchronous test of SMTP connectivity and authentication for a specific identity."""
+    """Synchronous test of Brevo SMTP connectivity and authentication for a specific identity."""
     try:
         cfg = get_identity_config(identity)
     except ValueError as e:
@@ -316,7 +338,7 @@ def _check_smtp_health_sync(identity: str = "support") -> Dict[str, Any]:
             "secure": True,
         }
 
-    if not cfg["password"] or not cfg["host"]:
+    if not cfg["password"] or not cfg["username"] or not cfg["host"]:
         return {
             "configured": False,
             "connected": False,
@@ -324,7 +346,7 @@ def _check_smtp_health_sync(identity: str = "support") -> Dict[str, Any]:
             "sender": cfg["email"],
             "service": identity,
             "status_code": "NOT_CONFIGURED",
-            "message": f"{cfg['name']} SMTP credentials not set in server environment.",
+            "message": "Brevo SMTP credentials (SMTP_USERNAME / SMTP_PASSWORD) not set in server environment.",
             "host": cfg["host"],
             "port": cfg["port"],
             "secure": cfg["use_tls"],
@@ -354,7 +376,7 @@ def _check_smtp_health_sync(identity: str = "support") -> Dict[str, Any]:
             "sender": cfg["email"],
             "service": identity,
             "status_code": "CONNECTED",
-            "message": f"SMTP handshake and authentication succeeded for {cfg['email']}.",
+            "message": f"Brevo SMTP handshake and authentication succeeded for {cfg['email']}.",
             "host": host,
             "port": port,
             "secure": cfg["use_tls"],
@@ -368,7 +390,7 @@ def _check_smtp_health_sync(identity: str = "support") -> Dict[str, Any]:
             "sender": cfg["email"],
             "service": identity,
             "status_code": "AUTHENTICATION_FAILED",
-            "message": f"Authentication failed for {cfg['email']}. Check Gmail App Password.",
+            "message": f"Authentication failed with Brevo SMTP ({host}:{port}). Check Brevo SMTP key.",
             "host": host,
             "port": port,
             "secure": cfg["use_tls"],
@@ -382,7 +404,7 @@ def _check_smtp_health_sync(identity: str = "support") -> Dict[str, Any]:
             "sender": cfg["email"],
             "service": identity,
             "status_code": "CONNECTION_FAILED",
-            "message": f"Connection failed to {host}:{port}. Error: {str(e)}",
+            "message": f"Connection failed to Brevo SMTP {host}:{port}. Error: {str(e)}",
             "host": host,
             "port": port,
             "secure": cfg["use_tls"],
@@ -414,7 +436,7 @@ async def check_smtp_health(
     identity: str = "support",
     db: Optional[AsyncIOMotorDatabase] = None,
 ) -> SmtpStatusResponse:
-    """Asynchronous wrapper for live SMTP health check."""
+    """Asynchronous wrapper for live Brevo SMTP health check."""
     status_dict = await asyncio.to_thread(_check_smtp_health_sync, identity)
     return SmtpStatusResponse(**status_dict)
 
@@ -425,7 +447,7 @@ async def send_test_email(
     db: Optional[AsyncIOMotorDatabase] = None,
 ) -> SendTestEmailResponse:
     """
-    Sends a test verification email using the explicitly chosen service ('support', 'noreply', or 'official').
+    Sends a test verification email via Brevo SMTP using the chosen identity ('support', 'noreply', or 'official').
     """
     norm_service = (service or "support").strip().lower()
     if norm_service not in ("support", "noreply", "official"):
@@ -434,11 +456,11 @@ async def send_test_email(
     cfg = get_identity_config(norm_service)
     subject = f"Ametheus SMTP Test — {cfg['name']} ({cfg['email']})"
 
-    text_body = f"""Ametheus Esports Platform — SMTP Service Test
+    text_body = f"""Ametheus Esports Platform — Brevo SMTP Service Test
 ===================================================
 
 This is an administrative test message dispatched from the Ametheus Operations Cockpit.
-If you received this message, the {cfg['name']} ({norm_service.upper()}) email identity is functioning properly.
+If you received this message, Brevo SMTP delivery for {cfg['name']} ({norm_service.upper()}) is functioning properly.
 
 Identity: {cfg['name']}
 Sender Email: {cfg['email']}
@@ -468,11 +490,11 @@ https://ametheus.gg
     <tr>
       <td style="padding: 28px 24px;">
         <div style="background-color: #064E3B; border: 1px solid #059669; border-radius: 8px; padding: 14px 16px; margin-bottom: 20px; color: #A7F3D0; font-family: monospace; font-size: 12px; font-weight: bold;">
-          &#10004; SUCCESS: Gmail SMTP relay connection and delivery confirmed!
+          &#10004; SUCCESS: Brevo SMTP relay connection and delivery confirmed!
         </div>
 
         <p style="margin: 0 0 16px 0; font-size: 13px; color: #CBD5E1; line-height: 1.6;">
-          This verification email was triggered from the Super Admin diagnostic panel.
+          This verification email was triggered from the Super Admin diagnostic panel via Brevo SMTP relay.
         </p>
 
         <table width="100%" border="0" cellspacing="0" cellpadding="8" style="font-size: 12px; font-family: monospace; background-color: #0B0E16; border-radius: 8px; border: 1px solid #242C3D; margin-bottom: 20px;">
@@ -522,13 +544,13 @@ https://ametheus.gg
 
 
 # =========================================================================
-# EXISTING APPLICATION EMAIL ROUTING IMPLEMENTATIONS
+# EXISTING APPLICATION EMAIL ROUTING IMPLEMENTATIONS (PRESERVED TEMPLATES)
 # =========================================================================
 
 async def send_ticket_confirmation_email(ticket: dict, db: Optional[AsyncIOMotorDatabase] = None) -> Tuple[bool, Optional[str]]:
     """
-    Sends confirmation receipt email to the user using the SUPPORT identity (support.ametheus@gmail.com).
-    Reply-To points directly to support.ametheus@gmail.com.
+    Sends confirmation receipt email to the user using the SUPPORT identity (support@ametheus.games).
+    Reply-To points directly to support@ametheus.games.
     """
     ticket_id = ticket.get("ticket_id") or ticket.get("id") or "AMT-000000"
     user_name = ticket.get("name", "Contender")
@@ -740,8 +762,8 @@ async def send_notification_email(
 ) -> Tuple[bool, Optional[str]]:
     """
     Sends an automated tournament/match notification email to the user.
-    Routes via the NO-REPLY identity (noreply.ametheus@gmail.com).
-    Reply-To points to support.ametheus@gmail.com.
+    Routes via the NO-REPLY identity (noreply@ametheus.games).
+    Reply-To points to support@ametheus.games.
     """
     to_email_clean = (recipient or "").strip().lower()
     if not to_email_clean or "@" not in to_email_clean:
@@ -881,7 +903,7 @@ https://ametheus.gg
     </tr>
     <tr>
       <td style="background-color: #0B0E16; padding: 18px 28px; text-align: center; border-top: 1px solid #242C3D; font-size: 11px; color: #64748B;">
-        Sent by Ametheus Official Communications &bull; official.ametheus@gmail.com<br/>
+        Sent by Ametheus Official Communications &bull; official@ametheus.games<br/>
         &copy; 2026 AMETHEUS Esports Platform. All competitive integrity rights reserved.
       </td>
     </tr>
@@ -899,8 +921,7 @@ async def send_official_announcement_to_recipient(
     recipient_name: Optional[str] = None,
 ) -> tuple[bool, Optional[str]]:
     """
-    Sends an official announcement using official.ametheus@gmail.com.
+    Sends an official announcement using official@ametheus.games.
     """
     text_body, html_body = render_official_announcement_email(subject, message, recipient_name)
     return await send_official_email(to_email, subject, text_body, html_body)
-
