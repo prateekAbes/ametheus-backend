@@ -225,6 +225,10 @@ class AuditLogResponse(BaseModel):
     ip_address: str
     prev_hash: Optional[str] = None
     record_hash: Optional[str] = None
+    is_archived: bool = False
+    archived_at: Optional[str] = None
+    archived_by: Optional[str] = None
+    archive_reason: Optional[str] = None
 
 # Notification
 class NotificationResponse(BaseModel):
@@ -235,6 +239,10 @@ class NotificationResponse(BaseModel):
     is_read: bool
     link: Optional[str] = None
     created_at: Optional[str] = None
+    is_archived: bool = False
+    archived_at: Optional[str] = None
+    archived_by: Optional[str] = None
+    archive_reason: Optional[str] = None
     model_config = ConfigDict(from_attributes=True)
 
 class NotificationListResponse(BaseModel):

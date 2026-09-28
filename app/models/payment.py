@@ -60,6 +60,10 @@ class GamePayment(BaseModel):
     verified_by: Optional[str] = None
     verified_at: Optional[datetime] = None
     is_dummy: bool = False
+    is_archived: bool = False
+    archived_at: Optional[datetime] = None
+    archived_by: Optional[str] = None
+    archive_reason: Optional[str] = None
     created_at: datetime = Field(default_factory=get_utc_now)
     updated_at: datetime = Field(default_factory=get_utc_now)
 
@@ -91,6 +95,10 @@ class WalletLedger(BaseModel):
     description: str
     admin_id: Optional[str] = None
     is_dummy: bool = False
+    is_archived: bool = False
+    archived_at: Optional[datetime] = None
+    archived_by: Optional[str] = None
+    archive_reason: Optional[str] = None
     created_at: datetime = Field(default_factory=get_utc_now)
 
     def to_mongo(self) -> dict:
@@ -124,6 +132,10 @@ class Payout(BaseModel):
     paid_at: Optional[datetime] = None
     rejection_reason: Optional[str] = None
     is_dummy: bool = False
+    is_archived: bool = False
+    archived_at: Optional[datetime] = None
+    archived_by: Optional[str] = None
+    archive_reason: Optional[str] = None
     created_at: datetime = Field(default_factory=get_utc_now)
     updated_at: datetime = Field(default_factory=get_utc_now)
 

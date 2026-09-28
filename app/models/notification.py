@@ -12,6 +12,10 @@ class Notification(BaseModel):
     is_read: bool = False
     link: Optional[str] = None
     metadata_json: str = "{}"
+    is_archived: bool = False
+    archived_at: Optional[datetime] = None
+    archived_by: Optional[str] = None
+    archive_reason: Optional[str] = None
     created_at: datetime = Field(default_factory=get_utc_now)
     updated_at: datetime = Field(default_factory=get_utc_now)
 

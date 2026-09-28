@@ -138,11 +138,19 @@ async def init_db_indexes(db: AsyncIOMotorDatabase):
         await db.payouts.create_index("status")
         await db.payouts.create_index("game_id")
         await db.payouts.create_index("is_dummy")
+        await db.payouts.create_index("is_archived")
 
         # Audit Logs & Notifications
         await db.audit_logs.create_index("created_at")
+        await db.audit_logs.create_index("is_archived")
         await db.notifications.create_index("user_id")
         await db.notifications.create_index([("user_id", 1), ("is_read", 1)])
+        await db.notifications.create_index("is_archived")
+
+        # Support Tickets & Payments Archival Indexes
+        await db.game_payments.create_index("is_archived")
+        await db.wallet_ledger.create_index("is_archived")
+        await db.support_tickets.create_index("is_archived")
 
         # Data Migration: Rule 5 & 11 - Normalize tournament status and match live links
         try:

@@ -24,6 +24,18 @@ from app.services.email_service import (
 )
 from app.services.audit import record_audit_log
 from app.core.config import settings
+from app.schemas.archive import (
+    ArchiveFilterRequest,
+    ArchivePreviewResponse,
+    ArchiveExecutionResponse,
+    UnarchiveResponse,
+)
+from app.services.archive_service import (
+    preview_archive,
+    execute_archive,
+    archive_single_record,
+    unarchive_record,
+)
 
 router = APIRouter()
 
@@ -56,6 +68,10 @@ def _clean_ticket_doc(doc: dict) -> dict:
         item["_id"] = str(item["_id"])
     if not item.get("ticket_id"):
         item["ticket_id"] = item["id"]
+    item["is_archived"] = bool(item.get("is_archived", False))
+    item["archived_at"] = str(item.get("archived_at")) if item.get("archived_at") else None
+    item["archived_by"] = item.get("archived_by")
+    item["archive_reason"] = item.get("archive_reason")
     return item
 
 
@@ -242,6 +258,7 @@ async def list_support_tickets(
     status_filter: Optional[str] = Query(None, alias="status"),
     category: Optional[str] = None,
     search: Optional[str] = None,
+    is_archived: bool = Query(False),
     limit: int = Query(50, ge=1, le=200),
     skip: int = Query(0, ge=0),
     admin_user: User = Depends(require_organizer),
@@ -249,9 +266,17 @@ async def list_support_tickets(
 ):
     """Admin endpoint to retrieve and search support tickets with status and category filtering."""
     query: dict = {}
+    if is_archived:
+        query["is_archived"] = True
+    else:
+        query["is_archived"] = {"$ne": True}
 
     if status_filter and status_filter.upper() != "ALL":
-        query["status"] = status_filter.upper()
+        st = status_filter.upper()
+        if st == "RESOLVED_CLOSED":
+            query["status"] = {"$in": ["RESOLVED", "CLOSED"]}
+        else:
+            query["status"] = st
 
     if category and category.upper() != "ALL":
         query["category"] = category.upper()
@@ -272,6 +297,55 @@ async def list_support_tickets(
 
     tickets = [_clean_ticket_doc(d) for d in docs]
     return SupportTicketListResponse(tickets=tickets, total=total)
+
+
+@router.post("/tickets/archive/preview", response_model=ArchivePreviewResponse)
+async def preview_support_archive_endpoint(
+    payload: ArchiveFilterRequest,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    count = await preview_archive(db, "support_tickets", payload)
+    return ArchivePreviewResponse(
+        section="support_tickets",
+        matching_count=count,
+        filters_applied=payload.model_dump(exclude_none=True),
+    )
+
+
+@router.post("/tickets/archive", response_model=ArchiveExecutionResponse)
+async def execute_support_archive_endpoint(
+    payload: ArchiveFilterRequest,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    count = await execute_archive(db, "support_tickets", payload, admin_user)
+    return ArchiveExecutionResponse(
+        success=True,
+        section="support_tickets",
+        archived_count=count,
+        message=f"Successfully archived {count} support tickets.",
+    )
+
+
+@router.post("/tickets/{ticket_id}/archive")
+async def archive_single_support_ticket(
+    ticket_id: str,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    ok = await archive_single_record(db, "support_tickets", ticket_id, admin_user)
+    return {"status": "success", "message": "Support ticket archived", "ticket_id": ticket_id}
+
+
+@router.post("/tickets/{ticket_id}/unarchive")
+async def unarchive_single_support_ticket(
+    ticket_id: str,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    ok = await unarchive_record(db, "support_tickets", ticket_id, admin_user)
+    return {"status": "success", "message": "Support ticket restored", "ticket_id": ticket_id}
 
 
 @router.get("/tickets/{ticket_id}", response_model=SupportTicketResponse)

@@ -35,6 +35,10 @@ class AuditLog(BaseModel):
     ip_address: str = "127.0.0.1"
     prev_hash: Optional[str] = None
     record_hash: Optional[str] = None
+    is_archived: bool = False
+    archived_at: Optional[datetime] = None
+    archived_by: Optional[str] = None
+    archive_reason: Optional[str] = None
     created_at: datetime = Field(default_factory=get_utc_now)
     updated_at: datetime = Field(default_factory=get_utc_now)
 

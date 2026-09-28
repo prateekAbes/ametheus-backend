@@ -60,6 +60,10 @@ class SupportTicketResponse(BaseModel):
     user_email_status: Optional[str] = None
     support_email_status: Optional[str] = None
     logs: List[SupportLogResponse] = Field(default_factory=list)
+    is_archived: bool = False
+    archived_at: Optional[str] = None
+    archived_by: Optional[str] = None
+    archive_reason: Optional[str] = None
     created_at: str
     updated_at: str
     resolved_at: Optional[str] = None

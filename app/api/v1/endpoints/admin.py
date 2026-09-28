@@ -40,6 +40,20 @@ from app.schemas import (
     CreateRoundPayload,
     WalletAuditSummaryResponse,
 )
+from app.schemas.archive import (
+    ArchiveFilterRequest,
+    ArchivePreviewResponse,
+    ArchiveExecutionResponse,
+    UnarchiveResponse,
+    BulkUnarchiveRequest,
+)
+from app.services.archive_service import (
+    preview_archive,
+    execute_archive,
+    archive_single_record,
+    unarchive_record,
+    unarchive_bulk_records,
+)
 from app.services.audit import record_audit_log
 from app.services.bracket_engine import (
     swap_match_teams,
@@ -81,11 +95,32 @@ async def assign_tournament_admin(
 
 @router.get("/audit-logs", response_model=List[AuditLogResponse])
 async def list_audit_logs(
+    is_archived: bool = False,
+    search: Optional[str] = None,
+    action: Optional[str] = None,
+    operator: Optional[str] = None,
+    limit: int = 100,
+    skip: int = 0,
     admin_user: User = Depends(require_super_admin),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
-    cursor = db.audit_logs.find().sort("created_at", -1).limit(100)
-    logs = await cursor.to_list(length=100)
+    query: Dict[str, Any] = {}
+    if is_archived:
+        query["is_archived"] = True
+    else:
+        query["is_archived"] = {"$ne": True}
+
+    if action and action.upper() != "ALL":
+        query["action"] = action.upper()
+    if operator and operator.strip():
+        query["operator"] = {"$regex": re.escape(operator.strip()), "$options": "i"}
+    if search and search.strip():
+        s = search.strip()
+        rgx = {"$regex": re.escape(s), "$options": "i"}
+        query["$or"] = [{"operator": rgx}, {"action": rgx}, {"target": rgx}, {"details": rgx}]
+
+    cursor = db.audit_logs.find(query).sort("created_at", -1).skip(skip).limit(limit)
+    logs = await cursor.to_list(length=limit)
     return [
         AuditLogResponse(
             id=str(l.get("_id", l.get("id"))),
@@ -97,6 +132,10 @@ async def list_audit_logs(
             ip_address=l.get("ip_address", "127.0.0.1"),
             prev_hash=l.get("prev_hash"),
             record_hash=l.get("record_hash"),
+            is_archived=bool(l.get("is_archived", False)),
+            archived_at=str(l.get("archived_at")) if l.get("archived_at") else None,
+            archived_by=l.get("archived_by"),
+            archive_reason=l.get("archive_reason"),
         )
         for l in logs
     ]
@@ -785,10 +824,16 @@ class CreateWinningPayoutPayload(BaseModel):
 async def list_admin_payments(
     status_filter: Optional[str] = None,
     game_id: Optional[str] = None,
+    is_archived: bool = False,
     admin_user: User = Depends(require_super_admin),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     query = {"is_dummy": {"$ne": True}}
+    if is_archived:
+        query["is_archived"] = True
+    else:
+        query["is_archived"] = {"$ne": True}
+
     if status_filter and status_filter.upper() != "ALL":
         sf = status_filter.upper()
         query["status"] = sf
@@ -802,6 +847,9 @@ async def list_admin_payments(
     for d in docs:
         d["id"] = str(d.get("_id", d.get("id")))
         d.pop("_id", None)
+        d["is_archived"] = bool(d.get("is_archived", False))
+        if d.get("archived_at") and hasattr(d["archived_at"], "isoformat"):
+            d["archived_at"] = d["archived_at"].isoformat()
     return docs
 
 @router.post("/payments/{payment_id}/approve")
@@ -1022,10 +1070,16 @@ async def reject_payment(
 @router.get("/payouts")
 async def list_admin_payouts(
     status_filter: Optional[str] = None,
+    is_archived: bool = False,
     admin_user: User = Depends(require_super_admin),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     query = {"is_dummy": {"$ne": True}}
+    if is_archived:
+        query["is_archived"] = True
+    else:
+        query["is_archived"] = {"$ne": True}
+
     if status_filter and status_filter.upper() != "ALL":
         query["status"] = status_filter.upper()
 
@@ -1035,6 +1089,9 @@ async def list_admin_payouts(
         d["id"] = str(d.get("_id", d.get("id")))
         d.pop("_id", None)
         d["amount_inr"] = d.get("amount_paise", 0) / 100
+        d["is_archived"] = bool(d.get("is_archived", False))
+        if d.get("archived_at") and hasattr(d["archived_at"], "isoformat"):
+            d["archived_at"] = d["archived_at"].isoformat()
     return docs
 
 @router.post("/payouts/create-winning")
@@ -3193,6 +3250,7 @@ async def trigger_match_reminder_admin(
 async def get_wallet_audit_logs(
     search: Optional[str] = None,
     txn_type: Optional[str] = None,
+    is_archived: bool = False,
     limit: int = 100,
     skip: int = 0,
     admin_user: User = Depends(require_super_admin),
@@ -3224,6 +3282,11 @@ async def get_wallet_audit_logs(
 
     # Build ledger query
     ledger_query: Dict[str, Any] = {"is_dummy": {"$ne": True}}
+    if is_archived:
+        ledger_query["is_archived"] = True
+    else:
+        ledger_query["is_archived"] = {"$ne": True}
+
     if txn_type and txn_type != "ALL":
         ledger_query["txn_type"] = txn_type
 
@@ -3280,6 +3343,9 @@ async def get_wallet_audit_logs(
             "reference_id": t.get("reference_id"),
             "description": t.get("description", ""),
             "admin_id": t.get("admin_id"),
+            "is_archived": bool(t.get("is_archived", False)),
+            "archived_at": t.get("archived_at").isoformat() if hasattr(t.get("archived_at"), "isoformat") else str(t.get("archived_at") or ""),
+            "archived_by": t.get("archived_by"),
             "created_at": str(t.get("created_at")),
         })
 
@@ -3743,6 +3809,219 @@ async def update_tournament_stream(
         "message": "Tournament live stream URL updated",
         "live_stream_url": payload.live_stream_url
     }
+
+
+# ----------------- SECTION-SPECIFIC CLEAR / ARCHIVE SYSTEM -----------------
+
+def check_archive_permission(section: str, user: User):
+    sec = section.strip().lower()
+    if sec in ["payments", "wallet_ledger", "audit_logs", "payouts"]:
+        if user.role != "SUPER_ADMIN":
+            raise HTTPException(status_code=403, detail=f"Operation on {section} requires SUPER_ADMIN role")
+    elif sec in ["notifications", "support_tickets"]:
+        if user.role not in ["ORGANIZER", "SUPER_ADMIN"]:
+            raise HTTPException(status_code=403, detail=f"Operation on {section} requires ORGANIZER or SUPER_ADMIN role")
+    else:
+        raise HTTPException(status_code=400, detail=f"Unknown archive section '{section}'")
+
+
+@router.get("/notifications")
+async def list_admin_platform_notifications(
+    search: Optional[str] = None,
+    notification_type: Optional[str] = None,
+    is_read: Optional[bool] = None,
+    is_archived: bool = False,
+    user_id: Optional[str] = None,
+    limit: int = 100,
+    skip: int = 0,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    query: Dict[str, Any] = {"is_dummy": {"$ne": True}}
+    if is_archived:
+        query["is_archived"] = True
+    else:
+        query["is_archived"] = {"$ne": True}
+
+    if notification_type and notification_type.upper() != "ALL":
+        query["type"] = notification_type.upper()
+    if is_read is not None:
+        query["is_read"] = is_read
+    if user_id and user_id.strip():
+        query["user_id"] = user_id.strip()
+    if search and search.strip():
+        s = search.strip()
+        rgx = {"$regex": re.escape(s), "$options": "i"}
+        query["$or"] = [{"title": rgx}, {"message": rgx}, {"user_id": rgx}]
+
+    total = await db.notifications.count_documents(query)
+    cursor = db.notifications.find(query).sort("created_at", -1).skip(skip).limit(limit)
+    docs = await cursor.to_list(length=limit)
+
+    items = []
+    for n in docs:
+        items.append({
+            "id": str(n.get("_id", n.get("id"))),
+            "user_id": n.get("user_id"),
+            "type": n.get("type", "SYSTEM"),
+            "title": n.get("title", ""),
+            "message": n.get("message", ""),
+            "is_read": bool(n.get("is_read", False)),
+            "link": n.get("link"),
+            "is_archived": bool(n.get("is_archived", False)),
+            "archived_at": n.get("archived_at").isoformat() if hasattr(n.get("archived_at"), "isoformat") else str(n.get("archived_at") or ""),
+            "archived_by": n.get("archived_by"),
+            "archive_reason": n.get("archive_reason"),
+            "created_at": n.get("created_at").isoformat() if hasattr(n.get("created_at"), "isoformat") else str(n.get("created_at") or ""),
+        })
+
+    return {"items": items, "total": total}
+
+
+@router.post("/archive/{section}/preview", response_model=ArchivePreviewResponse)
+async def preview_section_archive_endpoint(
+    section: str,
+    payload: ArchiveFilterRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    check_archive_permission(section, current_user)
+    count = await preview_archive(db, section, payload)
+    return ArchivePreviewResponse(
+        section=section,
+        matching_count=count,
+        filters_applied=payload.model_dump(exclude_none=True),
+    )
+
+
+@router.post("/archive/{section}/execute", response_model=ArchiveExecutionResponse)
+async def execute_section_archive_endpoint(
+    section: str,
+    payload: ArchiveFilterRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    check_archive_permission(section, current_user)
+    count = await execute_archive(db, section, payload, current_user)
+    return ArchiveExecutionResponse(
+        success=True,
+        section=section,
+        archived_count=count,
+        message=f"Successfully archived {count} records in {section}.",
+    )
+
+
+@router.post("/archive/{section}/{record_id}", response_model=ArchiveExecutionResponse)
+async def archive_single_record_endpoint(
+    section: str,
+    record_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    check_archive_permission(section, current_user)
+    ok = await archive_single_record(db, section, record_id, current_user)
+    return ArchiveExecutionResponse(
+        success=ok,
+        section=section,
+        archived_count=1 if ok else 0,
+        message=f"Record {record_id} archived successfully.",
+    )
+
+
+@router.post("/archive/{section}/{record_id}/restore", response_model=UnarchiveResponse)
+async def unarchive_single_record_endpoint(
+    section: str,
+    record_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    check_archive_permission(section, current_user)
+    ok = await unarchive_record(db, section, record_id, current_user)
+    return UnarchiveResponse(
+        success=ok,
+        section=section,
+        unarchived_count=1 if ok else 0,
+        message=f"Record {record_id} restored to active view successfully.",
+    )
+
+
+@router.post("/archive/{section}/restore-bulk", response_model=UnarchiveResponse)
+async def unarchive_bulk_records_endpoint(
+    section: str,
+    payload: BulkUnarchiveRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    check_archive_permission(section, current_user)
+    count = await unarchive_bulk_records(db, section, payload.target_ids, current_user)
+    return UnarchiveResponse(
+        success=True,
+        section=section,
+        unarchived_count=count,
+        message=f"Successfully restored {count} records to active view.",
+    )
+
+
+# Section-specific convenience routes
+@router.post("/payments/{payment_id}/archive")
+async def archive_payment_convenience(
+    payment_id: str,
+    admin_user: User = Depends(require_super_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    ok = await archive_single_record(db, "payments", payment_id, admin_user)
+    return {"status": "success", "message": "Payment archived", "payment_id": payment_id}
+
+
+@router.post("/payments/{payment_id}/unarchive")
+async def unarchive_payment_convenience(
+    payment_id: str,
+    admin_user: User = Depends(require_super_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    ok = await unarchive_record(db, "payments", payment_id, admin_user)
+    return {"status": "success", "message": "Payment restored", "payment_id": payment_id}
+
+
+@router.post("/wallet-ledger/{id}/archive")
+async def archive_wallet_ledger_convenience(
+    id: str,
+    admin_user: User = Depends(require_super_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    ok = await archive_single_record(db, "wallet_ledger", id, admin_user)
+    return {"status": "success", "message": "Wallet transaction archived", "id": id}
+
+
+@router.post("/wallet-ledger/{id}/unarchive")
+async def unarchive_wallet_ledger_convenience(
+    id: str,
+    admin_user: User = Depends(require_super_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    ok = await unarchive_record(db, "wallet_ledger", id, admin_user)
+    return {"status": "success", "message": "Wallet transaction restored", "id": id}
+
+
+@router.post("/audit-logs/{id}/archive")
+async def archive_audit_log_convenience(
+    id: str,
+    admin_user: User = Depends(require_super_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    ok = await archive_single_record(db, "audit_logs", id, admin_user)
+    return {"status": "success", "message": "Audit log archived", "id": id}
+
+
+@router.post("/audit-logs/{id}/unarchive")
+async def unarchive_audit_log_convenience(
+    id: str,
+    admin_user: User = Depends(require_super_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    ok = await unarchive_record(db, "audit_logs", id, admin_user)
+    return {"status": "success", "message": "Audit log restored", "id": id}
+
 
 
 
