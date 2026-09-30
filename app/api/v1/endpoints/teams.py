@@ -1,11 +1,15 @@
 from typing import List, Union, Optional
+from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, status
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from app.api.deps import get_db, get_current_user
 from app.models.user import User
 from app.models.team import Team, TeamMember
+from app.models.base import get_utc_now
 from app.services.audit import record_audit_log
+from app.services.wallet_service import credit_wallet_funds
+from app.services.notification import create_notification
 from app.schemas import TeamCreate, TeamJoin, TeamResponse, TeamMemberResponse
 
 router = APIRouter()
@@ -97,6 +101,12 @@ async def create_team(
     if not game:
         raise HTTPException(status_code=404, detail="Game not found")
 
+    if game.get("status") == "COMING_SOON":
+        raise HTTPException(
+            status_code=400,
+            detail=f"{game.get('name', 'This game')} is coming soon and not yet active for team creation.",
+        )
+
     is_team_game = game.get("is_team_game", True)
     max_size = game.get("max_team_size", 5)
     max_subs = game.get("max_substitutes", 1)
@@ -161,6 +171,11 @@ async def join_team(
 
     game_id = team.get("game_id")
     game = await db.games.find_one({"$or": [{"_id": game_id}, {"id": game_id}, {"slug": game_id}]})
+    if game and game.get("status") == "COMING_SOON":
+        raise HTTPException(
+            status_code=400,
+            detail=f"{game.get('name', 'This game')} is coming soon and not yet active.",
+        )
     if game and (not game.get("is_team_game", True) or game.get("max_team_size", 5) <= 1):
         raise HTTPException(
             status_code=400,
@@ -342,5 +357,202 @@ async def delete_team(
             detail="Only the team captain or platform admin can disband the team.",
         )
 
-    await db.teams.delete_one({"_id": team["_id"]})
-    return {"status": "success", "message": f"Team '{team['name']}' has been disbanded"}
+    team_id = str(team.get("_id", team.get("id")))
+    team_name = team.get("name", "Team")
+    team_ids_query = [team_id]
+    if team.get("id") and str(team.get("id")) != team_id:
+        team_ids_query.append(str(team.get("id")))
+    if team.get("_id") and str(team.get("_id")) != team_id:
+        team_ids_query.append(str(team.get("_id")))
+
+    now_utc = datetime.now(timezone.utc)
+
+    # 1. Collect all roster members for notifications
+    members = team.get("members", []) or []
+    substitutes = team.get("substitutes", []) or []
+    captain_id = team.get("captain_id")
+    all_roster_user_ids = set()
+    if captain_id:
+        all_roster_user_ids.add(captain_id)
+    for m in members + substitutes:
+        uid = m.get("user_id") if isinstance(m, dict) else getattr(m, "user_id", None)
+        if uid:
+            all_roster_user_ids.add(uid)
+
+    # 2. Find all active/pending registrations for this team
+    registrations = await db.tournament_registrations.find({
+        "team_id": {"$in": team_ids_query},
+        "payment_status": {"$nin": ["REJECTED", "CANCELLED", "REFUNDED"]},
+    }).to_list(length=200)
+
+    reg_ids = [str(r.get("_id", r.get("id"))) for r in registrations if r.get("_id") or r.get("id")]
+
+    # 3. Track refunded payments to ensure strict idempotency
+    refunded_payment_count = 0
+    total_refunded_paise = 0
+    refunded_payment_ids = set()
+
+    # 3A. Refund successful payments in db.game_payments (UPI or direct payment records)
+    payment_query = {
+        "status": "APPROVED",
+        "is_refunded": {"$ne": True},
+        "$or": [
+            {"team_id": {"$in": team_ids_query}},
+        ]
+    }
+    if reg_ids:
+        payment_query["$or"].append({"registration_id": {"$in": reg_ids}})
+
+    approved_payments = await db.game_payments.find(payment_query).to_list(length=200)
+
+    for p in approved_payments:
+        p_id = str(p.get("_id", p.get("id")))
+        if p_id in refunded_payment_ids:
+            continue
+
+        payer_id = p.get("user_id")
+        amount_paise = int(p.get("amount_paise", 0))
+        ref_id = f"refund_pay_{p_id}"
+
+        if amount_paise > 0 and payer_id:
+            # Atomic idempotency guard in wallet ledger
+            existing_refund = await db.wallet_ledger.find_one({
+                "user_id": payer_id,
+                "reference_id": ref_id,
+                "txn_type": "TEAM_DISBAND_REFUND",
+            })
+            if not existing_refund:
+                await credit_wallet_funds(
+                    db=db,
+                    user_id=payer_id,
+                    amount_paise=amount_paise,
+                    txn_type="TEAM_DISBAND_REFUND",
+                    reference_id=ref_id,
+                    description=f"Refund: Team '{team_name}' disbanded (Payment {p.get('utr') or p_id[:8]})",
+                    admin_id=current_user.id if current_user.role == "SUPER_ADMIN" else None,
+                )
+                refunded_payment_count += 1
+                total_refunded_paise += amount_paise
+            refunded_payment_ids.add(p_id)
+
+            # Mark payment record as refunded while keeping original details intact
+            await db.game_payments.update_one(
+                {"_id": p["_id"]},
+                {
+                    "$set": {
+                        "is_refunded": True,
+                        "refunded_at": now_utc,
+                        "refund_amount_paise": amount_paise,
+                        "refund_destination": "PLAYER_WALLET",
+                        "refund_reason": f"Team '{team_name}' disbanded by {current_user.username}",
+                    }
+                },
+            )
+
+    # 3B. Refund registrations paid via WALLET directly
+    for reg in registrations:
+        if reg.get("payment_method") == "WALLET" and reg.get("payment_status") == "PAID" and not reg.get("is_refunded"):
+            reg_id = str(reg.get("_id", reg.get("id")))
+            ref_id = f"refund_reg_{reg_id}"
+
+            existing_refund = await db.wallet_ledger.find_one({
+                "reference_id": ref_id,
+                "txn_type": "TEAM_DISBAND_REFUND",
+            })
+            amount_paise = 0
+            payer_id = None
+            if not existing_refund:
+                # Identify payer and original debit amount from wallet ledger
+                debit_ledger = await db.wallet_ledger.find_one({
+                    "$or": [
+                        {"reference_id": reg_id},
+                        {"reference_id": reg.get("order_id")},
+                        {"reference_id": reg.get("wallet_txn_id")}
+                    ],
+                    "txn_type": "TOURNAMENT_ENTRY",
+                })
+                if debit_ledger:
+                    payer_id = debit_ledger.get("user_id")
+                    amount_paise = abs(int(debit_ledger.get("amount_paise", 0)))
+                else:
+                    payer_id = reg.get("player_id") or team.get("captain_id")
+                    tourn = await db.tournaments.find_one({"$or": [{"_id": reg.get("tournament_id")}, {"id": reg.get("tournament_id")}, {"slug": reg.get("tournament_id")}]})
+                    amount_paise = int(round((tourn.get("entry_fee_inr", 0) if tourn else 0) * 100))
+
+                if amount_paise > 0 and payer_id:
+                    await credit_wallet_funds(
+                        db=db,
+                        user_id=payer_id,
+                        amount_paise=amount_paise,
+                        txn_type="TEAM_DISBAND_REFUND",
+                        reference_id=ref_id,
+                        description=f"Refund: Team '{team_name}' disbanded (Registration {reg_id[:8]})",
+                        admin_id=current_user.id if current_user.role == "SUPER_ADMIN" else None,
+                    )
+                    refunded_payment_count += 1
+                    total_refunded_paise += amount_paise
+
+            await db.tournament_registrations.update_one(
+                {"_id": reg["_id"]},
+                {
+                    "$set": {
+                        "is_refunded": True,
+                        "refunded_at": now_utc,
+                        "refund_amount_paise": amount_paise,
+                    }
+                },
+            )
+
+    # 4. Invalidate and cancel all tournament registrations for this team
+    await db.tournament_registrations.update_many(
+        {"team_id": {"$in": team_ids_query}},
+        {
+            "$set": {
+                "status": "CANCELLED",
+                "payment_status": "CANCELLED",
+                "cancelled_at": now_utc,
+                "cancellation_reason": f"Team '{team_name}' disbanded",
+            }
+        },
+    )
+
+    # 5. Clean up any scheduled match slots holding this team
+    await db.matches.update_many(
+        {"team_a_id": {"$in": team_ids_query}, "status": {"$in": ["SCHEDULED", "CHECK_IN_OPEN"]}},
+        {"$set": {"team_a_id": None, "team_a_name": "TBD (Slot 1)", "team_a_tag": "TBD"}}
+    )
+    await db.matches.update_many(
+        {"team_b_id": {"$in": team_ids_query}, "status": {"$in": ["SCHEDULED", "CHECK_IN_OPEN"]}},
+        {"$set": {"team_b_id": None, "team_b_name": "TBD (Slot 2)", "team_b_tag": "TBD"}}
+    )
+
+    # 6. Notify roster members of the disbandment and wallet refunds
+    for uid in all_roster_user_ids:
+        await create_notification(
+            db=db,
+            user_id=uid,
+            title="Team Disbanded",
+            message=f"Team '{team_name}' has been disbanded. Any tournament registrations have been cancelled and eligible entry fees refunded to your Ametheus wallet.",
+            notification_type="TEAM",
+            link="/dashboard",
+        )
+
+    # 7. Record system audit log
+    await record_audit_log(
+        db=db,
+        operator=current_user.username,
+        role=current_user.role,
+        action="DISBAND_TEAM",
+        target=f"Team {team_name} ({team_id})",
+        details=f"Disbanded team. Cancelled {len(registrations)} registration(s). Refunded {refunded_payment_count} payment(s) totaling ₹{total_refunded_paise / 100:.2f} to player wallets.",
+    )
+
+    # 8. Delete the team record from the database
+    await db.teams.delete_many({"$or": [{"_id": team["_id"]}, {"id": team_id}]})
+
+    return {
+        "status": "success",
+        "message": f"Team '{team_name}' has been disbanded. Active registrations were cancelled and eligible entry fees refunded to player wallets.",
+        "refunded_payments_count": refunded_payment_count,
+        "total_refunded_inr": total_refunded_paise / 100,
+    }

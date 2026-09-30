@@ -282,8 +282,11 @@ async def update_tournament(
     gid = updated_tourn.get("game_id")
     game = await db.games.find_one({"$or": [{"_id": gid}, {"id": gid}, {"slug": gid}]})
     tid = str(updated_tourn.get("_id", updated_tourn.get("id")))
-    tslug = updated_tourn.get("slug")
-    reg_count = await db.tournament_registrations.count_documents({"$or": [{"tournament_id": tid}, {"tournament_id": tslug}]})
+    tslug = updated_tourn.get("slug", "")
+    reg_count = await db.tournament_registrations.count_documents({
+        "$or": [{"tournament_id": tid}, {"tournament_id": tslug}],
+        "payment_status": {"$nin": ["REJECTED", "CANCELLED", "REFUNDED"]},
+    })
 
     # If tournament transitioned to LIVE, ensure bracket matches exist and are LIVE
     if updated_tourn.get("status") in ["LIVE", "ONGOING"]:
@@ -345,7 +348,10 @@ async def publish_tournament(
     gid = updated.get("game_id")
     game = await db.games.find_one({"$or": [{"_id": gid}, {"id": gid}, {"slug": gid}]})
     tid = str(updated.get("_id", updated.get("id")))
-    reg_count = await db.tournament_registrations.count_documents({"$or": [{"tournament_id": tid}, {"tournament_id": updated.get("slug")}]})
+    reg_count = await db.tournament_registrations.count_documents({
+        "$or": [{"tournament_id": tid}, {"tournament_id": updated.get("slug")}],
+        "payment_status": {"$nin": ["REJECTED", "CANCELLED", "REFUNDED"]},
+    })
     return serialize_tournament_response(updated, game, reg_count)
 
 @router.delete("/tournaments/{id}")
@@ -507,7 +513,8 @@ async def get_my_organized_tournaments(
         game_obj = await db.games.find_one({"$or": [{"_id": gid}, {"id": gid}, {"slug": gid}]}) if gid else None
         tid = str(t.get("_id", t.get("id")))
         reg_count = await db.tournament_registrations.count_documents({
-            "$or": [{"tournament_id": tid}, {"tournament_id": t.get("slug")}]
+            "$or": [{"tournament_id": tid}, {"tournament_id": t.get("slug")}],
+            "payment_status": {"$nin": ["REJECTED", "CANCELLED", "REFUNDED"]},
         })
         response.append(serialize_tournament_response(t, game_obj, reg_count))
 

@@ -98,7 +98,8 @@ async def list_tournaments(
             continue
 
         reg_count = await db.tournament_registrations.count_documents({
-            "$or": [{"tournament_id": tid}, {"tournament_id": t.get("slug")}]
+            "$or": [{"tournament_id": tid}, {"tournament_id": t.get("slug")}],
+            "payment_status": {"$nin": ["REJECTED", "CANCELLED", "REFUNDED"]},
         })
 
         rules = safe_json_loads(t.get("rules", t.get("rules_json")), [])
@@ -198,7 +199,11 @@ async def get_my_tournament_registrations(
     if my_team_ids:
         reg_or.append({"team_id": {"$in": my_team_ids}})
 
-    regs = await db.tournament_registrations.find({"$or": reg_or}).to_list(length=100)
+    regs = await db.tournament_registrations.find({
+        "$or": reg_or,
+        "payment_status": {"$nin": ["REJECTED", "CANCELLED", "REFUNDED"]},
+        "status": {"$nin": ["CANCELLED", "REFUNDED"]},
+    }).to_list(length=100)
 
     results = []
     for r in regs:
@@ -284,7 +289,8 @@ async def get_tournament_by_slug(slug: str, db: AsyncIOMotorDatabase = Depends(g
     game_obj = await db.games.find_one({"$or": [{"_id": gid}, {"id": gid}, {"slug": gid}]})
 
     reg_count = await db.tournament_registrations.count_documents({
-        "$or": [{"tournament_id": tid}, {"tournament_id": t.get("slug")}]
+        "$or": [{"tournament_id": tid}, {"tournament_id": t.get("slug")}],
+        "payment_status": {"$nin": ["REJECTED", "CANCELLED", "REFUNDED"]},
     })
 
     rules = safe_json_loads(t.get("rules", t.get("rules_json")), [])
@@ -341,7 +347,9 @@ async def get_tournament_by_slug(slug: str, db: AsyncIOMotorDatabase = Depends(g
     # 2. Registered rosters from database registrations
     registered_rosters = []
     reg_cursor = db.tournament_registrations.find({
-        "$or": [{"tournament_id": tid}, {"tournament_id": t.get("slug")}]
+        "$or": [{"tournament_id": tid}, {"tournament_id": t.get("slug")}],
+        "payment_status": {"$nin": ["REJECTED", "CANCELLED", "REFUNDED"]},
+        "status": {"$nin": ["CANCELLED", "REFUNDED"]},
     })
     registrations = await reg_cursor.to_list(length=100)
     for reg in registrations:
@@ -529,7 +537,7 @@ async def register_team_for_tournament(
     # 2. Capacity check
     reg_count = await db.tournament_registrations.count_documents({
         "$or": [{"tournament_id": tid}, {"tournament_id": tourn.get("slug")}],
-        "payment_status": {"$ne": "REJECTED"}
+        "payment_status": {"$nin": ["REJECTED", "CANCELLED", "REFUNDED"]},
     })
 
     max_teams = tourn.get("max_teams", 16)
@@ -544,6 +552,12 @@ async def register_team_for_tournament(
 
     gid = tourn.get("game_id")
     game_obj = await db.games.find_one({"$or": [{"_id": gid}, {"id": gid}, {"slug": gid}]})
+    if game_obj and game_obj.get("status") == "COMING_SOON":
+        raise HTTPException(
+            status_code=400,
+            detail=f"{game_obj.get('name', 'This game')} is coming soon and tournament registration is not available yet.",
+        )
+
     is_solo_game = bool(game_obj and (not game_obj.get("is_team_game", True) or game_obj.get("slug") == "chess"))
 
     user_game_id = payload.game_id or payload.in_game_id
@@ -553,7 +567,7 @@ async def register_team_for_tournament(
         existing_reg = await db.tournament_registrations.find_one({
             "tournament_id": tid,
             "player_id": current_user.id,
-            "payment_status": {"$ne": "REJECTED"}
+            "payment_status": {"$nin": ["REJECTED", "CANCELLED", "REFUNDED"]},
         })
         if existing_reg:
             raise HTTPException(status_code=400, detail="You are already registered for this tournament")
@@ -681,7 +695,7 @@ async def register_team_for_tournament(
     existing_reg = await db.tournament_registrations.find_one({
         "tournament_id": tid,
         "team_id": team_id,
-        "payment_status": {"$ne": "REJECTED"}
+        "payment_status": {"$nin": ["REJECTED", "CANCELLED", "REFUNDED"]},
     })
 
     if existing_reg:
@@ -771,7 +785,8 @@ async def get_registration_status(
     solo_reg = await db.tournament_registrations.find_one({
         "tournament_id": tid,
         "player_id": current_user.id,
-        "payment_status": {"$ne": "REJECTED"}
+        "payment_status": {"$nin": ["REJECTED", "CANCELLED", "REFUNDED"]},
+        "status": {"$nin": ["CANCELLED", "REFUNDED"]},
     })
     if solo_reg:
         solo_reg["id"] = str(solo_reg.get("_id", solo_reg.get("id")))
@@ -792,7 +807,8 @@ async def get_registration_status(
         team_reg = await db.tournament_registrations.find_one({
             "tournament_id": tid,
             "team_id": {"$in": team_ids},
-            "payment_status": {"$ne": "REJECTED"}
+            "payment_status": {"$nin": ["REJECTED", "CANCELLED", "REFUNDED"]},
+            "status": {"$nin": ["CANCELLED", "REFUNDED"]},
         })
         if team_reg:
             team_reg["id"] = str(team_reg.get("_id", team_reg.get("id")))
@@ -848,7 +864,7 @@ async def register_tournament_direct_upi(
     # Capacity check
     reg_count = await db.tournament_registrations.count_documents({
         "$or": [{"tournament_id": tid}, {"tournament_id": tourn.get("slug")}],
-        "payment_status": {"$ne": "REJECTED"}
+        "payment_status": {"$nin": ["REJECTED", "CANCELLED", "REFUNDED"]},
     })
     max_teams = tourn.get("max_teams", 16)
     if reg_count >= max_teams:
@@ -860,6 +876,12 @@ async def register_tournament_direct_upi(
 
     gid = tourn.get("game_id")
     game_obj = await db.games.find_one({"$or": [{"_id": gid}, {"id": gid}, {"slug": gid}]})
+    if game_obj and game_obj.get("status") == "COMING_SOON":
+        raise HTTPException(
+            status_code=400,
+            detail=f"{game_obj.get('name', 'This game')} is coming soon and tournament registration is not available yet.",
+        )
+
     is_solo_game = bool(game_obj and (not game_obj.get("is_team_game", True) or game_obj.get("slug") == "chess"))
 
     team_id = None
@@ -890,7 +912,7 @@ async def register_tournament_direct_upi(
         existing_reg = await db.tournament_registrations.find_one({
             "tournament_id": tid,
             "team_id": team_id,
-            "payment_status": {"$ne": "REJECTED"}
+            "payment_status": {"$nin": ["REJECTED", "CANCELLED", "REFUNDED"]},
         })
         if existing_reg:
             raise HTTPException(status_code=400, detail="Team is already registered for this tournament")
@@ -898,7 +920,7 @@ async def register_tournament_direct_upi(
         existing_reg = await db.tournament_registrations.find_one({
             "tournament_id": tid,
             "player_id": current_user.id,
-            "payment_status": {"$ne": "REJECTED"}
+            "payment_status": {"$nin": ["REJECTED", "CANCELLED", "REFUNDED"]},
         })
         if existing_reg:
             raise HTTPException(status_code=400, detail="You are already registered for this tournament")
@@ -1287,6 +1309,7 @@ async def get_tournament_community_link(
         "tournament_id": {"$in": [tid, tslug]},
         "$or": reg_or,
         "payment_status": {"$in": ["PAID", "FREE"]},
+        "status": {"$nin": ["CANCELLED", "REFUNDED"]},
     })
 
     if not confirmed_reg:

@@ -40,7 +40,10 @@ async def list_matches(
             # Auto-generate matches if tournament is LIVE or ONGOING with 0 matches and >= 2 registrations
             if tourn.get("status") in ["LIVE", "ONGOING"]:
                 matches_count = await db.matches.count_documents({"$or": [{"tournament_id": tid}, {"tournament_id": tslug}]})
-                reg_count = await db.tournament_registrations.count_documents({"$or": [{"tournament_id": tid}, {"tournament_id": tslug}]})
+                reg_count = await db.tournament_registrations.count_documents({
+                    "$or": [{"tournament_id": tid}, {"tournament_id": tslug}],
+                    "payment_status": {"$nin": ["REJECTED", "CANCELLED", "REFUNDED"]},
+                })
                 if matches_count == 0 and reg_count >= 2:
                     from app.services.bracket_engine import build_single_elimination_bracket
                     from app.models.tournament import Tournament

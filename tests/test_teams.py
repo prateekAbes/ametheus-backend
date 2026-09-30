@@ -212,3 +212,141 @@ async def test_one_team_per_game_enforcement(client):
         headers=headers_user,
     )
     assert res3.status_code == 201
+
+@pytest.mark.asyncio
+async def test_coming_soon_game_rejects_team_ops(client):
+    headers = make_auth_headers("usr_cs_test")
+
+    async with TestSessionLocal() as db:
+        u = User(id="usr_cs_test", clerk_user_id="usr_cs_test", email="cs@test.com", username="cs_player", role="PLAYER")
+        g_cs = Game(
+            slug="cyberpunk-arena-cs",
+            name="Cyberpunk Arena",
+            category="pc",
+            platform="PC",
+            tag="5V5",
+            is_team_game=True,
+            status="COMING_SOON",
+            banner_url="http://banner",
+            logo_url="http://logo",
+            description="Coming soon title",
+        )
+        db.add_all([u, g_cs])
+        await db.commit()
+
+    # Attempt to create team for COMING_SOON game -> 400
+    res = await client.post(
+        "/api/v1/teams",
+        json={"game_slug": "cyberpunk-arena-cs", "name": "Cyber Team", "tag": "CYB", "captain_handle": "CyberLead"},
+        headers=headers,
+    )
+    assert res.status_code == 400
+    assert "coming soon" in res.json()["detail"].lower()
+
+@pytest.mark.asyncio
+async def test_team_disband_refunds_all_eligible_payers(client):
+    from conftest import mock_db
+    from app.models.payment import GamePayment, WalletLedger
+    from app.models.tournament import TournamentRegistration, Tournament
+
+    cap_id = "usr_disband_cap"
+    mem_a_id = "usr_disband_mem_a"
+    headers_cap = make_auth_headers(cap_id)
+
+    async with TestSessionLocal() as db:
+        u_cap = User(id=cap_id, clerk_user_id=cap_id, email="cap_d@test.com", username="cap_d", role="PLAYER", inr_balance_paise=10000, inr_balance="100.00")
+        u_a = User(id=mem_a_id, clerk_user_id=mem_a_id, email="a_d@test.com", username="mem_a", role="PLAYER", inr_balance_paise=5000, inr_balance="50.00")
+        db.add_all([u_cap, u_a])
+        await db.commit()
+
+    # 1. Create team
+    create_res = await client.post(
+        "/api/v1/teams",
+        json={"game_slug": "valorant", "name": "Disband Test Team", "tag": "DTT", "captain_handle": "CapHandle"},
+        headers=headers_cap,
+    )
+    assert create_res.status_code == 201
+    team_data = create_res.json()
+    team_id = team_data["id"]
+
+    # 2. Add an approved UPI payment made by Member A (₹60 = 6000 paise)
+    upi_pay = GamePayment(
+        id="pay_upi_disband_123",
+        payment_type="TOURNAMENT_ENTRY",
+        user_id=mem_a_id,
+        tournament_id="tourn_test_1",
+        team_id=team_id,
+        amount_paise=6000,
+        amount_inr=60.0,
+        payment_method="UPI",
+        status="APPROVED",
+        utr="UTRDISBAND123",
+    )
+    await mock_db.game_payments.insert_one(upi_pay.to_mongo())
+
+    # 3. Add a wallet-paid tournament registration made by Captain (₹50 = 5000 paise)
+    reg_wallet = TournamentRegistration(
+        id="reg_wallet_disband_456",
+        tournament_id="tourn_test_1",
+        team_id=team_id,
+        player_id=cap_id,
+        payment_method="WALLET",
+        payment_status="PAID",
+        order_id="ord_wallet_456",
+        wallet_txn_id="txn_wallet_456",
+    )
+    await mock_db.tournament_registrations.insert_one(reg_wallet.to_mongo())
+
+    # Debit ledger for captain's entry fee
+    debit_ledger = WalletLedger(
+        id="ledger_debit_456",
+        user_id=cap_id,
+        txn_type="TOURNAMENT_ENTRY",
+        amount_paise=-5000,
+        balance_before_paise=15000,
+        balance_after_paise=10000,
+        reference_id="reg_wallet_disband_456",
+        description="Tournament entry fee debit",
+    )
+    await mock_db.wallet_ledger.insert_one(debit_ledger.to_mongo())
+
+    # 4. Captain disbands team
+    disband_res = await client.delete(f"/api/v1/teams/{team_id}", headers=headers_cap)
+    assert disband_res.status_code == 200
+    disband_data = disband_res.json()
+    assert disband_data["status"] == "success"
+    assert disband_data["refunded_payments_count"] == 2
+    assert disband_data["total_refunded_inr"] == 110.0  # 60 + 50
+
+    # 5. Verify Team is deleted
+    team_in_db = await mock_db.teams.find_one({"_id": team_id})
+    assert team_in_db is None
+
+    # 6. Verify Registration is cancelled
+    reg_in_db = await mock_db.tournament_registrations.find_one({"$or": [{"_id": "reg_wallet_disband_456"}, {"id": "reg_wallet_disband_456"}]})
+    assert reg_in_db["payment_status"] == "CANCELLED"
+    assert reg_in_db["status"] == "CANCELLED"
+
+    # 7. Verify Member A received ₹60 into Ametheus Wallet (NOT UPI)
+    user_a_updated = await mock_db.users.find_one({"$or": [{"_id": mem_a_id}, {"id": mem_a_id}]})
+    assert user_a_updated["inr_balance_paise"] == 5000 + 6000  # 11000 paise = ₹110
+
+    # 8. Verify Captain received ₹50 into Ametheus Wallet
+    user_cap_updated = await mock_db.users.find_one({"$or": [{"_id": cap_id}, {"id": cap_id}]})
+    assert user_cap_updated["inr_balance_paise"] == 10000 + 5000  # 15000 paise = ₹150
+
+    # 9. Verify refund ledgers exist with txn_type="TEAM_DISBAND_REFUND"
+    refund_ledgers = await mock_db.wallet_ledger.find({"txn_type": "TEAM_DISBAND_REFUND"}).to_list(10)
+    assert len(refund_ledgers) == 2
+    mem_a_refund = next(l for l in refund_ledgers if l["user_id"] == mem_a_id)
+    assert mem_a_refund["amount_paise"] == 6000
+    assert "refund_pay_pay_upi_disband_123" in mem_a_refund["reference_id"]
+    cap_refund = next(l for l in refund_ledgers if l["user_id"] == cap_id)
+    assert cap_refund["amount_paise"] == 5000
+    assert "refund_reg_reg_wallet_disband_456" in cap_refund["reference_id"]
+
+    # 10. Verify game payment record marked as refunded
+    pay_in_db = await mock_db.game_payments.find_one({"_id": "pay_upi_disband_123"})
+    assert pay_in_db["is_refunded"] is True
+    assert pay_in_db["refund_destination"] == "PLAYER_WALLET"
+
