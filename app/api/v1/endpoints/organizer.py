@@ -285,7 +285,7 @@ async def update_tournament(
     tslug = updated_tourn.get("slug", "")
     reg_count = await db.tournament_registrations.count_documents({
         "$or": [{"tournament_id": tid}, {"tournament_id": tslug}],
-        "payment_status": {"$nin": ["REJECTED", "CANCELLED", "REFUNDED"]},
+        "payment_status": {"$in": ["PAID", "FREE"]},
     })
 
     # If tournament transitioned to LIVE, ensure bracket matches exist and are LIVE
@@ -350,7 +350,7 @@ async def publish_tournament(
     tid = str(updated.get("_id", updated.get("id")))
     reg_count = await db.tournament_registrations.count_documents({
         "$or": [{"tournament_id": tid}, {"tournament_id": updated.get("slug")}],
-        "payment_status": {"$nin": ["REJECTED", "CANCELLED", "REFUNDED"]},
+        "payment_status": {"$in": ["PAID", "FREE"]},
     })
     return serialize_tournament_response(updated, game, reg_count)
 
@@ -514,7 +514,7 @@ async def get_my_organized_tournaments(
         tid = str(t.get("_id", t.get("id")))
         reg_count = await db.tournament_registrations.count_documents({
             "$or": [{"tournament_id": tid}, {"tournament_id": t.get("slug")}],
-            "payment_status": {"$nin": ["REJECTED", "CANCELLED", "REFUNDED"]},
+            "payment_status": {"$in": ["PAID", "FREE"]},
         })
         response.append(serialize_tournament_response(t, game_obj, reg_count))
 

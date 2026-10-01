@@ -99,7 +99,7 @@ async def list_tournaments(
 
         reg_count = await db.tournament_registrations.count_documents({
             "$or": [{"tournament_id": tid}, {"tournament_id": t.get("slug")}],
-            "payment_status": {"$nin": ["REJECTED", "CANCELLED", "REFUNDED"]},
+            "payment_status": {"$in": ["PAID", "FREE"]},
         })
 
         rules = safe_json_loads(t.get("rules", t.get("rules_json")), [])
@@ -290,7 +290,7 @@ async def get_tournament_by_slug(slug: str, db: AsyncIOMotorDatabase = Depends(g
 
     reg_count = await db.tournament_registrations.count_documents({
         "$or": [{"tournament_id": tid}, {"tournament_id": t.get("slug")}],
-        "payment_status": {"$nin": ["REJECTED", "CANCELLED", "REFUNDED"]},
+        "payment_status": {"$in": ["PAID", "FREE"]},
     })
 
     rules = safe_json_loads(t.get("rules", t.get("rules_json")), [])
@@ -348,8 +348,7 @@ async def get_tournament_by_slug(slug: str, db: AsyncIOMotorDatabase = Depends(g
     registered_rosters = []
     reg_cursor = db.tournament_registrations.find({
         "$or": [{"tournament_id": tid}, {"tournament_id": t.get("slug")}],
-        "payment_status": {"$nin": ["REJECTED", "CANCELLED", "REFUNDED"]},
-        "status": {"$nin": ["CANCELLED", "REFUNDED"]},
+        "payment_status": {"$in": ["PAID", "FREE"]},
     })
     registrations = await reg_cursor.to_list(length=100)
     for reg in registrations:
