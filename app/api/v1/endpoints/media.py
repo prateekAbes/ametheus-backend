@@ -109,15 +109,6 @@ class PageMediaConfigPayload(BaseModel):
     opacity: Optional[float] = 0.35
 
 DEFAULT_PAGE_MEDIA = {
-    "home": {
-        "page_id": "home",
-        "title": "Homepage Hero",
-        "media_type": "gif",
-        "media_url": "https://media.giphy.com/media/v1.Y2lkPTc5MGI3NjExM3Z0ZWFmNnN2cWJxeHoxbjlyM3cydXBnNDB1NnY2d2hkYWFxdG00MSZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/3oKIPnAiaMCws8nOsE/giphy.gif",
-        "fallback_url": "https://images.unsplash.com/photo-1542751371-adc38448a05e?auto=format&fit=crop&w=1600&q=80",
-        "is_active": True,
-        "opacity": 0.40,
-    },
     "tournaments": {
         "page_id": "tournaments",
         "title": "Tournaments Hub",
@@ -233,16 +224,6 @@ async def update_page_media(
     data["updated_at"] = datetime.now(timezone.utc).isoformat()
     data["updated_by"] = getattr(admin_user, "email", "admin") or getattr(admin_user, "id", "admin")
 
-    if page_id == "home":
-        from app.models.admin import OFFICIAL_HERO_GIF_URL
-        if payload.media_url and payload.media_url != OFFICIAL_HERO_GIF_URL:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Homepage hero GIF asset is locked and protected. Only presentation settings (animation_speed, brightness, opacity, contrast, saturation, overlay_opacity) may be modified.",
-            )
-        data["media_url"] = OFFICIAL_HERO_GIF_URL
-        data["is_locked"] = True
-
     await db.page_media.update_one(
         {"page_id": page_id},
         {"$set": data},
@@ -263,13 +244,6 @@ async def save_page_media(
 ):
     """Admin endpoint to save page media configuration."""
     return await update_page_media(payload.page_id, payload, admin_user, db)
-
-@router.get("/hero/settings")
-async def get_public_hero_settings(db: AsyncIOMotorDatabase = Depends(get_db)):
-    """Public read endpoint for homepage hero presentation settings."""
-    from app.models.admin import HeroPresentationSettings
-    doc = await db.hero_settings.find_one({"_id": "hero_settings"})
-    return HeroPresentationSettings.from_mongo(doc)
 
 @router.get("/{media_id}")
 async def get_media_file(

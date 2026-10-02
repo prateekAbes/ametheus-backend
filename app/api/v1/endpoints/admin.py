@@ -7,9 +7,6 @@ from app.models.user import User
 from app.models.admin import (
     TournamentAdminAssignment,
     AuditLog,
-    HeroPresentationSettings,
-    HeroPresentationSettingsUpdate,
-    OFFICIAL_HERO_GIF_URL,
 )
 from app.models.match import Match
 from app.models.tournament import Tournament, TournamentStage, StageRound
@@ -71,71 +68,6 @@ from app.services.bracket_engine import (
 )
 
 router = APIRouter()
-
-# ----------------- HOMEPAGE HERO SETTINGS (PROTECTED & IMMUTABLE ASSET) -----------------
-
-@router.get("/hero/settings", response_model=HeroPresentationSettings)
-async def get_hero_presentation_settings(
-    db: AsyncIOMotorDatabase = Depends(get_db),
-):
-    """
-    Fetch authoritative presentation settings for the protected homepage hero.
-    """
-    doc = await db.hero_settings.find_one({"_id": "hero_settings"})
-    return HeroPresentationSettings.from_mongo(doc)
-
-@router.patch("/hero/settings", response_model=HeroPresentationSettings)
-async def update_hero_presentation_settings(
-    payload: HeroPresentationSettingsUpdate,
-    request: Request,
-    admin_user: User = Depends(require_super_admin),
-    db: AsyncIOMotorDatabase = Depends(get_db),
-):
-    """
-    Update presentation settings (speed, brightness, opacity, contrast, saturation, overlay)
-    for the official homepage hero. Restricted exclusively to SUPER_ADMIN.
-    Rejects any attempts to mutate, upload, or replace the protected hero asset.
-    """
-    raw_body = await request.json()
-    forbidden_keys = {
-        "asset_url", "media_url", "hero_gif", "hero_gif_url",
-        "hero_media", "hero_asset", "url", "file", "upload"
-    }
-    present_forbidden = forbidden_keys.intersection(raw_body.keys())
-    if present_forbidden:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"The official Ametheus hero GIF is locked and protected. Asset modification is prohibited. Disallowed parameters: {', '.join(present_forbidden)}. Only presentation settings (animation_speed, brightness, opacity, contrast, saturation, overlay_opacity) may be configured."
-        )
-
-    update_dict = {k: v for k, v in payload.model_dump(exclude_unset=True).items() if v is not None}
-    from app.models.base import get_utc_now
-    now = get_utc_now()
-    update_dict["updated_at"] = now
-    update_dict["updated_by"] = getattr(admin_user, "email", None) or getattr(admin_user, "username", "super_admin")
-    update_dict["asset_url"] = OFFICIAL_HERO_GIF_URL
-    update_dict["is_locked"] = True
-
-    await db.hero_settings.update_one(
-        {"_id": "hero_settings"},
-        {"$set": update_dict},
-        upsert=True
-    )
-
-    try:
-        await record_audit_log(
-            db=db,
-            operator=admin_user.username or admin_user.email,
-            role="SUPER_ADMIN",
-            action="UPDATE_HERO_SETTINGS",
-            target="HOMEPAGE_HERO_PRESENTATION",
-            details=f"Updated hero presentation settings: {list(update_dict.keys())}",
-        )
-    except Exception:
-        pass
-
-    updated_doc = await db.hero_settings.find_one({"_id": "hero_settings"})
-    return HeroPresentationSettings.from_mongo(updated_doc)
 
 # ----------------- SUPER ADMIN ONLY -----------------
 

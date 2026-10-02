@@ -5,7 +5,6 @@ from httpx import AsyncClient, ASGITransport
 
 from app.main import app
 from app.core.database import get_db
-from app.models.admin import OFFICIAL_HERO_GIF_URL, HeroPresentationSettings
 from app.models.user import User
 from app.api.deps import get_current_user, require_super_admin
 
@@ -35,75 +34,6 @@ async def client(mock_db):
         yield ac
 
     app.dependency_overrides.clear()
-
-@pytest.mark.asyncio
-async def test_hero_settings_defaults(client):
-    """Verify that GET /admin/hero/settings returns official defaults with immutable asset."""
-    resp = await client.get("/api/v1/admin/hero/settings")
-    assert resp.status_code == 200
-    data = resp.json()
-    assert data["asset_url"] == OFFICIAL_HERO_GIF_URL
-    assert data["is_locked"] is True
-    assert data["animation_speed"] == 1.0
-    assert data["opacity"] == 0.40
-
-@pytest.mark.asyncio
-async def test_hero_settings_rejects_asset_url_mutation(client):
-    """Verify that PATCH /admin/hero/settings rejects any attempt to mutate asset URL."""
-    payload = {
-        "asset_url": "https://malicious.example.com/fake.gif",
-        "brightness": 1.2,
-    }
-    resp = await client.patch("/api/v1/admin/hero/settings", json=payload)
-    assert resp.status_code == 400
-    assert "locked and protected" in resp.json()["detail"]
-
-    # Also test with media_url or hero_gif
-    resp2 = await client.patch("/api/v1/admin/hero/settings", json={"media_url": "http://test.com"})
-    assert resp2.status_code == 400
-
-@pytest.mark.asyncio
-async def test_hero_settings_updates_presentation(client):
-    """Verify that PATCH /admin/hero/settings allows tuning presentation settings."""
-    payload = {
-        "animation_speed": 1.5,
-        "brightness": 1.2,
-        "opacity": 0.5,
-        "contrast": 1.1,
-        "saturation": 1.3,
-        "overlay_opacity": 0.25,
-    }
-    resp = await client.patch("/api/v1/admin/hero/settings", json=payload)
-    assert resp.status_code == 200
-    data = resp.json()
-    assert data["animation_speed"] == 1.5
-    assert data["brightness"] == 1.2
-    assert data["opacity"] == 0.5
-    assert data["contrast"] == 1.1
-    assert data["saturation"] == 1.3
-    assert data["overlay_opacity"] == 0.25
-    assert data["asset_url"] == OFFICIAL_HERO_GIF_URL
-
-@pytest.mark.asyncio
-async def test_media_page_home_rejects_asset_mutation(client):
-    """Verify that PUT /media/pages/home blocks altering the hero media asset."""
-    payload = {
-        "page_id": "home",
-        "title": "Homepage Hero",
-        "media_type": "gif",
-        "media_url": "https://attacker.com/fake.gif",
-        "is_active": True,
-    }
-    resp = await client.put("/api/v1/media/pages/home", json=payload)
-    assert resp.status_code == 400
-    assert "locked and protected" in resp.json()["detail"]
-
-@pytest.mark.asyncio
-async def test_public_hero_settings_endpoint(client):
-    """Verify that public GET /media/hero/settings is accessible."""
-    resp = await client.get("/api/v1/media/hero/settings")
-    assert resp.status_code == 200
-    assert resp.json()["asset_url"] == OFFICIAL_HERO_GIF_URL
 
 @pytest.mark.asyncio
 async def test_get_current_user_super_admin_resolution(mock_db):
