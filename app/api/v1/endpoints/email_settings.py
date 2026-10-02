@@ -48,6 +48,37 @@ async def get_public_email_settings():
     )
 
 
+@public_router.get("/stats")
+async def get_public_platform_stats(db: AsyncIOMotorDatabase = Depends(get_db)):
+    """
+    Public platform statistics for About page and public platform metrics.
+    """
+    total_users = await db.users.count_documents({})
+    total_tournaments = await db.tournaments.count_documents({})
+    total_games = await db.games.count_documents({"status": "active"})
+    if total_games == 0:
+        total_games = await db.games.count_documents({})
+    total_matches = await db.matches.count_documents({})
+    total_teams = await db.teams.count_documents({})
+
+    pipeline = [
+        {"$match": {"status": "PAID"}},
+        {"$group": {"_id": None, "total": {"$sum": "$amount_paise"}}},
+    ]
+    agg = await db.payouts.aggregate(pipeline).to_list(1)
+    payout_paise = agg[0]["total"] if agg else 0
+    payout_inr = payout_paise // 100
+
+    return {
+        "total_users": total_users,
+        "total_tournaments": total_tournaments,
+        "total_games": total_games,
+        "total_matches": total_matches,
+        "total_teams": total_teams,
+        "total_payout_inr": payout_inr,
+    }
+
+
 @admin_router.get("/status", response_model=EmailSystemStatusResponse)
 async def get_admin_email_system_status(
     admin_user: User = Depends(require_super_admin),

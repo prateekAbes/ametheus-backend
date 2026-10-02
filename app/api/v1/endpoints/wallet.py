@@ -45,8 +45,12 @@ async def get_wallet_ledger(
     for t in txns:
         t["id"] = str(t.get("_id", t.get("id")))
         t.pop("_id", None)
-        t["amount_inr"] = t["amount_paise"] / 100
-        t["balance_after_inr"] = t["balance_after_paise"] / 100
+        amt_paise = t.get("amount_paise", 0)
+        is_credit = amt_paise > 0
+        t["entry_type"] = "CREDIT" if is_credit else "DEBIT"
+        t["source_type"] = t.get("txn_type", "WALLET_TOPUP" if is_credit else "PAYMENT")
+        t["amount_inr"] = abs(amt_paise) / 100
+        t["balance_after_inr"] = t.get("balance_after_paise", 0) / 100
     return txns
 
 @router.post("/withdraw")

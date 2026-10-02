@@ -1,5 +1,6 @@
 from typing import List, Optional
-from datetime import datetime
+from datetime import datetime, timezone
+from pydantic import BaseModel
 from fastapi import APIRouter, Depends, HTTPException, Query
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
@@ -435,4 +436,59 @@ async def get_match_join_info(
         "join_info": join_info,
         "match_message": match_msg,
     }
+
+class MatchUpdatePayload(BaseModel):
+    lobby_code: Optional[str] = None
+    lobby_password: Optional[str] = None
+    youtube_live_url: Optional[str] = None
+    live_link: Optional[str] = None
+    server_region: Optional[str] = None
+    status: Optional[str] = None
+    score_a: Optional[int] = None
+    score_b: Optional[int] = None
+    winner_team_id: Optional[str] = None
+
+@router.patch("/{id}")
+async def update_match_details(
+    id: str,
+    payload: MatchUpdatePayload,
+    current_user: User = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    if current_user.role not in ["SUPER_ADMIN", "ADMIN", "ORGANIZER"]:
+        raise HTTPException(status_code=403, detail="Admin or Organizer privilege required")
+
+    match = await db.matches.find_one({"$or": [{"_id": id}, {"id": id}]})
+    if not match:
+        raise HTTPException(status_code=404, detail="Match not found")
+
+    update_data = {}
+    if payload.lobby_code is not None:
+        update_data["lobby_code"] = payload.lobby_code.strip() if payload.lobby_code else None
+    if payload.lobby_password is not None:
+        update_data["lobby_password"] = payload.lobby_password.strip() if payload.lobby_password else None
+    if payload.youtube_live_url is not None:
+        url = payload.youtube_live_url.strip() or None
+        update_data["youtube_live_url"] = url
+        update_data["live_link"] = url
+    elif payload.live_link is not None:
+        url = payload.live_link.strip() or None
+        update_data["youtube_live_url"] = url
+        update_data["live_link"] = url
+    if payload.server_region is not None:
+        update_data["server_region"] = payload.server_region
+    if payload.status is not None:
+        update_data["status"] = payload.status
+    if payload.score_a is not None:
+        update_data["score_a"] = payload.score_a
+    if payload.score_b is not None:
+        update_data["score_b"] = payload.score_b
+    if payload.winner_team_id is not None:
+        update_data["winner_team_id"] = payload.winner_team_id
+
+    if update_data:
+        update_data["updated_at"] = datetime.now(timezone.utc)
+        await db.matches.update_one({"_id": match["_id"]}, {"$set": update_data})
+
+    return {"status": "success", "message": "Match updated successfully"}
 
