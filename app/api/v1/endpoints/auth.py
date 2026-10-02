@@ -71,13 +71,19 @@ async def sync_clerk_user(
         "admin@ametheus.gg",
         "pk.4081988@gmail.com",
     }
-    is_super_admin = clean_email in admin_emails
+    token_metadata = token_claims.get("public_metadata") or token_claims.get("metadata") or {}
+    token_role = str(token_metadata.get("role", "")).upper()
+    is_super_admin = (clean_email in admin_emails) or (token_role in ["SUPER_ADMIN", "ADMIN"])
 
-    # 1. Search for existing user record by Clerk user ID or email (case-insensitive)
-    user_doc = await db.users.find_one({
+    # 1. Search for existing user records by Clerk user ID and/or email
+    user_by_clerk = await db.users.find_one({
         "$or": [
             {"_id": payload.clerk_user_id},
             {"clerk_user_id": payload.clerk_user_id},
+        ]
+    })
+    user_by_email = await db.users.find_one({
+        "$or": [
             {"email": clean_email},
             {"email": payload.email.strip()},
         ]
@@ -86,9 +92,16 @@ async def sync_clerk_user(
     from app.models.base import get_utc_now
     now = get_utc_now()
 
+    if user_by_clerk and user_by_email and str(user_by_clerk["_id"]) != str(user_by_email["_id"]):
+        # Merge duplicate accounts: keep the pre-existing email record, remove the orphaned auto-provisioned placeholder
+        await db.users.delete_one({"_id": user_by_clerk["_id"]})
+        user_doc = user_by_email
+    else:
+        user_doc = user_by_clerk or user_by_email
+
     if user_doc:
         target_id = user_doc["_id"]
-        # Update permitted fields only — PROTECT application fields (role, balances, teams, etc.)
+        # Update permitted fields only — PROTECT application fields (balances, teams, etc.)
         update_fields = {
             "clerk_user_id": payload.clerk_user_id,
             "email": clean_email,
@@ -97,12 +110,14 @@ async def sync_clerk_user(
         # Only populate display_name if not already present in the user's database record
         if not user_doc.get("display_name") and payload.display_name:
             update_fields["display_name"] = payload.display_name.strip()
-        # Only populate avatar_url if not already present in the user's database record (preserve custom user avatars)
+        # Only populate avatar_url if not already present in the user's database record
         if not user_doc.get("avatar_url") and payload.avatar_url:
             update_fields["avatar_url"] = payload.avatar_url.strip()
-        # Preserve designated super admin role if email matches
+        # Enforce authoritative role
         if is_super_admin:
             update_fields["role"] = "SUPER_ADMIN"
+        elif token_role in ["ORGANIZER", "TOURNAMENT_ADMIN"] and user_doc.get("role") != "SUPER_ADMIN":
+            update_fields["role"] = "ORGANIZER"
         # Keep username_lower in sync
         existing_username = user_doc.get("username", "")
         if existing_username:
@@ -125,7 +140,7 @@ async def sync_clerk_user(
     if username_taken:
         clean_username = f"{clean_username[:18]}_{payload.clerk_user_id[-6:].lower()}"
 
-    initial_role = "SUPER_ADMIN" if is_super_admin else "PLAYER"
+    initial_role = "SUPER_ADMIN" if is_super_admin else ("ORGANIZER" if token_role in ["ORGANIZER", "TOURNAMENT_ADMIN"] else "PLAYER")
 
     # Application fields set ONLY upon initial insertion
     set_on_insert_fields = {

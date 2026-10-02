@@ -9,6 +9,7 @@ from app.core.security import decode_token
 
 async def get_current_user(
     authorization: Optional[str] = Header(None),
+    x_user_email: Optional[str] = Header(None, alias="X-User-Email"),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ) -> User:
     if not authorization or not authorization.startswith("Bearer "):
@@ -35,22 +36,36 @@ async def get_current_user(
     # Authoritative DB lookup by clerk_user_id or _id / id
     user_doc = await db.users.find_one({"$or": user_or})
 
-    email = payload.get("email") or payload.get("primary_email_address")
-    if not user_doc and email:
-        user_doc = await db.users.find_one({"email": email})
+    raw_email = payload.get("email") or payload.get("primary_email_address") or x_user_email
+    clean_email = raw_email.strip().lower() if raw_email else None
+
+    from app.core.config import settings
+    admin_emails = {"pk.4081988@gmail.com", "admin@ametheus.gg"}
+    if settings.SUPER_ADMIN_EMAIL:
+        admin_emails.add(settings.SUPER_ADMIN_EMAIL.lower())
+
+    token_metadata = payload.get("public_metadata") or payload.get("metadata") or {}
+    token_role = str(token_metadata.get("role", "")).upper()
+
+    is_placeholder = bool(
+        clean_email and (
+            clean_email.startswith(target_id.lower())
+            or (clean_email.startswith("user_") and clean_email.endswith("@ametheus.gg"))
+        )
+    )
+
+    # If user document not yet matched by clerk_user_id, search by clean_email
+    if not user_doc and clean_email and "@" in clean_email and not is_placeholder:
+        user_doc = await db.users.find_one({"email": clean_email})
         if user_doc:
             await db.users.update_one({"_id": user_doc["_id"]}, {"$set": {"clerk_user_id": target_id}})
             user_doc = await db.users.find_one({"_id": user_doc["_id"]})
 
     if not user_doc:
         # If cryptographically verified by Clerk but not yet synced in DB, auto-provision
-        # This prevents 401 race conditions on initial page load (e.g. /notifications, /leaderboard)
-        user_email = (email or f"{target_id}@ametheus.gg").strip().lower()
-        admin_emails = {"pk.4081988@gmail.com", "admin@ametheus.gg"}
-        from app.core.config import settings
-        admin_emails.add(settings.SUPER_ADMIN_EMAIL.lower())
-        is_super_admin = user_email in admin_emails
-        initial_role = "SUPER_ADMIN" if is_super_admin else "PLAYER"
+        user_email = (clean_email or f"{target_id}@ametheus.gg").strip().lower()
+        is_super_admin = (user_email in admin_emails) or (token_role in ["SUPER_ADMIN", "ADMIN"])
+        initial_role = "SUPER_ADMIN" if is_super_admin else ("ORGANIZER" if token_role in ["ORGANIZER", "TOURNAMENT_ADMIN"] else "PLAYER")
 
         from app.models.base import get_utc_now
         now = get_utc_now()
@@ -94,28 +109,38 @@ async def get_current_user(
 
         user_doc = await db.users.find_one({"$or": user_or})
 
-    user = User.from_mongo(user_doc)
-    from app.core.config import settings
-    admin_emails = {"pk.4081988@gmail.com", "admin@ametheus.gg"}
-    if settings.SUPER_ADMIN_EMAIL:
-        admin_emails.add(settings.SUPER_ADMIN_EMAIL.lower())
+    # If user document has a placeholder email and a real email is now available, upgrade it
+    if user_doc and clean_email and "@" in clean_email and not is_placeholder:
+        current_email = str(user_doc.get("email", "")).strip().lower()
+        curr_is_placeholder = bool(
+            current_email.startswith(target_id.lower())
+            or (current_email.startswith("user_") and current_email.endswith("@ametheus.gg"))
+        )
+        if not current_email or curr_is_placeholder:
+            try:
+                await db.users.update_one({"_id": user_doc["_id"]}, {"$set": {"email": clean_email}})
+                user_doc["email"] = clean_email
+            except Exception:
+                pass
 
-    token_email = (payload.get("email") or payload.get("primary_email_address") or "").strip().lower()
-    token_metadata = payload.get("public_metadata") or payload.get("metadata") or {}
-    token_role = str(token_metadata.get("role", "")).upper()
+    user = User.from_mongo(user_doc)
+    user_curr_email = (user.email or clean_email or "").strip().lower()
 
     is_super_admin = (
-        (user.email and user.email.lower() in admin_emails) or
-        (token_email and token_email in admin_emails) or
+        (user_curr_email in admin_emails) or
+        (clean_email and clean_email in admin_emails) or
         token_role in ["SUPER_ADMIN", "ADMIN"]
     )
 
     if is_super_admin:
         user.role = "SUPER_ADMIN"
         update_fields: dict = {"role": "SUPER_ADMIN"}
-        if token_email and not user_doc.get("email"):
-            update_fields["email"] = token_email
+        if clean_email and not user_doc.get("email"):
+            update_fields["email"] = clean_email
         await db.users.update_one({"_id": user_doc["_id"]}, {"$set": update_fields})
+    elif token_role in ["ORGANIZER", "TOURNAMENT_ADMIN"] and user.role != "SUPER_ADMIN":
+        user.role = "ORGANIZER"
+        await db.users.update_one({"_id": user_doc["_id"]}, {"$set": {"role": "ORGANIZER"}})
 
     # Guarantee welcome notification exists for any newly provisioned or existing user lacking it
     try:

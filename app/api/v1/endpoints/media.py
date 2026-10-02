@@ -233,6 +233,16 @@ async def update_page_media(
     data["updated_at"] = datetime.now(timezone.utc).isoformat()
     data["updated_by"] = getattr(admin_user, "email", "admin") or getattr(admin_user, "id", "admin")
 
+    if page_id == "home":
+        from app.models.admin import OFFICIAL_HERO_GIF_URL
+        if payload.media_url and payload.media_url != OFFICIAL_HERO_GIF_URL:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Homepage hero GIF asset is locked and protected. Only presentation settings (animation_speed, brightness, opacity, contrast, saturation, overlay_opacity) may be modified.",
+            )
+        data["media_url"] = OFFICIAL_HERO_GIF_URL
+        data["is_locked"] = True
+
     await db.page_media.update_one(
         {"page_id": page_id},
         {"$set": data},
@@ -253,6 +263,13 @@ async def save_page_media(
 ):
     """Admin endpoint to save page media configuration."""
     return await update_page_media(payload.page_id, payload, admin_user, db)
+
+@router.get("/hero/settings")
+async def get_public_hero_settings(db: AsyncIOMotorDatabase = Depends(get_db)):
+    """Public read endpoint for homepage hero presentation settings."""
+    from app.models.admin import HeroPresentationSettings
+    doc = await db.hero_settings.find_one({"_id": "hero_settings"})
+    return HeroPresentationSettings.from_mongo(doc)
 
 @router.get("/{media_id}")
 async def get_media_file(
