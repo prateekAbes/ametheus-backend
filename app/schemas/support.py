@@ -3,11 +3,14 @@ from pydantic import BaseModel, Field, EmailStr, ConfigDict
 
 
 class SupportTicketCreateRequest(BaseModel):
-    name: str = Field(..., min_length=2, max_length=100)
-    email: str = Field(..., min_length=5, max_length=150)
-    category: str = Field(..., min_length=2, max_length=50)
+    name: Optional[str] = None
+    email: Optional[str] = None
+    category: Optional[str] = "OTHER"
     payment_type: Optional[str] = None
-    description: str = Field(..., min_length=10, max_length=5000)
+    description: Optional[str] = None
+    subject: Optional[str] = None
+    message: Optional[str] = None
+    priority: Optional[str] = None
 
 
 class SupportTicketUpdateRequest(BaseModel):

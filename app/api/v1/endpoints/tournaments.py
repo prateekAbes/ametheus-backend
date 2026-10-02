@@ -169,6 +169,7 @@ async def list_tournaments(
                 prizes=prizes,
                 bracket_rounds=bracket,
                 registered_rosters=[],
+                is_featured=bool(t.get("is_featured", False)),
             )
         )
     return response
@@ -276,6 +277,56 @@ async def get_tournaments_summary(db: AsyncIOMotorDatabase = Depends(get_db)):
         "total_prize_pool_inr": total_prize_pool_inr,
         "formatted_prize_pool": formatted,
         "active_tournaments_count": active_count,
+    }
+
+@router.get("/featured", response_model=Optional[TournamentResponse])
+async def get_featured_tournament(db: AsyncIOMotorDatabase = Depends(get_db)):
+    """Return the admin-designated featured tournament for the homepage."""
+    t = await db.tournaments.find_one({
+        "is_featured": True,
+        "status": {"$nin": ["DELETED", "CANCELLED", "HIDDEN"]},
+        "is_dummy": {"$ne": True},
+    })
+    if not t:
+        return None
+    tid = str(t.get("_id", t.get("id")))
+    return await get_tournament_by_slug(tid, db)
+
+@router.post("/{id}/feature")
+async def set_featured_tournament(
+    id: str,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Admin endpoint to select or clear the main homepage featured tournament."""
+    # First, clear any previously featured tournaments
+    await db.tournaments.update_many({}, {"$set": {"is_featured": False}})
+
+    if id.lower() in ["none", "unset", "clear"]:
+        return {"status": "success", "message": "Homepage featured tournament cleared", "featured_tournament_id": None}
+
+    t = await find_tournament_by_id_or_slug(db, id)
+    if not t:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+
+    tid = str(t.get("_id", t.get("id")))
+    await db.tournaments.update_one(
+        {"$or": [{"_id": t.get("_id")}, {"id": tid}, {"slug": t.get("slug")}]},
+        {"$set": {"is_featured": True}}
+    )
+
+    await record_audit_log(
+        db=db,
+        operator=admin_user.username,
+        role=admin_user.role,
+        action="SET_HOMEPAGE_FEATURED_TOURNAMENT",
+        target=f"Tournament {tid} ({t.get('title')})",
+    )
+
+    return {
+        "status": "success",
+        "message": f"Tournament '{t.get('title')}' is now featured on homepage",
+        "featured_tournament_id": tid,
     }
 
 @router.get("/{slug}", response_model=TournamentResponse)
@@ -434,6 +485,7 @@ async def get_tournament_by_slug(slug: str, db: AsyncIOMotorDatabase = Depends(g
         prizes=prizes,
         bracket_rounds=bracket,
         registered_rosters=registered_rosters,
+        is_featured=bool(t.get("is_featured", False)),
     )
 
 @router.get("/{slug}/matches", response_model=List[MatchResponse])

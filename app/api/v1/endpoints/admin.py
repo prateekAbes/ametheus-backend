@@ -836,20 +836,39 @@ async def list_admin_payments(
 
     if status_filter and status_filter.upper() != "ALL":
         sf = status_filter.upper()
-        query["status"] = sf
         if sf == "PENDING":
-            query["utr"] = {"$exists": True, "$type": "string", "$ne": ""}
+            query["status"] = {"$in": ["PENDING", "PENDING_VERIFICATION", "SUBMITTED"]}
+        else:
+            query["status"] = sf
     if game_id:
         query["game_id"] = game_id
 
     cursor = db.game_payments.find(query).sort("created_at", -1)
     docs = await cursor.to_list(length=200)
+
+    user_ids = [str(d.get("user_id")) for d in docs if d.get("user_id")]
+    u_map = {}
+    if user_ids:
+        users = await db.users.find({"$or": [{"_id": {"$in": user_ids}}, {"id": {"$in": user_ids}}, {"clerk_user_id": {"$in": user_ids}}]}).to_list(len(user_ids))
+        for u in users:
+            uid = str(u.get("_id", u.get("id")))
+            u_map[uid] = u
+            if u.get("clerk_user_id"):
+                u_map[str(u["clerk_user_id"])] = u
+
     for d in docs:
         d["id"] = str(d.get("_id", d.get("id")))
         d.pop("_id", None)
         d["is_archived"] = bool(d.get("is_archived", False))
         if d.get("archived_at") and hasattr(d["archived_at"], "isoformat"):
             d["archived_at"] = d["archived_at"].isoformat()
+        uid = str(d.get("user_id", ""))
+        if uid in u_map:
+            u_info = u_map[uid]
+            if not d.get("user_email"):
+                d["user_email"] = u_info.get("email")
+            if not d.get("user_name"):
+                d["user_name"] = u_info.get("display_name") or u_info.get("username")
     return docs
 
 @router.post("/payments/{payment_id}/approve")

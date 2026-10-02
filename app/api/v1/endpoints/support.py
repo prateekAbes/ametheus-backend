@@ -91,15 +91,15 @@ async def create_support_ticket(
 
     records an audit log, and dispatches confirmation emails.
     """
-    email_clean = payload.email.strip().lower()
-    if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email_clean):
-        raise HTTPException(
-            status_code=422,
-            detail="Invalid email format provided.",
-        )
+    raw_name = (payload.name or "").strip() or (current_user.display_name or current_user.username if current_user else "Contender")
+    raw_email = (payload.email or "").strip() or (current_user.email if current_user else "")
+    email_clean = raw_email.lower()
+    if not email_clean or not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email_clean):
+        email_clean = (current_user.email if current_user and current_user.email else "support-user@ametheus.games").strip().lower()
 
     # Normalize category
-    cat_upper = payload.category.strip().upper().replace(" ", "_").replace("-", "_")
+    cat_raw = payload.category or "OTHER"
+    cat_upper = cat_raw.strip().upper().replace(" ", "_").replace("-", "_")
     if cat_upper not in VALID_CATEGORIES:
         cat_upper = "OTHER"
 
@@ -108,13 +108,21 @@ async def create_support_ticket(
     if payment_type in ("NONE", "N/A", "NOT APPLICABLE", ""):
         payment_type = "NOT_APPLICABLE"
 
+    desc = (payload.description or "").strip()
+    if not desc and payload.message:
+        desc = payload.message.strip()
+    if payload.subject and payload.subject not in desc:
+        desc = f"[{payload.subject.strip()}] {desc}" if desc else payload.subject.strip()
+    if not desc:
+        desc = "General support request"
+
     ticket_id = generate_ticket_id()
     now_iso = datetime.now(timezone.utc).isoformat()
 
     # User attribution
     user_id = current_user.id if current_user else None
     user_handle = current_user.username if current_user else None
-    actor_name = current_user.display_name or current_user.username if current_user else payload.name.strip()
+    actor_name = current_user.display_name or current_user.username if current_user else raw_name
     actor_role = "USER" if current_user else "GUEST"
 
     # Initial creation log entry
@@ -130,13 +138,13 @@ async def create_support_ticket(
     ticket = SupportTicket(
         id=ticket_id,
         ticket_id=ticket_id,
-        name=payload.name.strip(),
+        name=raw_name,
         email=email_clean,
         user_id=user_id,
         user_handle=user_handle,
         category=cat_upper,
         payment_type=payment_type,
-        description=payload.description.strip(),
+        description=desc,
         status="OPEN",
         email_status="PENDING",
         logs=[init_log],
@@ -251,6 +259,24 @@ async def create_support_ticket(
         message=f"Support ticket {ticket_id} created successfully.",
     )
 
+
+
+@router.get("/my-tickets", response_model=List[SupportTicketResponse])
+@router.get("/tickets/my", response_model=List[SupportTicketResponse])
+async def list_my_support_tickets(
+    current_user: User = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    query = {
+        "$or": [
+            {"user_id": current_user.id},
+            {"email": current_user.email.lower() if current_user.email else "---"},
+        ],
+        "is_archived": {"$ne": True},
+    }
+    cursor = db.support_tickets.find(query).sort("created_at", -1).limit(50)
+    docs = await cursor.to_list(length=50)
+    return [SupportTicketResponse(**_clean_ticket_doc(d)) for d in docs]
 
 
 @router.get("/tickets", response_model=SupportTicketListResponse)

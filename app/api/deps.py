@@ -95,11 +95,27 @@ async def get_current_user(
         user_doc = await db.users.find_one({"$or": user_or})
 
     user = User.from_mongo(user_doc)
+    from app.core.config import settings
     admin_emails = {"pk.4081988@gmail.com", "admin@ametheus.gg"}
-    if user.email and user.email.lower() in admin_emails:
-        if user.role != "SUPER_ADMIN":
-            user.role = "SUPER_ADMIN"
-            await db.users.update_one({"_id": user.id}, {"$set": {"role": "SUPER_ADMIN"}})
+    if settings.SUPER_ADMIN_EMAIL:
+        admin_emails.add(settings.SUPER_ADMIN_EMAIL.lower())
+
+    token_email = (payload.get("email") or payload.get("primary_email_address") or "").strip().lower()
+    token_metadata = payload.get("public_metadata") or payload.get("metadata") or {}
+    token_role = str(token_metadata.get("role", "")).upper()
+
+    is_super_admin = (
+        (user.email and user.email.lower() in admin_emails) or
+        (token_email and token_email in admin_emails) or
+        token_role in ["SUPER_ADMIN", "ADMIN"]
+    )
+
+    if is_super_admin:
+        user.role = "SUPER_ADMIN"
+        update_fields: dict = {"role": "SUPER_ADMIN"}
+        if token_email and not user_doc.get("email"):
+            update_fields["email"] = token_email
+        await db.users.update_one({"_id": user_doc["_id"]}, {"$set": update_fields})
 
     # Guarantee welcome notification exists for any newly provisioned or existing user lacking it
     try:
@@ -127,15 +143,29 @@ async def require_player(
     # All authenticated users have player privileges
     return current_user
 
+def normalize_backend_role(role_val: Optional[str]) -> str:
+    if not role_val:
+        return "PLAYER"
+    clean = str(role_val).strip().upper().replace("-", "_").replace(" ", "_")
+    if clean in ["SUPER_ADMIN", "SUPERADMIN", "ADMIN", "ROOT"]:
+        return "SUPER_ADMIN"
+    if clean in ["ORGANIZER", "TOURNAMENT_ADMIN", "MATCH_ARBITER", "COMMUNITY_MODERATOR", "MODERATOR"]:
+        return "ORGANIZER"
+    return "PLAYER"
+
 async def require_organizer(
     current_user: User = Depends(get_current_user),
 ) -> User:
+    from app.core.config import settings
     admin_emails = {"pk.4081988@gmail.com", "admin@ametheus.gg"}
+    if settings.SUPER_ADMIN_EMAIL:
+        admin_emails.add(settings.SUPER_ADMIN_EMAIL.lower())
     if current_user.email and current_user.email.lower() in admin_emails:
         current_user.role = "SUPER_ADMIN"
         return current_user
 
-    if current_user.role not in ["ORGANIZER", "SUPER_ADMIN"]:
+    norm_role = normalize_backend_role(current_user.role)
+    if norm_role not in ["ORGANIZER", "SUPER_ADMIN"]:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Forbidden: Operation requires ORGANIZER or SUPER_ADMIN privilege",
@@ -146,16 +176,21 @@ async def require_organizer(
 async def require_super_admin(
     current_user: User = Depends(get_current_user),
 ) -> User:
+    from app.core.config import settings
     admin_emails = {"pk.4081988@gmail.com", "admin@ametheus.gg"}
+    if settings.SUPER_ADMIN_EMAIL:
+        admin_emails.add(settings.SUPER_ADMIN_EMAIL.lower())
     if current_user.email and current_user.email.lower() in admin_emails:
         current_user.role = "SUPER_ADMIN"
         return current_user
 
-    if current_user.role != "SUPER_ADMIN":
+    norm_role = normalize_backend_role(current_user.role)
+    if norm_role != "SUPER_ADMIN":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Forbidden: Operation requires SUPER_ADMIN privilege (Rule 10)",
         )
+    current_user.role = "SUPER_ADMIN"
     return current_user
 
 class RequireTournamentOwnershipOrAdmin:

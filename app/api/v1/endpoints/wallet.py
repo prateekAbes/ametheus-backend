@@ -4,9 +4,10 @@ from typing import Optional, List
 from fastapi import APIRouter, Depends, HTTPException, status
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
+from pydantic import BaseModel
 from app.api.deps import get_db, get_current_user, require_super_admin
 from app.models.user import User
-from app.models.payment import Payout
+from app.models.payment import Payout, GamePayment
 from app.schemas import WalletBalanceResponse, WalletWithdrawRequest
 from app.services.wallet_service import (
     get_user_wallet_balances,
@@ -14,6 +15,7 @@ from app.services.wallet_service import (
     release_reserved_funds,
     finalize_reserved_deduction,
 )
+from app.services.upi_service import get_next_active_upi_account, build_upi_payment_uri
 from app.services.audit import record_audit_log
 from app.services.notification import create_notification
 
@@ -110,3 +112,88 @@ async def get_my_withdrawals(
         d.pop("_id", None)
         d["amount_inr"] = d["amount_paise"] / 100
     return docs
+
+class WalletDepositPayload(BaseModel):
+    amount_inr: float
+    utr: Optional[str] = None
+    screenshot_url: Optional[str] = None
+
+@router.post("/deposit")
+@router.post("/topup")
+async def deposit_wallet_funds(
+    payload: WalletDepositPayload,
+    current_user: User = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    if payload.amount_inr <= 0:
+        raise HTTPException(status_code=400, detail="Deposit amount must be greater than zero")
+
+    amount_paise = int(round(payload.amount_inr * 100))
+    upi_acc = await get_next_active_upi_account(db)
+    upi_id = upi_acc.get("upi_id")
+    payee_name = upi_acc.get("payee_name", "AMETHEUS")
+    acc_code = upi_acc.get("code", "UPI001")
+    acc_id = str(upi_acc.get("_id", upi_acc.get("id")))
+    qr_url = upi_acc.get("qr_url")
+
+    upi_uri = build_upi_payment_uri(
+        upi_id=upi_id,
+        payee_name=payee_name,
+        amount_inr=payload.amount_inr,
+        note="Wallet Topup",
+    )
+
+    clean_utr = payload.utr.strip() if payload.utr else None
+    payment_status = "PENDING" if clean_utr else "INITIATED"
+
+    payment = GamePayment(
+        payment_type="WALLET_TOPUP",
+        user_id=current_user.id,
+        amount_paise=amount_paise,
+        amount_inr=payload.amount_inr,
+        payment_method="UPI",
+        payment_account_id=acc_id,
+        payment_account_code=acc_code,
+        upi_id=upi_id,
+        payee_name=payee_name,
+        qr_url=qr_url,
+        upi_uri=upi_uri,
+        utr=clean_utr,
+        screenshot_url=payload.screenshot_url,
+        status=payment_status,
+    )
+    p_doc = payment.to_mongo()
+    await db.game_payments.insert_one(p_doc)
+
+    if clean_utr:
+        await record_audit_log(
+            db=db,
+            operator=current_user.username,
+            role=current_user.role,
+            action="SUBMIT_WALLET_DEPOSIT",
+            target=f"Payment {payment.id}",
+            details=f"Deposit of ₹{payload.amount_inr:.2f} submitted with UTR {clean_utr}",
+        )
+        await create_notification(
+            db=db,
+            user_id=current_user.id,
+            title="Deposit Submitted",
+            message=f"Deposit reference {clean_utr} received. Wallet will be credited upon admin verification.",
+            notification_type="PAYMENT",
+            link="/wallet",
+        )
+
+    return {
+        "status": payment_status,
+        "payment_id": payment.id,
+        "amount_inr": payload.amount_inr,
+        "amount_paise": amount_paise,
+        "payment_account_code": acc_code,
+        "upi_id": upi_id,
+        "payee_name": payee_name,
+        "qr_url": qr_url,
+        "upi_uri": upi_uri,
+        "utr": clean_utr,
+        "message": "Deposit submitted for admin approval" if clean_utr else "Deposit initiated",
+    }
+

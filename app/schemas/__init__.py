@@ -291,6 +291,7 @@ class TournamentResponse(BaseModel):
     prizes: List[Dict[str, Any]] = []
     bracket_rounds: List[Dict[str, Any]] = []
     registered_rosters: List[Dict[str, Any]] = []
+    is_featured: Optional[bool] = False
     model_config = ConfigDict(from_attributes=True, extra="allow")
 
 class TournamentRegisterRequest(BaseModel):
