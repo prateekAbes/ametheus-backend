@@ -11,7 +11,7 @@ from app.models.user import User
 
 router = APIRouter()
 
-MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB limit
+MAX_FILE_SIZE = 20 * 1024 * 1024  # 20 MB limit
 ALLOWED_TYPES = {
     "image/jpeg": ".jpg",
     "image/jpg": ".jpg",
@@ -21,6 +21,19 @@ ALLOWED_TYPES = {
     "image/svg+xml": ".svg",
 }
 
+def sanitize_svg(content: bytes) -> bytes:
+    """Strip malicious executable tags and attributes from SVG vector content."""
+    try:
+        import re
+        text = content.decode("utf-8", errors="ignore")
+        cleaned = re.sub(r'(?i)<script[\s\S]*?</script>', '', text)
+        cleaned = re.sub(r'(?i)\son\w+\s*=\s*["\'][^"\']*["\']', '', cleaned)
+        cleaned = re.sub(r'(?i)href\s*=\s*["\']javascript:[^"\']*["\']', '', cleaned)
+        cleaned = re.sub(r'(?i)<foreignObject[\s\S]*?</foreignObject>', '', cleaned)
+        return cleaned.encode("utf-8")
+    except Exception:
+        return content
+
 class Base64UploadPayload(BaseModel):
     data_url: str
     filename: Optional[str] = "upload.png"
@@ -29,7 +42,7 @@ async def _save_media(content: bytes, filename: str, content_type: str, db: Asyn
     if len(content) > MAX_FILE_SIZE:
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail="File size exceeds maximum limit of 10MB",
+            detail="File size exceeds maximum limit of 20MB",
         )
 
     if content_type not in ALLOWED_TYPES and not content_type.startswith("image/"):
@@ -37,6 +50,10 @@ async def _save_media(content: bytes, filename: str, content_type: str, db: Asyn
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Unsupported file type: {content_type}. Allowed: PNG, JPEG, WEBP, GIF, SVG",
         )
+
+    if content_type == "image/svg+xml" or filename.lower().endswith(".svg"):
+        content = sanitize_svg(content)
+        content_type = "image/svg+xml"
 
     media_id = f"img_{uuid.uuid4().hex[:14]}"
     b64_str = base64.b64encode(content).decode("utf-8")

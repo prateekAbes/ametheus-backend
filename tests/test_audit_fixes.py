@@ -115,3 +115,31 @@ async def test_match_patch_credentials(client, mock_db):
     assert doc["lobby_password"] == "SECRET_PASS_99"
     assert doc["youtube_live_url"] == "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
     assert doc["live_link"] == "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+
+@pytest.mark.asyncio
+async def test_svg_sanitization(client, mock_db):
+    """Verify that SVG upload strips script tags and malicious attributes."""
+    from app.api.v1.endpoints.media import sanitize_svg
+    malicious_svg = b'<svg><script>alert("xss")</script><rect width="100" height="100" onload="alert(1)" /></svg>'
+    cleaned = sanitize_svg(malicious_svg)
+    assert b"<script" not in cleaned
+    assert b"onload" not in cleaned
+    assert b'<rect width="100" height="100"' in cleaned
+
+@pytest.mark.asyncio
+async def test_game_category_normalization(client, mock_db):
+    """Verify that game creation normalizes category slug."""
+    payload = {
+        "slug": "apex-legends",
+        "name": "Apex Legends",
+        "category": "BR",
+        "platform": "PC",
+        "tag": "APEX",
+        "banner_url": "https://example.com/banner.png",
+        "logo_url": "https://example.com/logo.png",
+    }
+    resp = await client.post("/api/v1/games", json=payload)
+    assert resp.status_code == 201
+    data = resp.json()
+    assert data["category"] == "battle-royale"
+

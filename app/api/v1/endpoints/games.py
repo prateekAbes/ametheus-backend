@@ -32,6 +32,20 @@ GAME_FALLBACK_IMAGES = {
     },
 }
 
+def normalize_category_slug(category: Optional[str]) -> str:
+    if not category:
+        return "pc"
+    c = category.strip().lower().replace(" ", "-").replace("_", "-")
+    aliases = {
+        "br": "battle-royale",
+        "first-person-shooter": "fps",
+        "sports-racing": "sports",
+        "racing": "sports",
+        "strategy-card": "strategy",
+        "card": "strategy",
+    }
+    return aliases.get(c, c)
+
 def sanitize_game_images(slug: str, banner: str, logo: str):
     fb = GAME_FALLBACK_IMAGES.get(slug, {
         "banner": "https://images.unsplash.com/photo-1542751371-adc38448a05e?q=80&w=1200&auto=format&fit=crop",
@@ -126,7 +140,7 @@ async def create_game(
     game = Game(
         slug=payload.slug,
         name=payload.name,
-        category=payload.category,
+        category=normalize_category_slug(payload.category),
         platform=payload.platform,
         tag=payload.tag,
         is_team_game=payload.is_team_game,
@@ -177,6 +191,8 @@ async def update_game(
         raise HTTPException(status_code=404, detail="Game not found")
 
     update_data = {k: v for k, v in payload.model_dump(exclude_unset=True).items() if v is not None}
+    if "category" in update_data:
+        update_data["category"] = normalize_category_slug(update_data["category"])
     if update_data:
         await db.games.update_one({"_id": game["_id"]}, {"$set": update_data})
 
