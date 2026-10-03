@@ -97,7 +97,18 @@ async def create_team(
     current_user: User = Depends(get_current_user),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
-    game = await db.games.find_one({"$or": [{"slug": payload.game_slug}, {"_id": payload.game_slug}, {"id": payload.game_slug}]})
+    from bson import ObjectId
+    game_query = [
+        {"slug": payload.game_slug},
+        {"slug": payload.game_slug.lower()},
+        {"_id": payload.game_slug},
+        {"id": payload.game_slug},
+    ]
+    if ObjectId.is_valid(payload.game_slug):
+        game_query.append({"_id": ObjectId(payload.game_slug)})
+    game = await db.games.find_one({"$or": game_query})
+    if not game:
+        game = await db.games.find_one({"name": {"$regex": f"^{payload.game_slug}$", "$options": "i"}})
     if not game:
         raise HTTPException(status_code=404, detail="Game not found")
 

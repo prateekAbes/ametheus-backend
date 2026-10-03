@@ -1,5 +1,5 @@
 from typing import Optional, List, Dict, Any
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, model_validator
 
 # User
 class UserBase(BaseModel):
@@ -124,10 +124,39 @@ class TeamCreate(BaseModel):
     tag: str
     captain_handle: str
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_fields(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            # Resolve game slug / game id
+            slug = data.get("game_slug") or data.get("game_id")
+            if slug:
+                data["game_slug"] = str(slug).strip()
+            # Resolve captain handle / game handle / player handle / handle
+            handle = data.get("captain_handle") or data.get("game_handle") or data.get("player_handle") or data.get("handle")
+            if handle:
+                data["captain_handle"] = str(handle).strip()
+            elif not data.get("captain_handle"):
+                data["captain_handle"] = "Contender"
+        return data
+
 class TeamJoin(BaseModel):
     invite_code: str
     player_handle: str
     is_substitute: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_fields(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            handle = data.get("player_handle") or data.get("game_handle") or data.get("handle")
+            if handle:
+                data["player_handle"] = str(handle).strip()
+            elif not data.get("player_handle"):
+                data["player_handle"] = "Contender"
+            if "invite_code" in data:
+                data["invite_code"] = str(data["invite_code"]).strip().upper()
+        return data
 
 class TeamResponse(BaseModel):
     id: str

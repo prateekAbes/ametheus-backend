@@ -143,3 +143,64 @@ async def test_game_category_normalization(client, mock_db):
     data = resp.json()
     assert data["category"] == "battle-royale"
 
+
+@pytest.mark.asyncio
+async def test_team_creation_and_join_resilience(client, mock_db):
+    """Verify that team creation and joining work seamlessly without 422 with both canonical and alias fields."""
+    await mock_db.games.insert_one({
+        "_id": "g_val",
+        "slug": "valorant",
+        "name": "Valorant",
+        "is_team_game": True,
+        "max_team_size": 5,
+        "max_substitutes": 1,
+        "status": "ACTIVE",
+        "entry_fee_inr": 0,
+    })
+    await mock_db.games.insert_one({
+        "_id": "g_bgmi",
+        "slug": "bgmi",
+        "name": "BGMI",
+        "is_team_game": True,
+        "max_team_size": 4,
+        "max_substitutes": 1,
+        "status": "ACTIVE",
+        "entry_fee_inr": 0,
+    })
+
+    # 1. Create team using alias fields (game_id and game_handle)
+    alias_payload = {
+        "name": "Velocity Strike",
+        "tag": "VSE",
+        "game_id": "valorant",
+        "game_handle": "vortex#IND",
+    }
+    resp1 = await client.post("/api/v1/teams", json=alias_payload)
+    assert resp1.status_code == 201, f"Expected 201 Created but got {resp1.status_code}: {resp1.text}"
+    team1_data = resp1.json()
+    assert team1_data["name"] == "Velocity Strike"
+    assert team1_data["tag"] == "VSE"
+    assert team1_data["game_slug"] == "valorant"
+    assert len(team1_data["members"]) == 1
+    assert team1_data["members"][0]["game_handle"] == "vortex#IND"
+    invite_code = team1_data["invite_code"]
+
+    # 2. Join team using game_handle alias
+    other_user = User(
+        id="user_player_2",
+        clerk_user_id="clerk_p2",
+        email="p2@ametheus.gg",
+        username="contender_two",
+        role="PLAYER",
+    )
+    app.dependency_overrides[get_current_user] = lambda: other_user
+    join_payload = {
+        "invite_code": invite_code,
+        "game_handle": "p2#IND",
+    }
+    resp_join = await client.post("/api/v1/teams/join", json=join_payload)
+    assert resp_join.status_code == 200, f"Expected 200 OK but got {resp_join.status_code}: {resp_join.text}"
+    joined_data = resp_join.json()
+    assert len(joined_data["members"]) == 2
+    assert any(m["game_handle"] == "p2#IND" for m in joined_data["members"])
+
