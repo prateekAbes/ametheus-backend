@@ -854,6 +854,38 @@ async def advance_bracket_match(
             "match_number": next_match_num,
         })
 
+        if not next_match_doc and completed_match.round_number:
+            tourn_doc = await db.tournaments.find_one({"$or": [{"_id": tournament_id}, {"id": tournament_id}, {"slug": tournament_id}]})
+            c_rounds = tourn_doc.get("custom_rounds") or [] if tourn_doc else []
+            r_label = f"Round {next_round_num}"
+            if next_round_num <= len(c_rounds):
+                r_label = c_rounds[next_round_num - 1]
+            else:
+                r_label = get_round_name(next_round_num, max(next_round_num + 1, 3))
+
+            feeder_other = (m_num + 1) if (m_num % 2 != 0) else (m_num - 1)
+            new_downstream_match = Match(
+                tournament_id=str(tournament_id),
+                round_name=r_label,
+                round_number=next_round_num,
+                match_number=next_match_num,
+                stage=r_label,
+                match_type="MATCH",
+                format="BO3" if "final" in r_label.lower() else "BO1",
+                series_format="BO3" if "final" in r_label.lower() else "BO1",
+                status="SCHEDULED",
+                roster_status="PUBLISHED",
+                team_a_id=winner_team_id if is_team_a else None,
+                team_a_name=winner_name if is_team_a else None,
+                team_a_placeholder=None if is_team_a else f"Winner of Match {feeder_other}",
+                team_b_id=winner_team_id if not is_team_a else None,
+                team_b_name=winner_name if not is_team_a else None,
+                team_b_placeholder=None if not is_team_a else f"Winner of Match {feeder_other}",
+                previous_match_ids=[completed_match.id],
+            )
+            await db.matches.insert_one(new_downstream_match.to_mongo())
+            next_match_doc = await db.matches.find_one({"_id": new_downstream_match.id})
+
     next_match = None
     if next_match_doc:
         next_match = Match.from_mongo(next_match_doc)
@@ -894,7 +926,27 @@ async def advance_bracket_match(
             next_match.status = "SCHEDULED"
             update_data["status"] = "SCHEDULED"
 
-        await db.matches.update_one({"_id": next_match_doc["_id"]}, {"$set": update_data})
+        if update_data:
+            await db.matches.update_one({"_id": next_match_doc["_id"]}, {"$set": update_data})
+        await db.matches.update_one({"_id": next_match_doc["_id"]}, {"$addToSet": {"previous_match_ids": completed_match.id}})
+
+        # Link completed match to next match
+        await db.matches.update_one(
+            {"$or": [{"_id": completed_match.id}, {"id": completed_match.id}]},
+            {"$set": {
+                "next_match_id": str(next_match_doc.get("_id", next_match_doc.get("id"))),
+                "next_match_slot": "A" if is_team_a else "B",
+                "advancement_label": f"{next_match.round_name or f'Round {next_round_num}'} Match {next_match.match_number or next_match_num} Slot {'A' if is_team_a else 'B'}"
+            }}
+        )
+
+        # If downstream match is published, notify the newly advanced winner
+        if getattr(next_match, "roster_status", "PUBLISHED") in ["PUBLISHED", "UPDATED"]:
+            try:
+                from app.services.match_notification_service import notify_roster_published
+                await notify_roster_published(next_match.id, db)
+            except Exception as e:
+                print(f"[Advanced Team Notification Warning]: {e}")
 
         # Synchronize bracket_rounds if stored on tournament
         try:

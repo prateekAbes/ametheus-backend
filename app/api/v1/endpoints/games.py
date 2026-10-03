@@ -63,8 +63,8 @@ def serialize_game_doc(g: dict, teams_count: int = 0) -> GameResponse:
         slug=g["slug"],
         name=g["name"],
         category=g.get("category", "pc"),
-        platform=g["platform"],
-        tag=g["tag"],
+        platform=g.get("platform", "PC"),
+        tag=g.get("tag", "ESPORTS"),
         is_team_game=g.get("is_team_game", True),
         min_team_size=g.get("min_team_size", 1),
         max_team_size=g.get("max_team_size", 5),
@@ -87,16 +87,25 @@ def serialize_game_doc(g: dict, teams_count: int = 0) -> GameResponse:
         hero_media_enabled=g.get("hero_media_enabled", True),
         gallery=g.get("gallery", []),
         teams_count=teams_count,
+        genre_id=g.get("genre_id"),
+        genre_name=g.get("genre_name"),
     )
 
 @router.get("", response_model=List[GameResponse])
 async def list_games(
     status: Optional[str] = Query(None, description="Filter games by status e.g. ACTIVE, COMING_SOON"),
+    genre_id: Optional[str] = Query(None, description="Filter games by genre ID or slug"),
+    category: Optional[str] = Query(None, description="Filter games by category"),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     query = {"is_dummy": {"$ne": True}}
     if status:
         query["status"] = status.upper()
+    if genre_id:
+        query["$or"] = [{"genre_id": genre_id}, {"genre_name": genre_id}, {"category": genre_id}]
+    elif category:
+        c_norm = normalize_category_slug(category)
+        query["$or"] = [{"category": c_norm}, {"genre_name": category}, {"genre_id": category}]
     cursor = db.games.find(query)
     games_docs = await cursor.to_list(length=100)
     
@@ -137,10 +146,18 @@ async def create_game(
             detail=f"Game with slug '{payload.slug}' already exists",
         )
 
+    g_name = payload.genre_name
+    if payload.genre_id and not g_name:
+        genre_doc = await db.genres.find_one({"$or": [{"_id": payload.genre_id}, {"id": payload.genre_id}, {"slug": payload.genre_id}]})
+        if genre_doc:
+            g_name = genre_doc.get("name")
+
     game = Game(
         slug=payload.slug,
         name=payload.name,
         category=normalize_category_slug(payload.category),
+        genre_id=payload.genre_id,
+        genre_name=g_name,
         platform=payload.platform,
         tag=payload.tag,
         is_team_game=payload.is_team_game,
@@ -193,6 +210,10 @@ async def update_game(
     update_data = {k: v for k, v in payload.model_dump(exclude_unset=True).items() if v is not None}
     if "category" in update_data:
         update_data["category"] = normalize_category_slug(update_data["category"])
+    if "genre_id" in update_data and not update_data.get("genre_name"):
+        genre_doc = await db.genres.find_one({"$or": [{"_id": update_data["genre_id"]}, {"id": update_data["genre_id"]}, {"slug": update_data["genre_id"]}]})
+        if genre_doc:
+            update_data["genre_name"] = genre_doc.get("name")
     if update_data:
         await db.games.update_one({"_id": game["_id"]}, {"$set": update_data})
 

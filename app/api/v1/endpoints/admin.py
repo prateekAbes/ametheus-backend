@@ -19,6 +19,7 @@ from app.schemas import (
     AdminMatchPairRequest,
     AdminMatchCreatePayload,
     AdminMatchUpdatePayload,
+    AdminPublishRosterPayload,
     AdminMarkMatchLivePayload,
     AdminCompleteMatchPayload,
     AdminMatchScheduleUpdate,
@@ -1486,6 +1487,20 @@ async def pair_match_teams(
     if not tourn:
         raise HTTPException(status_code=404, detail="Tournament not found")
 
+    t_status = str(tourn.get("status") or "").upper()
+    t_reg_status = str(tourn.get("registration_status") or "").upper()
+    is_closed = (
+        t_reg_status == "CLOSED"
+        or t_status == "REGISTRATION_CLOSED"
+        or bool(tourn.get("is_registration_closed"))
+        or t_status in ["COMPLETED", "IN_PROGRESS"]
+    )
+    if not is_closed:
+        raise HTTPException(
+            status_code=400,
+            detail="Match creation is only allowed for tournaments whose registration is CLOSED. Please close registration before pairing matches.",
+        )
+
     tid = str(tourn.get("_id", tourn.get("id")))
 
     team_a = await db.teams.find_one({"$or": [{"_id": payload.team_a_id}, {"id": payload.team_a_id}]})
@@ -1796,6 +1811,43 @@ async def close_tournament_registration_admin(
     return {
         "status": "success",
         "message": f'Tournament "{tourn.get("title")}" registration is now CLOSED. It is now active in Live Matches!',
+    }
+
+@router.post("/tournaments/{id}/reopen-registration")
+async def reopen_tournament_registration_admin(
+    id: str,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Requirement 22: Admin reopens registration for a tournament.
+    Tournament status becomes REGISTRATION_OPEN, allowing new contenders/teams to register.
+    """
+    tourn = await db.tournaments.find_one({"$or": [{"_id": id}, {"id": id}, {"slug": id}]})
+    if not tourn:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+
+    await db.tournaments.update_one(
+        {"_id": tourn["_id"]},
+        {"$set": {
+            "status": "REGISTRATION_OPEN",
+            "registration_status": "OPEN",
+            "is_registration_closed": False,
+        }}
+    )
+
+    await record_audit_log(
+        db=db,
+        operator=admin_user.username,
+        role=admin_user.role,
+        action="REOPEN_REGISTRATION",
+        target=f"Tournament {tourn.get('title')}",
+        details="Registration reopened by admin. Contenders can register again.",
+    )
+
+    return {
+        "status": "success",
+        "message": f'Tournament "{tourn.get("title")}" registration has been REOPENED. Contenders can register again!',
     }
 
 @router.get("/tournaments/{id}/registered-rosters")
@@ -2549,6 +2601,20 @@ async def create_match_admin(
     if not tourn:
         raise HTTPException(status_code=404, detail="Tournament not found")
 
+    t_status = str(tourn.get("status") or "").upper()
+    t_reg_status = str(tourn.get("registration_status") or "").upper()
+    is_closed = (
+        t_reg_status == "CLOSED"
+        or t_status == "REGISTRATION_CLOSED"
+        or bool(tourn.get("is_registration_closed"))
+        or t_status in ["COMPLETED", "IN_PROGRESS"]
+    )
+    if not is_closed:
+        raise HTTPException(
+            status_code=400,
+            detail="Match creation is only allowed for tournaments whose registration is CLOSED. Please close registration before creating matches.",
+        )
+
     tid = str(tourn.get("_id", tourn.get("id")))
 
     # Resolve Team A
@@ -2635,6 +2701,7 @@ async def create_match_admin(
         scheduled_at=scheduled_at_dt,
         scheduled_time=scheduled_time_str,
         scheduled_date=payload.scheduled_date,
+        roster_status=(payload.roster_status or "PUBLISHED").upper(),
         live_link=payload.youtube_live_url,
         youtube_live_url=payload.youtube_live_url,
         status=payload.status or "SCHEDULED",
@@ -2661,13 +2728,20 @@ async def create_match_admin(
     )
     await db.matches.insert_one(match.to_mongo())
 
+    if match.roster_status == "PUBLISHED":
+        try:
+            from app.services.match_notification_service import notify_roster_published
+            await notify_roster_published(match.id, db)
+        except Exception as e:
+            print(f"[Roster Publication Notification Warning]: {e}")
+
     await record_audit_log(
         db=db,
         operator=admin_user.username,
         role=admin_user.role,
         action="CREATE_MATCH",
         target=f"Match {match.id} ({name_a} vs {name_b})",
-        details=f"Round: {round_name} | Series: {series_fmt} | Time: {scheduled_time_str}",
+        details=f"Round: {round_name} | Series: {series_fmt} | Status: {match.roster_status}",
     )
 
     return {
@@ -2751,6 +2825,8 @@ async def update_match_details_admin(
         update_fields["scheduled_time"] = payload.scheduled_time
     if payload.scheduled_date is not None:
         update_fields["scheduled_date"] = payload.scheduled_date
+    if payload.roster_status is not None:
+        update_fields["roster_status"] = payload.roster_status.upper()
     if payload.status is not None:
         update_fields["status"] = payload.status
     if payload.score_a is not None:
@@ -2771,7 +2847,32 @@ async def update_match_details_admin(
             pass
 
     if update_fields:
+        old_roster_status = match.get("roster_status", "PUBLISHED")
+        new_roster_status = update_fields.get("roster_status", old_roster_status)
+
         await db.matches.update_one({"_id": match["_id"]}, {"$set": update_fields})
+
+        # Notification handling (Sections 34, 35, 37, 39)
+        if old_roster_status == "DRAFT" and new_roster_status == "PUBLISHED":
+            try:
+                from app.services.match_notification_service import notify_roster_published
+                await notify_roster_published(id, db, force=True)
+            except Exception as e:
+                print(f"[Roster Publication on Update Warning]: {e}")
+        elif old_roster_status in ["PUBLISHED", "UPDATED"] and (
+            "team_a_id" in update_fields or "team_b_id" in update_fields or
+            "scheduled_time" in update_fields or "scheduled_date" in update_fields or "scheduled_at" in update_fields
+        ):
+            try:
+                from app.services.match_notification_service import notify_roster_updated
+                prev_details = {
+                    "opponent": match.get("team_b_name") or "TBD",
+                    "time": match.get("scheduled_time") or "TBD",
+                }
+                await notify_roster_updated(id, prev_details, db)
+            except Exception as e:
+                print(f"[Roster Update Notification Warning]: {e}")
+
         if "scheduled_time" in update_fields or "scheduled_at" in update_fields:
             try:
                 from app.services.match_notification_service import invalidate_reminders_on_schedule_change
@@ -3805,6 +3906,230 @@ async def revert_match_advancement_endpoint(
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     return await revert_match_advancement(match_id, db)
+
+
+@router.post("/matches/{id}/publish-roster")
+async def publish_match_roster_endpoint(
+    id: str,
+    payload: Optional[AdminPublishRosterPayload] = None,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Sections 38 & 39:
+    Admin finalizes and publishes a match roster.
+    Sets roster_status = 'PUBLISHED', makes it available to live matches,
+    and notifies affected Team Leaders via in-app notification & branded email.
+    """
+    from app.services.match_notification_service import notify_roster_published
+    match = await db.matches.find_one({"$or": [{"_id": id}, {"id": id}]})
+    if not match:
+        raise HTTPException(status_code=404, detail="Match not found")
+
+    await db.matches.update_one(
+        {"_id": match["_id"]},
+        {"$set": {"roster_status": "PUBLISHED"}}
+    )
+
+    result = await notify_roster_published(id, db, force=True)
+
+    await record_audit_log(
+        db=db,
+        operator=admin_user.username,
+        role=admin_user.role,
+        action="PUBLISH_ROSTER",
+        target=f"Match {id}",
+        details=f"Notified {result.get('notified_count', 0)} captains",
+    )
+
+    return {
+        "status": "success",
+        "message": f"Roster published and {result.get('notified_count', 0)} team leaders notified.",
+        "match_id": id,
+        "roster_status": "PUBLISHED",
+        "notified_count": result.get("notified_count", 0),
+    }
+
+
+@router.post("/tournaments/{tournament_id}/publish-all-rosters")
+async def publish_all_tournament_rosters_endpoint(
+    tournament_id: str,
+    round_name: Optional[str] = None,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Sections 38 & 39:
+    Batch publishes all draft match rosters for a given tournament or round.
+    """
+    from app.services.match_notification_service import notify_roster_published
+    tourn = await db.tournaments.find_one({"$or": [{"_id": tournament_id}, {"id": tournament_id}, {"slug": tournament_id}]})
+    if not tourn:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+    tid = str(tourn.get("_id", tourn.get("id")))
+
+    q: Dict[str, Any] = {
+        "$or": [{"tournament_id": tid}, {"tournament_id": tourn.get("slug")}],
+        "roster_status": "DRAFT",
+    }
+    if round_name and round_name != "ALL":
+        q["$or"] = [
+            {"round_name": round_name},
+            {"stage": round_name},
+        ]
+        q["tournament_id"] = {"$in": [tid, tourn.get("slug")]}
+
+    cursor = db.matches.find(q)
+    matches = await cursor.to_list(length=100)
+    published_count = 0
+    notified_total = 0
+
+    for m in matches:
+        mid = str(m.get("_id", m.get("id")))
+        await db.matches.update_one({"_id": m["_id"]}, {"$set": {"roster_status": "PUBLISHED"}})
+        res = await notify_roster_published(mid, db, force=True)
+        published_count += 1
+        notified_total += res.get("notified_count", 0)
+
+    await record_audit_log(
+        db=db,
+        operator=admin_user.username,
+        role=admin_user.role,
+        action="PUBLISH_ALL_ROSTERS",
+        target=f"Tournament {tid}",
+        details=f"Published {published_count} matches, notified {notified_total} leaders",
+    )
+
+    return {
+        "status": "success",
+        "message": f"Successfully published {published_count} match rosters! Delivered {notified_total} notifications.",
+        "published_matches": published_count,
+        "notified_leaders": notified_total,
+    }
+
+
+@router.get("/tournaments/{tournament_id}/rounds-rosters")
+async def get_tournament_rounds_rosters(
+    tournament_id: str,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Sections 26, 27, 38, 39:
+    Admin Roster & Match Formation Engine endpoint.
+    Returns:
+    - Tournament details
+    - Registered rosters (confirmed teams/solo entrants)
+    - All matches grouped by round
+    - For each match: participants, order, schedule, draft/published status, and advancement links
+    """
+    from bson import ObjectId
+    t_query = {"$or": [{"id": tournament_id}, {"_id": tournament_id}, {"slug": tournament_id}]}
+    if ObjectId.is_valid(tournament_id):
+        t_query["$or"].append({"_id": ObjectId(tournament_id)})
+    tourn = await db.tournaments.find_one(t_query)
+    if not tourn:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+
+    tid = str(tourn.get("_id", tourn.get("id")))
+    tslug = tourn.get("slug")
+
+    # 1. Fetch all confirmed registered rosters for this tournament
+    reg_cursor = db.tournament_registrations.find({
+        "$or": [{"tournament_id": tid}, {"tournament_id": tslug}],
+        "payment_status": {"$nin": ["REJECTED", "CANCELLED", "REFUNDED"]},
+    })
+    regs = await reg_cursor.to_list(length=250)
+
+    registered_teams = []
+    registered_ids = set()
+    for r in regs:
+        team_id = r.get("team_id")
+        user_id = r.get("player_id") or r.get("user_id") or r.get("captain_id")
+        if team_id:
+            registered_ids.add(str(team_id))
+            t_doc = await db.teams.find_one({"$or": [{"_id": team_id}, {"id": team_id}]})
+            if t_doc:
+                cap_user = await db.users.find_one({"$or": [{"_id": t_doc.get("captain_id")}, {"id": t_doc.get("captain_id")}]}) if t_doc.get("captain_id") else None
+                registered_teams.append({
+                    "id": str(t_doc.get("_id", t_doc.get("id"))),
+                    "name": t_doc.get("name"),
+                    "tag": t_doc.get("tag", "TEAM"),
+                    "captain_name": (cap_user.get("full_name") or cap_user.get("username")) if cap_user else (t_doc.get("captain_handle") or "Captain"),
+                    "captain_handle": cap_user.get("in_game_name") or t_doc.get("captain_handle") or "Captain",
+                    "member_count": len(t_doc.get("members") or []),
+                    "logo_url": t_doc.get("logo_url"),
+                })
+        elif user_id:
+            registered_ids.add(str(user_id))
+            u_doc = await db.users.find_one({"$or": [{"_id": user_id}, {"id": user_id}]})
+            if u_doc:
+                registered_teams.append({
+                    "id": str(u_doc.get("_id", u_doc.get("id"))),
+                    "name": u_doc.get("username"),
+                    "tag": "SOLO",
+                    "captain_name": u_doc.get("full_name") or u_doc.get("username"),
+                    "captain_handle": u_doc.get("in_game_name") or u_doc.get("username"),
+                    "member_count": 1,
+                    "logo_url": u_doc.get("avatar_url"),
+                })
+
+    # 2. Fetch all matches for this tournament
+    m_cursor = db.matches.find({
+        "$or": [{"tournament_id": tid}, {"tournament_id": tslug}]
+    }).sort([("round_number", 1), ("match_number", 1), ("order", 1)])
+    raw_matches = await m_cursor.to_list(length=200)
+
+    paired_team_ids = set()
+    rounds_map: Dict[str, Any] = {}
+
+    for m_doc in raw_matches:
+        m = Match.from_mongo(m_doc)
+        r_num = m.round_number or 1
+        r_name = m.round_name or m.stage or f"Round {r_num}"
+
+        if m.team_a_id:
+            paired_team_ids.add(str(m.team_a_id))
+        if m.team_b_id:
+            paired_team_ids.add(str(m.team_b_id))
+        for tid_extra in (m.team_ids or []):
+            paired_team_ids.add(str(tid_extra))
+
+        if r_name not in rounds_map:
+            rounds_map[r_name] = {
+                "round_number": r_num,
+                "round_name": r_name,
+                "matches": [],
+            }
+
+        rounds_map[r_name]["matches"].append(m.model_dump())
+
+    # Build rounds array sorted by round_number
+    rounds_list = sorted(list(rounds_map.values()), key=lambda x: x["round_number"])
+
+    # Unpaired registered teams
+    unpaired_teams = [t for t in registered_teams if t["id"] not in paired_team_ids]
+
+    return {
+        "status": "success",
+        "tournament": {
+            "id": tid,
+            "title": tourn.get("title", "Tournament"),
+            "slug": tslug,
+            "format": tourn.get("match_format") or tourn.get("format", "Single Elimination"),
+            "status": tourn.get("status", "UPCOMING"),
+            "registration_status": tourn.get("registration_status", "OPEN"),
+            "live_stream_url": tourn.get("live_stream_url"),
+            "community_platform": tourn.get("community_platform"),
+            "community_link": tourn.get("community_link"),
+            "server_region": tourn.get("server_region", "AWS Mumbai (ap-south-1)"),
+            "custom_rounds": tourn.get("custom_rounds") or [],
+        },
+        "registered_teams": registered_teams,
+        "unpaired_teams": unpaired_teams,
+        "rounds": rounds_list,
+        "total_matches": len(raw_matches),
+    }
 
 
 @router.patch("/tournaments/{tournament_id}/stream")

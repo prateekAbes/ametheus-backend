@@ -272,6 +272,319 @@ async def notify_join_info_updated(
                 title=title,
                 message=message,
                 notification_type="MATCH",
-                link=f"/matches?match_id={match.id}",
+                link=f"/matches/{match.id}",
                 metadata_json=f'{{"tournament_id": "{match.tournament_id}", "match_id": "{match.id}", "action": "JOIN_INFO_UPDATED"}}',
             )
+
+
+async def _resolve_captain_contact(
+    contender_id: Optional[str],
+    contender_name: Optional[str],
+    db: AsyncIOMotorDatabase
+) -> Optional[Dict[str, Any]]:
+    """
+    Resolves the team leader / captain contact information (user_id, email, display name, team name).
+    """
+    if not contender_id and not contender_name:
+        return None
+
+    from bson import ObjectId
+
+    # 1. Try resolving as Team
+    team_query = []
+    if contender_id:
+        team_query.extend([{"_id": contender_id}, {"id": contender_id}])
+        if ObjectId.is_valid(contender_id):
+            team_query.append({"_id": ObjectId(contender_id)})
+    if contender_name:
+        team_query.append({"name": contender_name})
+
+    team = await db.teams.find_one({"$or": team_query}) if team_query else None
+    if team:
+        captain_id = team.get("captain_id")
+        user = None
+        if captain_id:
+            u_query = [{"_id": captain_id}, {"id": captain_id}]
+            if ObjectId.is_valid(captain_id):
+                u_query.append({"_id": ObjectId(captain_id)})
+            user = await db.users.find_one({"$or": u_query})
+
+        email = user.get("email") if user else None
+        leader_name = (user.get("full_name") or user.get("username")) if user else "Captain"
+        return {
+            "user_id": str(captain_id or user.get("_id", "")) if (captain_id or user) else None,
+            "email": email,
+            "leader_name": leader_name,
+            "team_name": team.get("name", contender_name or "Team"),
+        }
+
+    # 2. Try resolving as Solo Contender (User)
+    user_query = []
+    if contender_id:
+        user_query.extend([{"_id": contender_id}, {"id": contender_id}])
+        if ObjectId.is_valid(contender_id):
+            user_query.append({"_id": ObjectId(contender_id)})
+    if contender_name:
+        user_query.append({"username": contender_name})
+
+    user = await db.users.find_one({"$or": user_query}) if user_query else None
+    if user:
+        return {
+            "user_id": str(user.get("_id", user.get("id"))),
+            "email": user.get("email"),
+            "leader_name": user.get("full_name") or user.get("username") or "Player",
+            "team_name": user.get("username") or contender_name or "Solo Contender",
+        }
+
+    return None
+
+
+async def notify_roster_published(
+    match_id: str,
+    db: AsyncIOMotorDatabase,
+    force: bool = False
+) -> Dict[str, Any]:
+    """
+    Sections 34, 35, 36, 38, 39:
+    Sends in-app notifications and branded emails to affected Team Leaders upon roster publication.
+    Enforces deduplication: will not spam if captain has already been notified for this match unless forced.
+    """
+    from app.services.email_service import send_match_roster_notification_email
+
+    match_doc = await db.matches.find_one({"$or": [{"_id": match_id}, {"id": match_id}]})
+    if not match_doc:
+        return {"status": "error", "message": "Match not found", "notified_count": 0}
+
+    match = Match.from_mongo(match_doc)
+    tourn = await db.tournaments.find_one({"$or": [{"_id": match.tournament_id}, {"id": match.tournament_id}, {"slug": match.tournament_id}]})
+    tourn_title = tourn.get("title", "Ametheus Championship") if tourn else "Ametheus Championship"
+    game_name = tourn.get("game_name") or (tourn.get("game", {})).get("name") or "Esports Match"
+    community_plat = tourn.get("community_platform") if tourn else None
+    community_link = tourn.get("community_link") if tourn else None
+
+    # Resolve date and time
+    date_str = match.scheduled_date or "Scheduled Date"
+    time_str = match.scheduled_time or "TBD"
+    if match.scheduled_at:
+        try:
+            if isinstance(match.scheduled_at, datetime):
+                date_str = match.scheduled_at.strftime("%b %d, %Y")
+                time_str = match.scheduled_at.strftime("%I:%M %p UTC")
+        except Exception:
+            pass
+
+    round_name = match.round_name or match.stage or f"Round {match.round_number}"
+
+    # Resolve Contender Leaders
+    already_notified = set(match.notified_captains or [])
+    notified_this_run = []
+
+    # Handle Team A and Team B
+    contacts_to_notify = []
+    contact_a = await _resolve_captain_contact(match.team_a_id, match.team_a_name, db)
+    contact_b = await _resolve_captain_contact(match.team_b_id, match.team_b_name, db)
+
+    team_a_display = (contact_a.get("team_name") if contact_a else match.team_a_name) or "Team A"
+    team_b_display = (contact_b.get("team_name") if contact_b else match.team_b_name) or "Team B"
+
+    if contact_a:
+        contacts_to_notify.append({
+            "contact": contact_a,
+            "my_team": team_a_display,
+            "opponent": team_b_display,
+        })
+    if contact_b:
+        contacts_to_notify.append({
+            "contact": contact_b,
+            "my_team": team_b_display,
+            "opponent": team_a_display,
+        })
+
+    # For multi-team / Battle Royale lobbies
+    if match.teams and isinstance(match.teams, list):
+        for t_info in match.teams:
+            tid = t_info.get("id") or t_info.get("_id")
+            tname = t_info.get("name")
+            c = await _resolve_captain_contact(tid, tname, db)
+            if c:
+                contacts_to_notify.append({
+                    "contact": c,
+                    "my_team": c.get("team_name", tname or "Team"),
+                    "opponent": "Battle Royale Lobby",
+                })
+
+    for item in contacts_to_notify:
+        c = item["contact"]
+        uid = c.get("user_id")
+        email = c.get("email")
+        lead_name = c.get("leader_name", "Team Leader")
+        my_team = item["my_team"]
+        opp_team = item["opponent"]
+
+        identifier = uid or email
+        if not identifier:
+            continue
+
+        if identifier in already_notified and not force:
+            continue
+
+        # 1. In-App Notification
+        if uid:
+            in_app_msg = f"Tournament: {tourn_title}\nGame: {game_name}\nRound: {round_name}\nMatch: Match {match.match_number}\nYour Team: {my_team}\nOpponent: {opp_team}\nDate: {date_str}\nTime: {time_str}"
+            if community_link:
+                in_app_msg += f"\nTournament Community: {community_link}"
+
+            await create_notification(
+                db=db,
+                user_id=uid,
+                title="Your Ametheus match has been scheduled",
+                message=in_app_msg,
+                notification_type="MATCH",
+                link=f"/matches/{match.id}",
+                metadata_json=f'{{"tournament_id": "{match.tournament_id}", "match_id": "{match.id}", "round": "{round_name}", "action": "ROSTER_PUBLISHED"}}',
+            )
+
+        # 2. Branded Email Notification
+        if email:
+            try:
+                await send_match_roster_notification_email(
+                    to_email=email,
+                    leader_name=lead_name,
+                    tournament_title=tourn_title,
+                    game_name=game_name,
+                    round_name=round_name,
+                    match_number=match.match_number,
+                    team_name=my_team,
+                    opponent_name=opp_team,
+                    scheduled_date=date_str,
+                    scheduled_time=time_str,
+                    match_id=match.id,
+                    community_platform=community_plat,
+                    community_link=community_link,
+                    is_update=False,
+                )
+            except Exception as e:
+                print(f"[Roster Notification Email Warning]: {e}")
+
+        notified_this_run.append(identifier)
+
+    if notified_this_run:
+        await db.matches.update_one(
+            {"_id": match_doc["_id"]},
+            {
+                "$set": {"roster_status": "PUBLISHED"},
+                "$addToSet": {"notified_captains": {"$each": notified_this_run}}
+            }
+        )
+
+    await ws_manager.broadcast({
+        "type": "ROSTER_PUBLISHED",
+        "match_id": match.id,
+        "tournament_id": match.tournament_id,
+        "round_name": round_name,
+    })
+
+    return {
+        "status": "success",
+        "message": f"Roster published and {len(notified_this_run)} team leaders notified.",
+        "notified_count": len(notified_this_run),
+    }
+
+
+async def notify_roster_updated(
+    match_id: str,
+    previous_details: Dict[str, str],
+    db: AsyncIOMotorDatabase
+) -> Dict[str, Any]:
+    """
+    Section 37:
+    Sends updated notifications to affected Team Leaders when match parameters (opponent, date, time) change.
+    """
+    from app.services.email_service import send_match_roster_notification_email
+
+    match_doc = await db.matches.find_one({"$or": [{"_id": match_id}, {"id": match_id}]})
+    if not match_doc:
+        return {"status": "error", "message": "Match not found", "notified_count": 0}
+
+    match = Match.from_mongo(match_doc)
+    tourn = await db.tournaments.find_one({"$or": [{"_id": match.tournament_id}, {"id": match.tournament_id}, {"slug": match.tournament_id}]})
+    tourn_title = tourn.get("title", "Ametheus Championship") if tourn else "Ametheus Championship"
+    game_name = tourn.get("game_name") or (tourn.get("game", {})).get("name") or "Esports Match"
+    community_plat = tourn.get("community_platform") if tourn else None
+    community_link = tourn.get("community_link") if tourn else None
+
+    date_str = match.scheduled_date or "Scheduled Date"
+    time_str = match.scheduled_time or "TBD"
+    round_name = match.round_name or match.stage or f"Round {match.round_number}"
+
+    contact_a = await _resolve_captain_contact(match.team_a_id, match.team_a_name, db)
+    contact_b = await _resolve_captain_contact(match.team_b_id, match.team_b_name, db)
+
+    team_a_display = (contact_a.get("team_name") if contact_a else match.team_a_name) or "Team A"
+    team_b_display = (contact_b.get("team_name") if contact_b else match.team_b_name) or "Team B"
+
+    items = []
+    if contact_a:
+        items.append({"contact": contact_a, "my_team": team_a_display, "opponent": team_b_display})
+    if contact_b:
+        items.append({"contact": contact_b, "my_team": team_b_display, "opponent": team_a_display})
+
+    sent_count = 0
+    for it in items:
+        c = it["contact"]
+        uid = c.get("user_id")
+        email = c.get("email")
+        lead_name = c.get("leader_name", "Team Leader")
+        my_team = it["my_team"]
+        opp_team = it["opponent"]
+
+        if uid:
+            in_app_msg = f"Your match in {tourn_title} has been updated.\nRound: {round_name} • Match {match.match_number}\nYour Team: {my_team}\nOpponent: {opp_team}\nDate: {date_str} • Time: {time_str}"
+            await create_notification(
+                db=db,
+                user_id=uid,
+                title="MATCH UPDATED: Your match has been rescheduled/updated",
+                message=in_app_msg,
+                notification_type="MATCH",
+                link=f"/matches/{match.id}",
+                metadata_json=f'{{"tournament_id": "{match.tournament_id}", "match_id": "{match.id}", "action": "ROSTER_UPDATED"}}',
+            )
+
+        if email:
+            try:
+                await send_match_roster_notification_email(
+                    to_email=email,
+                    leader_name=lead_name,
+                    tournament_title=tourn_title,
+                    game_name=game_name,
+                    round_name=round_name,
+                    match_number=match.match_number,
+                    team_name=my_team,
+                    opponent_name=opp_team,
+                    scheduled_date=date_str,
+                    scheduled_time=time_str,
+                    match_id=match.id,
+                    community_platform=community_plat,
+                    community_link=community_link,
+                    is_update=True,
+                    previous_details=previous_details,
+                )
+            except Exception as e:
+                print(f"[Roster Update Email Warning]: {e}")
+
+        sent_count += 1
+
+    await db.matches.update_one(
+        {"_id": match_doc["_id"]},
+        {"$set": {"roster_status": "UPDATED"}}
+    )
+
+    await ws_manager.broadcast({
+        "type": "ROSTER_UPDATED",
+        "match_id": match.id,
+        "tournament_id": match.tournament_id,
+        "round_name": round_name,
+    })
+
+    return {"status": "success", "message": f"Roster updates delivered to {sent_count} leaders.", "notified_count": sent_count}
+

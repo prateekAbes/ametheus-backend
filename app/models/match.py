@@ -18,6 +18,8 @@ class Match(BaseModel):
     series_format: str = "BO1"  # Strictly "BO1" or "BO3" (BO5 removed)
     scheduled_at: Optional[datetime] = None  # Authoritative ISO UTC timestamp
     scheduled_time: str = "TBD"
+    scheduled_date: Optional[str] = None
+    roster_status: str = "PUBLISHED"  # DRAFT, PUBLISHED, UPDATED, LIVE, COMPLETED, CANCELLED
     live_link: Optional[str] = None  # Live stream URL (YouTube, Twitch, Kick, etc.)
     youtube_live_url: Optional[str] = None  # Dedicated YouTube Live URL
     order: int = 0
@@ -37,6 +39,8 @@ class Match(BaseModel):
     next_match_id: Optional[str] = None  # ID of downstream match to advance winner to
     next_match_slot: Optional[str] = None  # "A" or "B"
     advancement_label: Optional[str] = None  # Human-readable destination label (e.g. "Round 2 Match 1 Slot A")
+    previous_match_ids: list[str] = Field(default_factory=list)
+    notified_captains: list[str] = Field(default_factory=list)
     check_in_status: dict[str, bool] = Field(default_factory=lambda: {"team_a": False, "team_b": False})
     teams: list[dict] = Field(default_factory=list)  # For Battle Royale / multi-team matches
     team_ids: list[str] = Field(default_factory=list)  # IDs of participating teams in this match lobby
@@ -103,6 +107,12 @@ class Match(BaseModel):
             d["teams"] = []
         if "team_ids" not in d or d["team_ids"] is None:
             d["team_ids"] = []
+        if "roster_status" not in d or not d["roster_status"]:
+            d["roster_status"] = "PUBLISHED"
+        if "notified_captains" not in d or d["notified_captains"] is None:
+            d["notified_captains"] = []
+        if "previous_match_ids" not in d or d["previous_match_ids"] is None:
+            d["previous_match_ids"] = []
 
         return cls(**d)
 

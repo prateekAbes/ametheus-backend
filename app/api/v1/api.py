@@ -16,11 +16,17 @@ from app.api.v1.endpoints import (
     support,
     regulations,
     email_settings,
+    genres,
+    reviews,
 )
 
 api_router = APIRouter()
 api_router.include_router(auth.router, prefix="/auth", tags=["Authentication & Users"])
 api_router.include_router(games.router, prefix="/games", tags=["Games"])
+api_router.include_router(genres.router, prefix="/genres", tags=["Genres"])
+api_router.include_router(genres.admin_router, prefix="/admin/genres", tags=["Admin Genres"])
+api_router.include_router(reviews.router, prefix="/reviews", tags=["Reviews"])
+api_router.include_router(reviews.admin_router, prefix="/admin/reviews", tags=["Admin Reviews"])
 api_router.include_router(teams.router, prefix="/teams", tags=["Teams"])
 api_router.include_router(payments.router, prefix="/payments", tags=["Payments"])
 api_router.include_router(upi_accounts.router, prefix="/admin/upi-accounts", tags=["Admin UPI Accounts"])

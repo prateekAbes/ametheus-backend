@@ -28,6 +28,8 @@ class GameResponse(BaseModel):
     slug: str
     name: str
     category: str
+    genre_id: Optional[str] = None
+    genre_name: Optional[str] = None
     platform: str
     tag: str
     is_team_game: bool
@@ -58,6 +60,8 @@ class GameCreate(BaseModel):
     slug: str
     name: str
     category: str
+    genre_id: Optional[str] = None
+    genre_name: Optional[str] = None
     platform: str
     tag: str
     is_team_game: bool = True
@@ -85,6 +89,8 @@ class GameCreate(BaseModel):
 class GameUpdate(BaseModel):
     name: Optional[str] = None
     category: Optional[str] = None
+    genre_id: Optional[str] = None
+    genre_name: Optional[str] = None
     platform: Optional[str] = None
     tag: Optional[str] = None
     is_team_game: Optional[bool] = None
@@ -402,6 +408,11 @@ class MatchResponse(BaseModel):
     youtube_live_url: Optional[str] = None
     order: Optional[int] = 0
     status: str
+    roster_status: Optional[str] = "PUBLISHED"
+    round_name: Optional[str] = None
+    round_number: Optional[int] = 1
+    match_number: Optional[int] = 1
+    scheduled_date: Optional[str] = None
     server_region: str
     lobby_code: Optional[str] = None
     lobby_password: Optional[str] = None
@@ -448,6 +459,7 @@ class AdminMatchCreatePayload(BaseModel):
     scheduled_time: Optional[str] = None
     scheduled_at: Optional[str] = None
     status: Optional[str] = "SCHEDULED"
+    roster_status: Optional[str] = "PUBLISHED"  # "DRAFT", "PUBLISHED"
     score_a: Optional[int] = None
     score_b: Optional[int] = None
     winner_team_id: Optional[str] = None
@@ -478,6 +490,7 @@ class AdminMatchUpdatePayload(BaseModel):
     scheduled_time: Optional[str] = None
     scheduled_at: Optional[str] = None
     status: Optional[str] = None
+    roster_status: Optional[str] = None  # "DRAFT", "PUBLISHED", "UPDATED", "CANCELLED"
     score_a: Optional[int] = None
     score_b: Optional[int] = None
     winner_team_id: Optional[str] = None
@@ -490,6 +503,10 @@ class AdminMatchUpdatePayload(BaseModel):
     join_info_enabled: Optional[bool] = None
     join_info: Optional[Dict[str, str]] = None
     match_message: Optional[str] = None
+
+class AdminPublishRosterPayload(BaseModel):
+    notify_leaders: bool = True
+    match_notes: Optional[str] = None
 
 class AdminMatchSetupItem(BaseModel):
     id: Optional[str] = None
@@ -665,14 +682,24 @@ class StageReorderPayload(BaseModel):
 class StageRoundCreate(BaseModel):
     name: str
     round_number: Optional[int] = None
+    format: Optional[str] = "SINGLE_ELIMINATION"
     series_format: Optional[str] = "BO1"
+    match_count: Optional[int] = 1
+    duration_minutes: Optional[int] = None
+    advancement_rule: Optional[str] = None
+    rules_notes: Optional[str] = None
     scheduled_date: Optional[str] = None
     scheduled_time: Optional[str] = None
 
 class StageRoundUpdate(BaseModel):
     name: Optional[str] = None
     status: Optional[str] = None
+    format: Optional[str] = None
     series_format: Optional[str] = None
+    match_count: Optional[int] = None
+    duration_minutes: Optional[int] = None
+    advancement_rule: Optional[str] = None
+    rules_notes: Optional[str] = None
     scheduled_date: Optional[str] = None
     scheduled_time: Optional[str] = None
 
@@ -706,4 +733,72 @@ class WalletAuditSummaryResponse(BaseModel):
     total_money_spent_inr: float
     total_transactions: int
     transactions: List[Dict[str, Any]]
+
+# Genre Schemas
+class GenreResponse(BaseModel):
+    id: str
+    slug: str
+    name: str
+    description: str = ""
+    banner_url: Optional[str] = None
+    icon_url: Optional[str] = None
+    rotation_interval_seconds: int = 4
+    display_order: int = 0
+    games: List[GameResponse] = []
+    games_count: int = 0
+    game_count: int = 0
+    model_config = ConfigDict(from_attributes=True)
+
+class GenreCreate(BaseModel):
+    name: str
+    slug: Optional[str] = None
+    description: Optional[str] = ""
+    banner_url: Optional[str] = None
+    icon_url: Optional[str] = None
+    rotation_interval_seconds: Optional[int] = 4
+    display_order: Optional[int] = 0
+
+class GenreUpdate(BaseModel):
+    name: Optional[str] = None
+    slug: Optional[str] = None
+    description: Optional[str] = None
+    banner_url: Optional[str] = None
+    icon_url: Optional[str] = None
+    rotation_interval_seconds: Optional[int] = None
+    display_order: Optional[int] = None
+
+# Review Schemas
+class ReviewResponse(BaseModel):
+    id: str
+    user_id: str
+    user_name: str
+    avatar_url: Optional[str] = None
+    rating: int
+    review_text: str
+    category: str = "PLATFORM"
+    status: str = "PENDING"
+    is_verified: bool = True
+    is_featured: bool = False
+    admin_notes: Optional[str] = None
+    created_at: Optional[str] = None
+    model_config = ConfigDict(from_attributes=True)
+
+class ReviewCreate(BaseModel):
+    rating: int = Field(default=5, ge=1, le=5)
+    review_text: str
+    category: Optional[str] = "PLATFORM"
+    user_name: Optional[str] = None
+    avatar_url: Optional[str] = None
+
+class ReviewStatusUpdate(BaseModel):
+    status: str  # APPROVED, FEATURED, HIDDEN, PENDING
+    admin_notes: Optional[str] = None
+
+class ReviewSummaryResponse(BaseModel):
+    average_rating: float
+    total_reviews: int
+    rating_distribution: Dict[str, int]
+    reviews: List[ReviewResponse]
+    featured_review: Optional[ReviewResponse] = None
+
 

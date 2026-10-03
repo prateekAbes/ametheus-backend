@@ -925,3 +925,207 @@ async def send_official_announcement_to_recipient(
     """
     text_body, html_body = render_official_announcement_email(subject, message, recipient_name)
     return await send_official_email(to_email, subject, text_body, html_body)
+
+
+async def send_match_roster_notification_email(
+    to_email: str,
+    leader_name: str,
+    tournament_title: str,
+    game_name: str,
+    round_name: str,
+    match_number: int,
+    team_name: str,
+    opponent_name: str,
+    scheduled_date: str,
+    scheduled_time: str,
+    match_id: str,
+    community_platform: Optional[str] = None,
+    community_link: Optional[str] = None,
+    is_update: bool = False,
+    previous_details: Optional[Dict[str, str]] = None,
+) -> Tuple[bool, Optional[str]]:
+    """
+    Sends a branded, mobile-responsive match roster notification email to a Team Leader.
+    Handles both initial assignment ('MATCH SCHEDULED') and updates ('MATCH UPDATED').
+    Complies with Sections 34, 35, 36, and 37 of the Match Engine specification.
+    """
+    to_email_clean = (to_email or "").strip().lower()
+    if not to_email_clean or "@" not in to_email_clean:
+        return False, "Recipient email is invalid or missing"
+
+    display_leader = leader_name or "Team Leader"
+    action_title = "MATCH UPDATED" if is_update else "MATCH SCHEDULED"
+    subject = f"AMETHEUS: {action_title} — {tournament_title} ({round_name})"
+
+    destination_url = f"https://ametheus.gg/matches/{match_id}"
+
+    # Build plain text body
+    text_body = f"""Ametheus
+----------------------------------------
+{action_title}
+
+Your team has been assigned a match in {tournament_title}.
+
+Tournament: {tournament_title}
+Game:       {game_name}
+Round:      {round_name}
+Match:      Match {match_number}
+Your Team:  {team_name}
+Opponent:   {opponent_name}
+Date:       {scheduled_date}
+Time:       {scheduled_time}
+"""
+
+    if is_update and previous_details:
+        text_body += f"""
+--- UPDATE DETAILS ---
+Previous: {previous_details.get('opponent', 'TBD')} @ {previous_details.get('time', 'TBD')}
+Updated:  {opponent_name} @ {scheduled_time}
+"""
+
+    text_body += f"""
+View Match Details:
+{destination_url}
+"""
+
+    if community_link:
+        text_body += f"""
+Tournament {community_platform or 'Community'} Link:
+{community_link}
+"""
+
+    text_body += """
+----------------------------------------
+AMETHEUS Esports Operations
+Competitive Integrity & Fair Play
+https://ametheus.gg
+"""
+
+    # Build HTML body
+    community_btn_html = ""
+    if community_link:
+        plat_label = (community_platform or "WhatsApp").upper()
+        community_btn_html = f"""
+        <div style="margin-top: 14px; text-align: center;">
+          <a href="{community_link}" target="_blank" style="display: inline-block; background-color: #10B981; color: #FFFFFF; padding: 10px 22px; font-family: monospace; font-size: 12px; font-weight: bold; text-transform: uppercase; text-decoration: none; border-radius: 6px; letter-spacing: 0.5px;">
+            💬 Join Tournament {plat_label} &rarr;
+          </a>
+        </div>
+        """
+
+    update_box_html = ""
+    if is_update and previous_details:
+        prev_opp = previous_details.get('opponent', 'TBD')
+        prev_time = previous_details.get('time', 'TBD')
+        update_box_html = f"""
+        <div style="background-color: #1A1A24; border: 1px solid #F59E0B; border-radius: 6px; padding: 14px 18px; margin-bottom: 20px;">
+          <p style="margin: 0 0 6px 0; font-size: 11px; text-transform: uppercase; font-weight: bold; color: #F59E0B; letter-spacing: 1px;">
+            ⚠️ What Changed:
+          </p>
+          <p style="margin: 0; font-size: 13px; line-height: 1.5; color: #E2E8F0;">
+            <strong style="color: #94A3B8;">Previous:</strong> {prev_opp} &bull; {prev_time}<br/>
+            <strong style="color: #10B981;">Updated:</strong> {opponent_name} &bull; {scheduled_time}
+          </p>
+        </div>
+        """
+
+    badge_color = "#F59E0B" if is_update else "#E56A10"
+
+    html_body = f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{subject}</title>
+</head>
+<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: #07090E; margin: 0; padding: 24px 12px; color: #F8FAFC;">
+  <table width="100%" border="0" cellspacing="0" cellpadding="0" style="max-width: 600px; margin: 0 auto; background-color: #111622; border-radius: 12px; border: 1px solid #242C3D; overflow: hidden; box-shadow: 0 8px 24px rgba(0,0,0,0.6);">
+    <!-- Header -->
+    <tr>
+      <td style="background-color: #161D2C; padding: 22px 28px; border-bottom: 2px solid {badge_color};">
+        <table width="100%" border="0" cellspacing="0" cellpadding="0">
+          <tr>
+            <td>
+              <h1 style="color: #FFFFFF; margin: 0; font-size: 20px; font-weight: 900; letter-spacing: 1.5px; text-transform: uppercase;">
+                AMETHEUS <span style="color: {badge_color};">MATCH ENGINE</span>
+              </h1>
+              <p style="color: #94A3B8; margin: 4px 0 0 0; font-size: 11px; text-transform: uppercase; letter-spacing: 2px;">
+                Official Roster Notification
+              </p>
+            </td>
+            <td align="right">
+              <span style="display: inline-block; background-color: {badge_color}; color: #07090E; padding: 4px 10px; font-family: monospace; font-size: 11px; font-weight: 900; text-transform: uppercase; border-radius: 4px; letter-spacing: 1px;">
+                {action_title}
+              </span>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+
+    <!-- Body -->
+    <tr>
+      <td style="padding: 28px 28px 20px 28px;">
+        <p style="margin: 0 0 16px 0; font-size: 14px; color: #94A3B8;">
+          Hello <strong style="color: #FFFFFF;">{display_leader}</strong>,
+        </p>
+
+        <p style="margin: 0 0 20px 0; font-size: 15px; color: #E2E8F0; line-height: 1.5;">
+          Your team <strong style="color: #FFFFFF;">{team_name}</strong> has a match confirmed in <strong style="color: {badge_color};">{tournament_title}</strong>.
+        </p>
+
+        {update_box_html}
+
+        <!-- Match Specs Table -->
+        <table width="100%" border="0" cellspacing="0" cellpadding="0" style="background-color: #0B0E16; border: 1px solid #1E2738; border-radius: 8px; margin-bottom: 24px; overflow: hidden;">
+          <tr>
+            <td style="padding: 12px 16px; border-bottom: 1px solid #1E2738; color: #64748B; font-size: 12px; font-family: monospace; text-transform: uppercase; width: 35%;">Tournament</td>
+            <td style="padding: 12px 16px; border-bottom: 1px solid #1E2738; color: #F8FAFC; font-size: 13px; font-weight: 700;">{tournament_title}</td>
+          </tr>
+          <tr>
+            <td style="padding: 12px 16px; border-bottom: 1px solid #1E2738; color: #64748B; font-size: 12px; font-family: monospace; text-transform: uppercase;">Game</td>
+            <td style="padding: 12px 16px; border-bottom: 1px solid #1E2738; color: #06B6D4; font-size: 13px; font-weight: 700; text-transform: uppercase;">{game_name}</td>
+          </tr>
+          <tr>
+            <td style="padding: 12px 16px; border-bottom: 1px solid #1E2738; color: #64748B; font-size: 12px; font-family: monospace; text-transform: uppercase;">Round &amp; Match</td>
+            <td style="padding: 12px 16px; border-bottom: 1px solid #1E2738; color: #F8FAFC; font-size: 13px; font-weight: 700;">{round_name} &bull; Match {match_number}</td>
+          </tr>
+          <tr>
+            <td style="padding: 12px 16px; border-bottom: 1px solid #1E2738; color: #64748B; font-size: 12px; font-family: monospace; text-transform: uppercase;">Your Team</td>
+            <td style="padding: 12px 16px; border-bottom: 1px solid #1E2738; color: #10B981; font-size: 13px; font-weight: 800;">{team_name}</td>
+          </tr>
+          <tr>
+            <td style="padding: 12px 16px; border-bottom: 1px solid #1E2738; color: #64748B; font-size: 12px; font-family: monospace; text-transform: uppercase;">Opponent</td>
+            <td style="padding: 12px 16px; border-bottom: 1px solid #1E2738; color: #EF4444; font-size: 13px; font-weight: 800;">{opponent_name}</td>
+          </tr>
+          <tr>
+            <td style="padding: 12px 16px; color: #64748B; font-size: 12px; font-family: monospace; text-transform: uppercase;">Date &amp; Time</td>
+            <td style="padding: 12px 16px; color: #F59E0B; font-size: 13px; font-weight: 700;">{scheduled_date} &bull; {scheduled_time}</td>
+          </tr>
+        </table>
+
+        <!-- Primary CTA Button -->
+        <div style="text-align: center; margin: 24px 0 8px 0;">
+          <a href="{destination_url}" style="display: inline-block; background-color: {badge_color}; color: #07090E; padding: 13px 32px; font-family: monospace; font-size: 13px; font-weight: 900; text-transform: uppercase; text-decoration: none; border-radius: 6px; letter-spacing: 1px; box-shadow: 0 4px 12px rgba(229,106,16,0.3);">
+            [ VIEW MATCH DETAILS &rarr; ]
+          </a>
+        </div>
+
+        {community_btn_html}
+      </td>
+    </tr>
+
+    <!-- Footer -->
+    <tr>
+      <td style="background-color: #0B0E16; padding: 20px 28px; text-align: center; border-top: 1px solid #1E2738; font-size: 11px; color: #64748B; line-height: 1.6;">
+        Competitive integrity &bull; Real-time tournament telemetry<br/>
+        &copy; 2026 AMETHEUS Esports Platform. All rights reserved.
+      </td>
+    </tr>
+  </table>
+</body>
+</html>
+"""
+
+    return await send_noreply_email(to_email_clean, subject, text_body, html_body)
+

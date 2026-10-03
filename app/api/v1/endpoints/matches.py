@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from datetime import datetime, timezone
 from pydantic import BaseModel
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -30,7 +30,7 @@ async def list_matches(
     status: Optional[str] = Query(None, description="Filter matches by status (e.g. LIVE, UPCOMING, COMPLETED)"),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
-    query = {}
+    query = {"roster_status": {"$ne": "DRAFT"}}
     if tournament_id:
         tourn = await db.tournaments.find_one({"$or": [{"_id": tournament_id}, {"id": tournament_id}, {"slug": tournament_id}]})
         if tourn:
@@ -284,11 +284,120 @@ async def create_match_dispute(
     }
 
 
+async def _resolve_public_team_roster(
+    team_id: Optional[str],
+    team_name: Optional[str],
+    db: AsyncIOMotorDatabase
+) -> Optional[Dict[str, Any]]:
+    if not team_id and not team_name:
+        return None
+    from bson import ObjectId
+    t_query = []
+    if team_id:
+        t_query.extend([{"_id": team_id}, {"id": team_id}])
+        if ObjectId.is_valid(team_id):
+            t_query.append({"_id": ObjectId(team_id)})
+    if team_name:
+        t_query.append({"name": team_name})
+
+    team = await db.teams.find_one({"$or": t_query}) if t_query else None
+    if team:
+        cap_user = None
+        cap_id = team.get("captain_id")
+        if cap_id:
+            u_query = [{"_id": cap_id}, {"id": cap_id}]
+            if ObjectId.is_valid(cap_id):
+                u_query.append({"_id": ObjectId(cap_id)})
+            cap_user = await db.users.find_one({"$or": u_query})
+
+        captain_info = {
+            "id": str(cap_id) if cap_id else None,
+            "name": (cap_user.get("full_name") or cap_user.get("username")) if cap_user else (team.get("captain_handle") or "Captain"),
+            "handle": cap_user.get("in_game_name") or team.get("captain_handle") or (cap_user.get("username") if cap_user else "Captain"),
+            "username": cap_user.get("username") if cap_user else None,
+            "avatar_url": cap_user.get("avatar_url") if cap_user else None,
+        }
+
+        members_list = []
+        raw_members = team.get("members") or []
+        for m in raw_members:
+            uid = m.get("user_id") if isinstance(m, dict) else getattr(m, "user_id", None)
+            m_user = None
+            if uid:
+                u_q = [{"_id": uid}, {"id": uid}]
+                if ObjectId.is_valid(uid):
+                    u_q.append({"_id": ObjectId(uid)})
+                m_user = await db.users.find_one({"$or": u_q})
+
+            m_name = (m_user.get("full_name") or m_user.get("username")) if m_user else (m.get("player_handle") or m.get("game_handle") or "Player")
+            m_handle = m_user.get("in_game_name") or m.get("player_handle") or m.get("game_handle") or (m_user.get("username") if m_user else "Player")
+            members_list.append({
+                "id": str(uid) if uid else None,
+                "name": m_name,
+                "handle": m_handle,
+                "role": m.get("role", "PLAYER") if isinstance(m, dict) else "PLAYER",
+                "avatar_url": m_user.get("avatar_url") if m_user else None,
+            })
+
+        return {
+            "id": str(team.get("_id", team.get("id"))),
+            "name": team.get("name"),
+            "tag": team.get("tag", "TEAM"),
+            "logo_url": team.get("logo_url"),
+            "captain": captain_info,
+            "members": members_list,
+        }
+
+    # Solo player
+    u_query = []
+    if team_id:
+        u_query.extend([{"_id": team_id}, {"id": team_id}])
+        if ObjectId.is_valid(team_id):
+            u_query.append({"_id": ObjectId(team_id)})
+    if team_name:
+        u_query.append({"username": team_name})
+
+    solo_user = await db.users.find_one({"$or": u_query}) if u_query else None
+    if solo_user:
+        solo_info = {
+            "id": str(solo_user.get("_id", solo_user.get("id"))),
+            "name": solo_user.get("full_name") or solo_user.get("username"),
+            "handle": solo_user.get("in_game_name") or solo_user.get("username"),
+            "username": solo_user.get("username"),
+            "avatar_url": solo_user.get("avatar_url"),
+        }
+        return {
+            "id": str(solo_user.get("_id", solo_user.get("id"))),
+            "name": solo_user.get("username"),
+            "tag": "SOLO",
+            "logo_url": solo_user.get("avatar_url"),
+            "captain": solo_info,
+            "members": [solo_info],
+        }
+
+    return {
+        "id": team_id,
+        "name": team_name or "TBD",
+        "tag": "TEAM",
+        "logo_url": None,
+        "captain": {"name": team_name or "TBD", "handle": "TBD"},
+        "members": [],
+    }
+
+
 @router.get("/{id}")
 async def get_match_detail(
     id: str,
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
+    """
+    Sections 29, 30, 31, 32:
+    Returns complete rich details for the Live Match detail view/page:
+    - Tournament metadata
+    - Verified roster formation (Team A & Team B captain + players)
+    - Multi-team participant rosters for Battle Royale
+    - Match journey & progression context (previous matches, next match, tournament rounds)
+    """
     from bson import ObjectId
     m_query = {"$or": [{"_id": id}, {"id": id}]}
     if ObjectId.is_valid(id):
@@ -300,22 +409,141 @@ async def get_match_detail(
 
     m = Match.from_mongo(match).model_dump()
 
-    # Inherit tournament stream url if not set on match
-    if not m.get("youtube_live_url"):
-        tourn_id = m.get("tournament_id")
-        if tourn_id:
-            t_query = {"$or": [{"id": tourn_id}, {"_id": tourn_id}, {"slug": tourn_id}]}
-            if ObjectId.is_valid(tourn_id):
-                t_query["$or"].append({"_id": ObjectId(tourn_id)})
-            tourn_doc = await db.tournaments.find_one(t_query)
-            if tourn_doc and tourn_doc.get("live_stream_url"):
-                m["youtube_live_url"] = tourn_doc.get("live_stream_url")
-                m["live_link"] = tourn_doc.get("live_stream_url")
+    # 1. Resolve Tournament Details
+    tourn_id = m.get("tournament_id")
+    tourn_doc = None
+    game_doc = None
+    if tourn_id:
+        t_query = {"$or": [{"id": tourn_id}, {"_id": tourn_id}, {"slug": tourn_id}]}
+        if ObjectId.is_valid(tourn_id):
+            t_query["$or"].append({"_id": ObjectId(tourn_id)})
+        tourn_doc = await db.tournaments.find_one(t_query)
+        if tourn_doc:
+            gid = tourn_doc.get("game_id")
+            if gid:
+                g_query = [{"_id": gid}, {"id": gid}, {"slug": gid}]
+                if ObjectId.is_valid(gid):
+                    g_query.append({"_id": ObjectId(gid)})
+                game_doc = await db.games.find_one({"$or": g_query})
 
-    # Strip sensitive join credentials from public view
+    # Inherit tournament stream url if not set on match
+    if not m.get("youtube_live_url") and tourn_doc and tourn_doc.get("live_stream_url"):
+        m["youtube_live_url"] = tourn_doc.get("live_stream_url")
+        m["live_link"] = tourn_doc.get("live_stream_url")
+
+    # 2. Resolve Rich Rosters for Team A and Team B
+    team_a_details = await _resolve_public_team_roster(m.get("team_a_id"), m.get("team_a_name"), db)
+    team_b_details = await _resolve_public_team_roster(m.get("team_b_id"), m.get("team_b_name"), db)
+
+    # 3. Resolve Multi-Team Rosters (Battle Royale)
+    teams_details = []
+    if m.get("teams") and isinstance(m.get("teams"), list):
+        for t_info in m.get("teams"):
+            tid = t_info.get("id") or t_info.get("_id")
+            tname = t_info.get("name")
+            res = await _resolve_public_team_roster(tid, tname, db)
+            if res:
+                teams_details.append(res)
+
+    # 4. Resolve Previous Matches feeding into this match
+    previous_matches = []
+    prev_ids = list(m.get("previous_match_ids") or [])
+    if not prev_ids and m.get("round_number", 1) > 1:
+        prev_r = m.get("round_number", 1) - 1
+        m_num = m.get("match_number", 1)
+        feeder_m1 = (m_num * 2) - 1
+        feeder_m2 = m_num * 2
+        prev_cursor = db.matches.find({
+            "tournament_id": m.get("tournament_id"),
+            "round_number": prev_r,
+            "match_number": {"$in": [feeder_m1, feeder_m2]}
+        })
+        async for pm in prev_cursor:
+            previous_matches.append({
+                "id": str(pm.get("_id", pm.get("id"))),
+                "round_name": pm.get("round_name") or f"Round {prev_r}",
+                "match_number": pm.get("match_number"),
+                "team_a_name": pm.get("team_a_name") or "TBD",
+                "team_b_name": pm.get("team_b_name") or "TBD",
+                "winner_team_id": pm.get("winner_team_id"),
+                "status": pm.get("status"),
+                "score_a": pm.get("score_a", 0),
+                "score_b": pm.get("score_b", 0),
+            })
+    elif prev_ids:
+        prev_cursor = db.matches.find({"_id": {"$in": prev_ids}})
+        async for pm in prev_cursor:
+            previous_matches.append({
+                "id": str(pm.get("_id", pm.get("id"))),
+                "round_name": pm.get("round_name"),
+                "match_number": pm.get("match_number"),
+                "team_a_name": pm.get("team_a_name") or "TBD",
+                "team_b_name": pm.get("team_b_name") or "TBD",
+                "winner_team_id": pm.get("winner_team_id"),
+                "status": pm.get("status"),
+            })
+
+    # 5. Resolve Downstream Match
+    next_match = None
+    if m.get("next_match_id"):
+        nm = await db.matches.find_one({"$or": [{"_id": m["next_match_id"]}, {"id": m["next_match_id"]}]})
+        if nm:
+            next_match = {
+                "id": str(nm.get("_id", nm.get("id"))),
+                "round_name": nm.get("round_name"),
+                "match_number": nm.get("match_number"),
+                "team_a_name": nm.get("team_a_name") or nm.get("team_a_placeholder") or "TBD",
+                "team_b_name": nm.get("team_b_name") or nm.get("team_b_placeholder") or "TBD",
+                "status": nm.get("status"),
+            }
+
+    # 6. Tournament Progression Rounds
+    tournament_progression = []
+    if tourn_doc:
+        custom_rounds = tourn_doc.get("custom_rounds") or []
+        distinct_rounds = await db.matches.distinct("round_name", {"tournament_id": m.get("tournament_id")})
+        rounds_seen = []
+        for r_name in (custom_rounds + distinct_rounds):
+            if r_name and r_name not in rounds_seen:
+                rounds_seen.append(r_name)
+
+        if not rounds_seen:
+            rounds_seen = ["Quarterfinals", "Semifinals", "Grand Final"]
+
+        curr_round_name = m.get("round_name") or m.get("stage")
+        for idx, r_name in enumerate(rounds_seen, start=1):
+            is_curr = (r_name == curr_round_name or idx == m.get("round_number"))
+            tournament_progression.append({
+                "round_number": idx,
+                "round_name": r_name,
+                "is_current": is_curr,
+            })
+
+    # Strip sensitive credentials from public payload
     m.pop("join_info", None)
 
-    return m
+    return {
+        **m,
+        "tournament": {
+            "id": str(tourn_doc.get("_id", tourn_doc.get("id"))) if tourn_doc else tourn_id,
+            "title": tourn_doc.get("title", "Tournament") if tourn_doc else "Tournament",
+            "name": tourn_doc.get("title", "Tournament") if tourn_doc else "Tournament",
+            "banner_url": tourn_doc.get("banner_url") if tourn_doc else None,
+            "format": tourn_doc.get("match_format") or tourn_doc.get("format", "Single Elimination") if tourn_doc else "Single Elimination",
+            "status": tourn_doc.get("status", "ONGOING") if tourn_doc else "ONGOING",
+            "game_id": tourn_doc.get("game_id") if tourn_doc else None,
+            "game_name": (game_doc.get("name") if game_doc else tourn_doc.get("game_name")) if tourn_doc else "Esports",
+            "game_slug": (game_doc.get("slug") if game_doc else "game") if game_doc else "game",
+            "community_platform": tourn_doc.get("community_platform") if tourn_doc else None,
+            "community_link": tourn_doc.get("community_link") if tourn_doc else None,
+        },
+        "team_a_details": team_a_details,
+        "team_b_details": team_b_details,
+        "teams_details": teams_details,
+        "previous_matches": previous_matches,
+        "next_match": next_match,
+        "tournament_progression": tournament_progression,
+    }
 
 
 @router.get("/{id}/join-info")

@@ -13,7 +13,12 @@ class StageRound(BaseModel):
     name: str = "Round 1"
     round_name: Optional[str] = None
     status: str = "UPCOMING"  # UPCOMING, IN_PROGRESS, COMPLETED
+    format: str = "SINGLE_ELIMINATION"  # SINGLE_ELIMINATION, KNOCKOUT, DOUBLE_ELIMINATION, ROUND_ROBIN, BATTLE_ROYALE, DROP_IN
     series_format: str = "BO1"  # Strictly "BO1" or "BO3"
+    match_count: int = 1
+    duration_minutes: Optional[int] = None
+    advancement_rule: Optional[str] = None
+    rules_notes: Optional[str] = None
     scheduled_date: Optional[str] = None
     scheduled_time: Optional[str] = None
     match_ids: List[str] = Field(default_factory=list)
@@ -114,6 +119,7 @@ class Tournament(BaseModel):
     custom_rounds: List[str] = Field(default_factory=list)
     community_platform: Optional[str] = None  # "DISCORD" | "WHATSAPP" | None
     community_link: Optional[str] = None      # invite link URL
+    whatsapp_group_url: Optional[str] = None  # dedicated WhatsApp group invite URL
     created_at: datetime = Field(default_factory=get_utc_now)
     updated_at: datetime = Field(default_factory=get_utc_now)
 
@@ -173,6 +179,13 @@ class Tournament(BaseModel):
         # If live_stream_url not set, check youtube_live_url or stream_url
         if not d.get("live_stream_url"):
             d["live_stream_url"] = d.get("youtube_live_url") or d.get("stream_url") or None
+
+        # Synchronize whatsapp_group_url and community_link
+        if not d.get("whatsapp_group_url") and d.get("community_platform") == "WHATSAPP":
+            d["whatsapp_group_url"] = d.get("community_link")
+        elif d.get("whatsapp_group_url") and not d.get("community_link"):
+            d["community_link"] = d.get("whatsapp_group_url")
+            d["community_platform"] = "WHATSAPP"
 
         # Parse legacy JSON strings if migrated from SQL
         for field in ["rules", "schedule", "prizes", "bracket_rounds"]:

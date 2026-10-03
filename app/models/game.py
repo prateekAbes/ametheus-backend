@@ -8,6 +8,8 @@ class Game(BaseModel):
     slug: str
     name: str
     category: str = "pc"
+    genre_id: Optional[str] = None
+    genre_name: Optional[str] = None
     platform: str
     tag: str
     is_team_game: bool = True
