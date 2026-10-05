@@ -83,7 +83,7 @@ async def create_organizer_match_request(
         "youtube_live_url": payload.youtube_live_url,
         "notes": payload.notes,
         "urgency": (payload.urgency or "NORMAL").upper(),
-        "status": "PENDING",  # PENDING, APPROVED, REJECTED, IN_REVIEW
+        "status": "NEW",  # NEW, UNDER_REVIEW, APPROVED, REJECTED, CANCELLED, RESOLVED
         "admin_notes": None,
         "created_at": now_utc.isoformat(),
         "updated_at": now_utc.isoformat(),
@@ -124,7 +124,13 @@ async def list_admin_organizer_match_requests(
 ):
     query = {}
     if status_filter and status_filter.upper() != "ALL":
-        query["status"] = status_filter.upper()
+        sf = status_filter.upper()
+        if sf == "NEW":
+            query["status"] = {"$in": ["NEW", "PENDING"]}
+        elif sf in ("UNDER_REVIEW", "IN_REVIEW"):
+            query["status"] = {"$in": ["UNDER_REVIEW", "IN_REVIEW"]}
+        else:
+            query["status"] = sf
     cursor = db.organizer_match_requests.find(query).sort("created_at", -1)
     docs = await cursor.to_list(100)
     for d in docs:

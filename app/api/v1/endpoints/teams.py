@@ -318,7 +318,11 @@ async def leave_team(
     if not team:
         raise HTTPException(status_code=404, detail="Team not found")
 
-    if team.get("captain_id") == current_user.id:
+    valid_user_ids = {str(current_user.id)}
+    if getattr(current_user, "clerk_user_id", None):
+        valid_user_ids.add(str(current_user.clerk_user_id))
+
+    if str(team.get("captain_id")) in valid_user_ids:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="The captain cannot leave the team. Disband the team or transfer leadership.",
@@ -328,8 +332,8 @@ async def leave_team(
         {"_id": team["_id"]},
         {
             "$pull": {
-                "members": {"user_id": current_user.id},
-                "substitutes": {"user_id": current_user.id},
+                "members": {"user_id": {"$in": list(valid_user_ids)}},
+                "substitutes": {"user_id": {"$in": list(valid_user_ids)}},
             }
         }
     )
@@ -346,13 +350,17 @@ async def transfer_team_leadership(
     if not team:
         raise HTTPException(status_code=404, detail="Team not found")
 
-    if team.get("captain_id") != current_user.id and current_user.role != "SUPER_ADMIN":
+    valid_user_ids = {str(current_user.id)}
+    if getattr(current_user, "clerk_user_id", None):
+        valid_user_ids.add(str(current_user.clerk_user_id))
+
+    if str(team.get("captain_id")) not in valid_user_ids and current_user.role != "SUPER_ADMIN":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only the team captain or super admin can transfer leadership.",
         )
 
-    if new_captain_id == current_user.id:
+    if new_captain_id in valid_user_ids:
         raise HTTPException(status_code=400, detail="You are already the captain.")
 
     members = team.get("members", []) or []
@@ -436,13 +444,17 @@ async def kick_team_member(
     if not team:
         raise HTTPException(status_code=404, detail="Team not found")
 
-    if team.get("captain_id") != current_user.id and current_user.role != "SUPER_ADMIN":
+    valid_user_ids = {str(current_user.id)}
+    if getattr(current_user, "clerk_user_id", None):
+        valid_user_ids.add(str(current_user.clerk_user_id))
+
+    if str(team.get("captain_id")) not in valid_user_ids and current_user.role != "SUPER_ADMIN":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only the team captain or platform admin can remove roster members.",
         )
 
-    if user_id == team.get("captain_id"):
+    if str(user_id) == str(team.get("captain_id")):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Cannot kick the team captain.",
@@ -469,7 +481,11 @@ async def delete_team(
     if not team:
         raise HTTPException(status_code=404, detail="Team not found")
 
-    if team.get("captain_id") != current_user.id and current_user.role != "SUPER_ADMIN":
+    valid_user_ids = {str(current_user.id)}
+    if getattr(current_user, "clerk_user_id", None):
+        valid_user_ids.add(str(current_user.clerk_user_id))
+
+    if str(team.get("captain_id")) not in valid_user_ids and current_user.role != "SUPER_ADMIN":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only the team captain or platform admin can disband the team.",

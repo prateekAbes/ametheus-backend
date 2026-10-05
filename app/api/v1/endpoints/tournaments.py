@@ -202,12 +202,16 @@ async def get_my_tournament_registrations(
     Returns all tournaments the current authenticated user is registered for,
     either as an individual contender or through their team rosters.
     """
+    valid_user_ids = [str(current_user.id)]
+    if getattr(current_user, "clerk_user_id", None):
+        valid_user_ids.append(str(current_user.clerk_user_id))
+
     # 1. Fetch user's teams
     my_teams_cursor = db.teams.find({
         "$or": [
-            {"captain_id": current_user.id},
-            {"members.user_id": current_user.id},
-            {"substitutes.user_id": current_user.id},
+            {"captain_id": {"$in": valid_user_ids}},
+            {"members.user_id": {"$in": valid_user_ids}},
+            {"substitutes.user_id": {"$in": valid_user_ids}},
         ],
         "is_dummy": {"$ne": True},
     })
@@ -215,7 +219,7 @@ async def get_my_tournament_registrations(
     my_team_ids = [str(t.get("_id", t.get("id"))) for t in my_teams]
 
     # 2. Query registrations matching player_id or team_id
-    reg_or = [{"player_id": current_user.id}]
+    reg_or = [{"player_id": {"$in": valid_user_ids}}]
     if my_team_ids:
         reg_or.append({"team_id": {"$in": my_team_ids}})
 
@@ -728,7 +732,10 @@ async def register_team_for_tournament(
     team_id = str(team.get("_id", team.get("id")))
 
     # 4. Captain authorization
-    if team.get("captain_id") != current_user.id:
+    valid_captain_ids = {str(current_user.id)}
+    if getattr(current_user, "clerk_user_id", None):
+        valid_captain_ids.add(str(current_user.clerk_user_id))
+    if str(team.get("captain_id")) not in valid_captain_ids and current_user.role != "SUPER_ADMIN":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only the verified team captain can register this team",
@@ -897,6 +904,7 @@ async def get_registration_status(
     return TournamentRegistrationStatusResponse(is_registered=False, registration=None)
 
 @router.post("/{id}/register-upi", response_model=TournamentRegisterUpiResponse)
+@router.post("/{id}/register/upi", response_model=TournamentRegisterUpiResponse)
 async def register_tournament_direct_upi(
     id: str,
     payload: TournamentRegisterRequest,
@@ -972,7 +980,10 @@ async def register_tournament_direct_upi(
         team = await db.teams.find_one({"$or": [{"_id": payload.team_id}, {"id": payload.team_id}]})
         if not team:
             raise HTTPException(status_code=404, detail="Team not found")
-        if team.get("captain_id") != current_user.id:
+        valid_captain_ids = {str(current_user.id)}
+        if getattr(current_user, "clerk_user_id", None):
+            valid_captain_ids.add(str(current_user.clerk_user_id))
+        if str(team.get("captain_id")) not in valid_captain_ids and current_user.role != "SUPER_ADMIN":
             raise HTTPException(status_code=403, detail="Only verified team captain can register this team")
         team_id = str(team.get("_id", team.get("id")))
         team_name = team.get("name")

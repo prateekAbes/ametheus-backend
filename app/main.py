@@ -37,14 +37,22 @@ app = FastAPI(
 
 # CORS Configuration
 configured_origins = list(settings.CORS_ORIGINS) if isinstance(settings.CORS_ORIGINS, list) else [settings.CORS_ORIGINS]
-for origin in ["https://ametheus-frontend.vercel.app", "http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:3000", "http://127.0.0.1:3000"]:
+for origin in [
+    "https://ametheus.games",
+    "https://www.ametheus.games",
+    "https://ametheus-frontend.vercel.app",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]:
     if origin not in configured_origins:
         configured_origins.append(origin)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=configured_origins,
-    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:[0-9]+)?$|^https://.*\.vercel\.app$",
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:[0-9]+)?$|^https://.*\.vercel\.app$|^https://(www\.)?ametheus\.games$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

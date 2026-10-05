@@ -38,7 +38,11 @@ async def get_user_notifications(
     Retrieve all notifications for the authenticated user, ordered by newest first from MongoDB.
     Defaults to active notifications (is_archived != True).
     """
-    query: Dict[str, Any] = {"user_id": current_user.id}
+    valid_user_ids = [str(current_user.id)]
+    if getattr(current_user, "clerk_user_id", None):
+        valid_user_ids.append(str(current_user.clerk_user_id))
+
+    query: Dict[str, Any] = {"user_id": {"$in": valid_user_ids}}
     if not include_archived:
         query["is_archived"] = {"$ne": True}
 
@@ -46,7 +50,7 @@ async def get_user_notifications(
     notifs = await cursor.to_list(length=50)
 
     unread_query: Dict[str, Any] = {
-        "user_id": current_user.id,
+        "user_id": {"$in": valid_user_ids},
         "is_read": False,
     }
     if not include_archived:
@@ -66,9 +70,13 @@ async def mark_notification_as_read(
     """
     Mark a single notification as read.
     """
+    valid_user_ids = [str(current_user.id)]
+    if getattr(current_user, "clerk_user_id", None):
+        valid_user_ids.append(str(current_user.clerk_user_id))
+
     notif = await db.notifications.find_one({
         "$or": [{"_id": notification_id}, {"id": notification_id}],
-        "user_id": current_user.id,
+        "user_id": {"$in": valid_user_ids},
     })
     if not notif:
         raise HTTPException(
@@ -89,9 +97,13 @@ async def mark_all_notifications_as_read(
     """
     Mark all unread notifications for the authenticated user as read.
     """
+    valid_user_ids = [str(current_user.id)]
+    if getattr(current_user, "clerk_user_id", None):
+        valid_user_ids.append(str(current_user.clerk_user_id))
+
     result = await db.notifications.update_many(
         {
-            "user_id": current_user.id,
+            "user_id": {"$in": valid_user_ids},
             "is_read": False,
         },
         {"$set": {"is_read": True}},

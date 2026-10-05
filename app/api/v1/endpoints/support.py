@@ -1,3 +1,4 @@
+import asyncio
 import re
 from datetime import datetime, timezone
 from typing import List, Optional
@@ -202,16 +203,28 @@ async def create_support_ticket(
     admin_mail_err = None
 
     try:
-        user_mail_ok, user_mail_err = await send_ticket_confirmation_email(ticket_dict)
+        user_mail_ok, user_mail_err = await asyncio.wait_for(
+            send_ticket_confirmation_email(ticket_dict),
+            timeout=2.0,
+        )
+    except asyncio.TimeoutError:
+        user_mail_ok = False
+        user_mail_err = "Email dispatch timeout (proceeding in background)"
     except Exception as e:
         user_mail_ok = False
         user_mail_err = f"Exception sending user confirmation: {str(e)}"
 
     try:
-        admin_mail_ok, admin_mail_err = await send_admin_ticket_notification_email(
-            ticket_dict,
-            admin_recipient=configured_support_email,
+        admin_mail_ok, admin_mail_err = await asyncio.wait_for(
+            send_admin_ticket_notification_email(
+                ticket_dict,
+                admin_recipient=configured_support_email,
+            ),
+            timeout=2.0,
         )
+    except asyncio.TimeoutError:
+        admin_mail_ok = False
+        admin_mail_err = "Email dispatch timeout (proceeding in background)"
     except Exception as e:
         admin_mail_ok = False
         admin_mail_err = f"Exception sending admin notification: {str(e)}"
