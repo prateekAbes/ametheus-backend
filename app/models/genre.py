@@ -12,6 +12,7 @@ class Genre(BaseModel):
     icon_url: Optional[str] = None
     rotation_interval_seconds: int = 4
     display_order: int = 0
+    is_active: bool = True
     created_at: datetime = Field(default_factory=get_utc_now)
     updated_at: datetime = Field(default_factory=get_utc_now)
 

@@ -2499,18 +2499,24 @@ async def save_live_match_structure_admin(
             id=match_id,
             tournament_id=tid,
             stage=stage,
+            round_name=item.round_name or stage,
             match_type=m_type,
             round_number=r_num,
             match_number=m_num,
-            format=s_fmt,
+            format=item.format or s_fmt,
             series_format=s_fmt,
             scheduled_time=sched_combined,
             scheduled_at=parsed_dt,
             status="SCHEDULED",
+            roster_status=item.roster_status or "DRAFT",
             team_a_id=item.team_a_id,
             team_b_id=item.team_b_id,
             team_a_name=item.team_a_name,
             team_b_name=item.team_b_name,
+            team_a_placeholder=item.team_a_placeholder,
+            team_b_placeholder=item.team_b_placeholder,
+            team_ids=item.team_ids or [],
+            teams=item.teams or [],
             next_match_id=item.next_match_id,
             next_match_slot=item.next_match_slot,
             advancement_label=item.advancement_label,
@@ -2529,25 +2535,42 @@ async def save_live_match_structure_admin(
         if r_num not in bracket_rounds_map:
             bracket_rounds_map[r_num] = {
                 "round_number": r_num,
-                "round_name": f"Round {r_num}",
+                "round_name": item.round_name or f"Round {r_num}",
                 "matches": []
             }
         bracket_rounds_map[r_num]["matches"].append({
             "id": db_match.id,
             "stage": stage,
+            "round_name": item.round_name or stage,
             "match_type": m_type,
+            "format": item.format or s_fmt,
             "series_format": s_fmt,
             "match_number": m_num,
             "team_a_id": item.team_a_id,
             "team_b_id": item.team_b_id,
+            "team_ids": item.team_ids or [],
+            "teams": item.teams or [],
             "youtube_live_url": item.youtube_live_url,
             "scheduled_time": sched_combined,
             "status": "SCHEDULED",
+            "roster_status": item.roster_status or "DRAFT",
         })
 
     bracket_tree = [bracket_rounds_map[k] for k in sorted(bracket_rounds_map.keys())]
 
     # Save to tournament
+    custom_round_names = []
+    if payload.rounds:
+        for r in payload.rounds:
+            rn = r.get("round_name") or r.get("name")
+            if rn and rn not in custom_round_names:
+                custom_round_names.append(rn)
+    if not custom_round_names:
+        for m in payload.matches:
+            rn = m.round_name or m.stage
+            if rn and rn not in custom_round_names:
+                custom_round_names.append(rn)
+
     await db.tournaments.update_one(
         {"_id": tourn_doc["_id"]},
         {"$set": {
@@ -2555,6 +2578,8 @@ async def save_live_match_structure_admin(
             "tournament_type": payload.match_format,
             "series_format": payload.series_format,
             "bracket_rounds": bracket_tree,
+            "formation_status": payload.formation_status or "DRAFT",
+            "custom_rounds": custom_round_names,
             "status": "REGISTRATION_CLOSED",
         }}
     )
@@ -2711,6 +2736,8 @@ async def create_match_admin(
         team_b_name=name_b,
         team_a_placeholder=payload.team_a_placeholder,
         team_b_placeholder=payload.team_b_placeholder,
+        team_ids=payload.team_ids or [],
+        teams=payload.teams or [],
         next_match_id=payload.next_match_id,
         next_match_slot=payload.next_match_slot,
         advancement_label=payload.advancement_label,
@@ -3268,6 +3295,42 @@ async def add_custom_tournament_round(
         "message": f'Round "{clean_name}" created successfully.',
         "round_name": clean_name,
         "custom_rounds": existing_rounds,
+    }
+
+@router.delete("/tournaments/{id}/rounds/{round_name}")
+async def delete_tournament_round_admin(
+    id: str,
+    round_name: str,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Admin removes a custom round and deletes matches in that round.
+    """
+    tourn = await db.tournaments.find_one({"$or": [{"_id": id}, {"id": id}, {"slug": id}]})
+    if not tourn:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+
+    tid = str(tourn.get("_id", tourn.get("id")))
+    tslug = tourn.get("slug", tid)
+
+    await db.tournaments.update_one(
+        {"_id": tourn["_id"]},
+        {"$pull": {"custom_rounds": round_name}}
+    )
+
+    await db.matches.delete_many({
+        "$and": [
+            {"$or": [{"tournament_id": tid}, {"tournament_id": tslug}]},
+            {"$or": [{"round_name": round_name}, {"stage": round_name}]},
+        ]
+    })
+
+    updated_tourn = await db.tournaments.find_one({"_id": tourn["_id"]})
+    return {
+        "status": "success",
+        "message": f'Round "{round_name}" removed.',
+        "custom_rounds": updated_tourn.get("custom_rounds") or [],
     }
 
 @router.patch("/tournaments/{id}/community")

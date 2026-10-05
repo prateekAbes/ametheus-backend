@@ -40,6 +40,8 @@ class GameResponse(BaseModel):
     prize_pool_inr: int = 0
     play_url: Optional[str] = None
     banner_url: str
+    banner_tablet_url: Optional[str] = None
+    banner_mobile_url: Optional[str] = None
     logo_url: str
     description: str
     server_region: str
@@ -72,6 +74,8 @@ class GameCreate(BaseModel):
     prize_pool_inr: int = 0
     play_url: Optional[str] = None
     banner_url: str = "https://images.unsplash.com/photo-1542751371-adc38448a05e"
+    banner_tablet_url: Optional[str] = None
+    banner_mobile_url: Optional[str] = None
     logo_url: str = "https://images.unsplash.com/photo-1542751371-adc38448a05e"
     description: str = ""
     server_region: str = "AWS Mumbai (ap-south-1)"
@@ -101,6 +105,8 @@ class GameUpdate(BaseModel):
     prize_pool_inr: Optional[int] = None
     play_url: Optional[str] = None
     banner_url: Optional[str] = None
+    banner_tablet_url: Optional[str] = None
+    banner_mobile_url: Optional[str] = None
     logo_url: Optional[str] = None
     description: Optional[str] = None
     server_region: Optional[str] = None
@@ -319,6 +325,9 @@ class TournamentResponse(BaseModel):
     registration_deadline: Optional[str] = None
     check_in_window_minutes: Optional[int] = 15
     banner_url: Optional[str] = ""
+    banner_tablet_url: Optional[str] = None
+    banner_mobile_url: Optional[str] = None
+    logo_url: Optional[str] = None
     badge_color: Optional[str] = "#E56A10"
     description: Optional[str] = ""
     rules: List[str] = []
@@ -455,6 +464,8 @@ class AdminMatchCreatePayload(BaseModel):
     stage: Optional[str] = None
     series_format: str = "BO1"
     match_format: Optional[str] = None
+    team_ids: Optional[List[str]] = None
+    teams: Optional[List[Dict[str, Any]]] = None
     scheduled_date: Optional[str] = None
     scheduled_time: Optional[str] = None
     scheduled_at: Optional[str] = None
@@ -513,12 +524,19 @@ class AdminMatchSetupItem(BaseModel):
     round_number: int = 1
     match_number: int = 1
     stage: str
+    round_name: Optional[str] = None
     match_type: str = "QUALIFIER"
+    format: Optional[str] = "Knockout"
     series_format: str = "BO1"
     team_a_id: Optional[str] = None
     team_b_id: Optional[str] = None
     team_a_name: Optional[str] = None
     team_b_name: Optional[str] = None
+    team_a_placeholder: Optional[str] = None
+    team_b_placeholder: Optional[str] = None
+    team_ids: Optional[List[str]] = None
+    teams: Optional[List[Dict[str, Any]]] = None
+    roster_status: Optional[str] = "DRAFT"
     scheduled_date: Optional[str] = None
     scheduled_time: Optional[str] = None
     scheduled_at: Optional[str] = None
@@ -533,6 +551,8 @@ class AdminMatchSetupItem(BaseModel):
 class AdminSaveLiveStructurePayload(BaseModel):
     match_format: str
     series_format: str = "BO1"
+    formation_status: Optional[str] = "DRAFT"
+    rounds: Optional[List[Dict[str, Any]]] = None
     matches: List[AdminMatchSetupItem]
 
 class AdminMarkMatchLivePayload(BaseModel):
@@ -747,6 +767,7 @@ class GenreResponse(BaseModel):
     games: List[GameResponse] = []
     games_count: int = 0
     game_count: int = 0
+    is_active: bool = True
     model_config = ConfigDict(from_attributes=True)
 
 class GenreCreate(BaseModel):
@@ -757,6 +778,7 @@ class GenreCreate(BaseModel):
     icon_url: Optional[str] = None
     rotation_interval_seconds: Optional[int] = 4
     display_order: Optional[int] = 0
+    is_active: Optional[bool] = True
 
 class GenreUpdate(BaseModel):
     name: Optional[str] = None
@@ -766,6 +788,7 @@ class GenreUpdate(BaseModel):
     icon_url: Optional[str] = None
     rotation_interval_seconds: Optional[int] = None
     display_order: Optional[int] = None
+    is_active: Optional[bool] = None
 
 # Review Schemas
 class ReviewResponse(BaseModel):

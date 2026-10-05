@@ -101,15 +101,20 @@ async def enrich_genre_doc(g_doc: dict, db: AsyncIOMotorDatabase) -> GenreRespon
         games=games_resp,
         games_count=len(games_resp),
         game_count=len(games_resp),
+        is_active=g_doc.get("is_active", True),
     )
 
 @router.get("", response_model=List[GenreResponse])
-async def list_genres(db: AsyncIOMotorDatabase = Depends(get_db)):
+async def list_genres(
+    include_inactive: bool = Query(False),
+    db: AsyncIOMotorDatabase = Depends(get_db)
+):
     """
     Public listing of all official game genres with their dynamically attached games.
     """
     await seed_genres_if_needed(db)
-    cursor = db.genres.find({}).sort("display_order", 1)
+    query = {} if include_inactive else {"is_active": {"$ne": False}}
+    cursor = db.genres.find(query).sort("display_order", 1)
     genre_docs = await cursor.to_list(length=100)
     return [await enrich_genre_doc(doc, db) for doc in genre_docs]
 
@@ -136,11 +141,11 @@ async def list_admin_genres(
 @admin_router.post("", response_model=GenreResponse, status_code=status.HTTP_201_CREATED)
 async def create_genre(
     payload: GenreCreate,
-    admin_user: User = Depends(require_super_admin),
+    admin_user: User = Depends(require_organizer),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """
-    Super Admin creates a new authoritative Genre.
+    Organizer or Super Admin creates a new authoritative Genre.
     Guarantees no duplicate genre name or slug.
     """
     name_clean = payload.name.strip()
@@ -166,6 +171,7 @@ async def create_genre(
         icon_url=payload.icon_url,
         rotation_interval_seconds=payload.rotation_interval_seconds or 4,
         display_order=payload.display_order or 0,
+        is_active=payload.is_active if payload.is_active is not None else True,
     )
     await db.genres.insert_one(genre.to_mongo())
 
@@ -184,7 +190,7 @@ async def create_genre(
 async def update_genre(
     id: str,
     payload: GenreUpdate,
-    admin_user: User = Depends(require_super_admin),
+    admin_user: User = Depends(require_organizer),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     doc = await db.genres.find_one({"$or": [{"_id": id}, {"id": id}, {"slug": id}]})
@@ -223,6 +229,8 @@ async def update_genre(
         update_fields["rotation_interval_seconds"] = payload.rotation_interval_seconds
     if payload.display_order is not None:
         update_fields["display_order"] = payload.display_order
+    if payload.is_active is not None:
+        update_fields["is_active"] = payload.is_active
 
     if update_fields:
         update_fields["updated_at"] = datetime.utcnow()
@@ -234,7 +242,7 @@ async def update_genre(
 @admin_router.delete("/{id}")
 async def delete_genre(
     id: str,
-    admin_user: User = Depends(require_super_admin),
+    admin_user: User = Depends(require_organizer),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     doc = await db.genres.find_one({"$or": [{"_id": id}, {"id": id}, {"slug": id}]})
@@ -260,3 +268,68 @@ async def delete_genre(
     )
 
     return {"status": "success", "message": f'Genre "{doc.get("name")}" deleted successfully.'}
+
+@admin_router.post("/{id}/games/{game_id}", response_model=GenreResponse)
+async def add_game_to_genre(
+    id: str,
+    game_id: str,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    doc = await db.genres.find_one({"$or": [{"_id": id}, {"id": id}, {"slug": id}]})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Genre not found")
+    gid = str(doc.get("_id", doc.get("id")))
+
+    game = await db.games.find_one({"$or": [{"_id": game_id}, {"id": game_id}, {"slug": game_id}]})
+    if not game:
+        raise HTTPException(status_code=404, detail="Game not found")
+
+    await db.games.update_one(
+        {"_id": game["_id"]},
+        {"$set": {"genre_id": gid, "genre_name": doc["name"], "category": doc.get("slug", doc["name"].lower())}}
+    )
+
+    await record_audit_log(
+        db=db,
+        operator=admin_user.username,
+        role=admin_user.role,
+        action="ADD_GAME_TO_GENRE",
+        target=f"Genre {doc.get('name')}",
+        details=f"Assigned game: {game.get('name')}",
+    )
+
+    refreshed = await db.genres.find_one({"_id": doc["_id"]})
+    return await enrich_genre_doc(refreshed, db)
+
+@admin_router.delete("/{id}/games/{game_id}", response_model=GenreResponse)
+async def remove_game_from_genre(
+    id: str,
+    game_id: str,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    doc = await db.genres.find_one({"$or": [{"_id": id}, {"id": id}, {"slug": id}]})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Genre not found")
+
+    game = await db.games.find_one({"$or": [{"_id": game_id}, {"id": game_id}, {"slug": game_id}]})
+    if not game:
+        raise HTTPException(status_code=404, detail="Game not found")
+
+    await db.games.update_one(
+        {"_id": game["_id"]},
+        {"$unset": {"genre_id": "", "genre_name": ""}}
+    )
+
+    await record_audit_log(
+        db=db,
+        operator=admin_user.username,
+        role=admin_user.role,
+        action="REMOVE_GAME_FROM_GENRE",
+        target=f"Genre {doc.get('name')}",
+        details=f"Unlinked game: {game.get('name')}",
+    )
+
+    refreshed = await db.genres.find_one({"_id": doc["_id"]})
+    return await enrich_genre_doc(refreshed, db)

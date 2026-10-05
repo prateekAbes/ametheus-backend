@@ -58,6 +58,9 @@ class TournamentCreatePayload(BaseModel):
     tournament_type: Optional[str] = "Single Elimination"
     match_format: Optional[str] = "Best of 1"
     banner_url: Optional[str] = None
+    banner_tablet_url: Optional[str] = None
+    banner_mobile_url: Optional[str] = None
+    logo_url: Optional[str] = None
     description: str
     rules: List[str] = []
     schedule: List[Dict[str, Any]] = []
@@ -82,6 +85,9 @@ class TournamentUpdatePayload(BaseModel):
     tournament_type: Optional[str] = None
     match_format: Optional[str] = None
     banner_url: Optional[str] = None
+    banner_tablet_url: Optional[str] = None
+    banner_mobile_url: Optional[str] = None
+    logo_url: Optional[str] = None
     description: Optional[str] = None
     rules: Optional[List[str]] = None
     schedule: Optional[List[Dict[str, Any]]] = None
@@ -142,6 +148,9 @@ def serialize_tournament_response(t: dict, game_obj: Optional[dict], reg_count: 
         tournament_type=t.get("tournament_type", "Single Elimination"),
         match_format=t.get("match_format", "Best of 1"),
         banner_url=t.get("banner_url", ""),
+        banner_tablet_url=t.get("banner_tablet_url"),
+        banner_mobile_url=t.get("banner_mobile_url"),
+        logo_url=t.get("logo_url"),
         badge_color=t.get("badge_color", "#E56A10"),
         description=t.get("description", ""),
         rules=rules,
@@ -170,6 +179,9 @@ async def create_tournament(
     slug = base_slug if not existing else f"{base_slug}-{organizer.id[:6]}"
 
     banner = payload.banner_url or game.get("banner_url")
+    banner_tablet = payload.banner_tablet_url or game.get("banner_tablet_url")
+    banner_mobile = payload.banner_mobile_url or game.get("banner_mobile_url")
+    logo = payload.logo_url or game.get("logo_url")
 
     prizes = payload.prizes if payload.prizes else [{"place": "1st", "amount": f"₹{payload.prize_pool_inr}"}]
 
@@ -195,6 +207,9 @@ async def create_tournament(
         tournament_type=payload.tournament_type or "Single Elimination",
         match_format=payload.match_format or "Best of 1",
         banner_url=banner,
+        banner_tablet_url=banner_tablet,
+        banner_mobile_url=banner_mobile,
+        logo_url=logo,
         badge_color=game.get("accent_color", "#E56A10"),
         description=payload.description,
         rules=payload.rules,
@@ -252,6 +267,12 @@ async def update_tournament(
         update_fields["match_format"] = payload.match_format
     if payload.banner_url is not None:
         update_fields["banner_url"] = payload.banner_url
+    if payload.banner_tablet_url is not None:
+        update_fields["banner_tablet_url"] = payload.banner_tablet_url
+    if payload.banner_mobile_url is not None:
+        update_fields["banner_mobile_url"] = payload.banner_mobile_url
+    if payload.logo_url is not None:
+        update_fields["logo_url"] = payload.logo_url
     if payload.description is not None:
         update_fields["description"] = payload.description
     if payload.rules is not None:
@@ -402,38 +423,6 @@ async def delete_tournament(
     )
     return {"status": "success", "message": f"Tournament '{tourn.get('title')}' successfully deleted"}
 
-@router.post("/tournaments/{id}/publish")
-async def publish_tournament(
-    id: str,
-    organizer: User = Depends(require_organizer),
-    db: AsyncIOMotorDatabase = Depends(get_db),
-):
-    tourn = await db.tournaments.find_one({"$or": [{"_id": id}, {"id": id}]})
-    if not tourn:
-        raise HTTPException(status_code=404, detail="Tournament not found")
-
-    if organizer.role != "SUPER_ADMIN" and tourn.get("organizer_id") != organizer.id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Forbidden: You do not own this tournament (Rule 20)",
-        )
-
-    validate_tournament_transition(tourn.get("status", "DRAFT"), "REGISTRATION_OPEN")
-    prev_status = tourn.get("status")
-
-    await db.tournaments.update_one({"_id": tourn["_id"]}, {"$set": {"status": "REGISTRATION_OPEN"}})
-    tid = str(tourn.get("_id", tourn.get("id")))
-
-    await record_audit_log(
-        db=db,
-        operator=organizer.username,
-        role=organizer.role,
-        action="TOURNAMENT_STATE_CHANGE",
-        target=f"Tournament {tourn.get('title')} ({tid})",
-        details=f"Status transitioned: {prev_status} -> REGISTRATION_OPEN",
-    )
-    return {"status": "success", "message": "Tournament published! Registration is now OPEN."}
-
 @router.post("/tournaments/{id}/close-registration")
 async def close_tournament_registration(
     id: str,
@@ -465,6 +454,38 @@ async def close_tournament_registration(
         details=f"Status transitioned: {prev_status} -> REGISTRATION_CLOSED",
     )
     return {"status": "success", "message": "Tournament registration is now CLOSED. Rosters locked."}
+
+@router.post("/tournaments/{id}/reopen-registration")
+async def reopen_tournament_registration(
+    id: str,
+    organizer: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    tourn = await db.tournaments.find_one({"$or": [{"_id": id}, {"id": id}]})
+    if not tourn:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+
+    if organizer.role != "SUPER_ADMIN" and tourn.get("organizer_id") != organizer.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Forbidden: You do not own this tournament (Rule 20)",
+        )
+
+    validate_tournament_transition(tourn.get("status", "REGISTRATION_CLOSED"), "REGISTRATION_OPEN")
+    prev_status = tourn.get("status")
+
+    await db.tournaments.update_one({"_id": tourn["_id"]}, {"$set": {"status": "REGISTRATION_OPEN"}})
+    tid = str(tourn.get("_id", tourn.get("id")))
+
+    await record_audit_log(
+        db=db,
+        operator=organizer.username,
+        role=organizer.role,
+        action="TOURNAMENT_STATE_CHANGE",
+        target=f"Tournament {tourn.get('title')} ({tid})",
+        details=f"Status transitioned: {prev_status} -> REGISTRATION_OPEN (Reopened)",
+    )
+    return {"status": "success", "message": "Tournament registration is now REOPENED. Contenders may register."}
 
 @router.post("/tournaments/{id}/cancel")
 async def cancel_tournament(

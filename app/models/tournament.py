@@ -110,6 +110,9 @@ class Tournament(BaseModel):
     registration_deadline: Optional[datetime] = None
     check_in_window_minutes: int = 15
     banner_url: str
+    banner_tablet_url: Optional[str] = None
+    banner_mobile_url: Optional[str] = None
+    logo_url: Optional[str] = None
     badge_color: str = "#E56A10"
     description: str = ""
     rules: List[Any] = Field(default_factory=list)
