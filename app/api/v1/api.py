@@ -18,9 +18,12 @@ from app.api.v1.endpoints import (
     email_settings,
     genres,
     reviews,
+    organizer_communications,
 )
 
 api_router = APIRouter()
+api_router.include_router(organizer_communications.organizer_comm_router, prefix="/organizer", tags=["Organizer Communications"])
+api_router.include_router(organizer_communications.admin_comm_router, prefix="/admin", tags=["Admin Organizer Communications"])
 api_router.include_router(auth.router, prefix="/auth", tags=["Authentication & Users"])
 api_router.include_router(games.router, prefix="/games", tags=["Games"])
 api_router.include_router(genres.router, prefix="/genres", tags=["Genres"])

@@ -318,6 +318,96 @@ async def leave_team(
     )
     return {"status": "success", "message": f"Successfully left team {team['name']}"}
 
+@router.post("/{id}/transfer-leadership/{new_captain_id}", response_model=TeamResponse)
+async def transfer_team_leadership(
+    id: str,
+    new_captain_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    team = await db.teams.find_one({"$or": [{"_id": id}, {"id": id}]})
+    if not team:
+        raise HTTPException(status_code=404, detail="Team not found")
+
+    if team.get("captain_id") != current_user.id and current_user.role != "SUPER_ADMIN":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the team captain or super admin can transfer leadership.",
+        )
+
+    if new_captain_id == current_user.id:
+        raise HTTPException(status_code=400, detail="You are already the captain.")
+
+    members = team.get("members", []) or []
+    substitutes = team.get("substitutes", []) or []
+
+    # Check that new_captain_id is on the roster
+    target_member = None
+    for m in members:
+        uid = m.get("user_id") if isinstance(m, dict) else getattr(m, "user_id", None)
+        if uid == new_captain_id:
+            target_member = m
+            break
+    if not target_member:
+        for s in substitutes:
+            uid = s.get("user_id") if isinstance(s, dict) else getattr(s, "user_id", None)
+            if uid == new_captain_id:
+                target_member = s
+                break
+
+    if not target_member:
+        raise HTTPException(status_code=400, detail="Designated new captain must be an active member of this team roster.")
+
+    new_members = []
+    new_subs = []
+    for m in members:
+        m_dict = dict(m) if isinstance(m, dict) else m.model_dump()
+        if m_dict.get("user_id") == current_user.id:
+            m_dict["role"] = "MEMBER"
+        elif m_dict.get("user_id") == new_captain_id:
+            m_dict["role"] = "CAPTAIN"
+        new_members.append(m_dict)
+
+    for s in substitutes:
+        s_dict = dict(s) if isinstance(s, dict) else s.model_dump()
+        if s_dict.get("user_id") == new_captain_id:
+            s_dict["role"] = "CAPTAIN"
+            new_members.append(s_dict)
+        else:
+            new_subs.append(s_dict)
+
+    await db.teams.update_one(
+        {"_id": team["_id"]},
+        {
+            "$set": {
+                "captain_id": new_captain_id,
+                "members": new_members,
+                "substitutes": new_subs,
+            }
+        }
+    )
+
+    await create_notification(
+        db=db,
+        user_id=new_captain_id,
+        title="Team Leadership Transferred",
+        message=f"You are now the team captain of '{team.get('name')}'.",
+        notification_type="TEAM",
+        link="/teams",
+    )
+
+    await record_audit_log(
+        db=db,
+        operator=current_user.username,
+        role=current_user.role,
+        action="TRANSFER_TEAM_LEADERSHIP",
+        target=f"Team {team.get('name')}",
+        details=f"Captaincy transferred from {current_user.username} to user ID {new_captain_id}",
+    )
+
+    updated_team = await db.teams.find_one({"_id": team["_id"]})
+    return await serialize_team(updated_team, db)
+
 @router.post("/{id}/kick/{user_id}")
 async def kick_team_member(
     id: str,

@@ -268,6 +268,37 @@ async def send_official_email(
     )
 
 
+async def send_personal_email_with_details(
+    sender_type: str,
+    recipient: str,
+    subject: str,
+    text_content: str,
+    html_content: str,
+) -> Dict[str, Any]:
+    """
+    Sends an individual personal or administrative email and returns full Brevo relay diagnostic response.
+    """
+    from datetime import datetime, timezone
+    ok, err_code, err_det, msg_id, sender_used = await asyncio.to_thread(
+        _send_identity_smtp_sync,
+        sender_type,
+        recipient,
+        subject,
+        text_content,
+        html_content,
+        None,
+    )
+    return {
+        "success": ok,
+        "error_code": err_code,
+        "error_detail": err_det,
+        "message_id": msg_id,
+        "sender": sender_used,
+        "recipient": recipient,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 # =========================================================================
 # SYSTEM STATUS & STARTUP VALIDATION
 # =========================================================================

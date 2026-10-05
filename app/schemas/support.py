@@ -14,8 +14,13 @@ class SupportTicketCreateRequest(BaseModel):
 
 
 class SupportTicketUpdateRequest(BaseModel):
-    status: Optional[str] = None  # OPEN, IN_PROGRESS, WAITING_FOR_USER, RESOLVED, CLOSED
+    status: Optional[str] = None  # NEW, OPEN, WAITING_FOR_USER, WAITING_FOR_ADMIN, UNREAD, IN_PROGRESS, ON_HOLD, RESOLVED, CLOSED, ARCHIVED
     internal_notes: Optional[str] = None
+
+
+class SupportTicketReplyRequest(BaseModel):
+    message: str
+    status: Optional[str] = None
 
 
 class SupportEmailStatus(BaseModel):
@@ -62,6 +67,7 @@ class SupportTicketResponse(BaseModel):
     email_error: Optional[str] = None
     user_email_status: Optional[str] = None
     support_email_status: Optional[str] = None
+    messages: List[dict] = Field(default_factory=list)
     logs: List[SupportLogResponse] = Field(default_factory=list)
     is_archived: bool = False
     archived_at: Optional[str] = None

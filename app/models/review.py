@@ -7,7 +7,7 @@ class Review(BaseModel):
     id: str = Field(default_factory=generate_uuid)
     user_id: str
     user_name: str
-    user_email: str
+    user_email: Optional[str] = "contender@ametheus.gg"
     avatar_url: Optional[str] = None
     rating: int = Field(default=5, ge=1, le=5)
     review_text: str

@@ -9,6 +9,7 @@ from app.models.support import SupportTicket, SupportLogEntry, generate_ticket_i
 from app.schemas.support import (
     SupportTicketCreateRequest,
     SupportTicketUpdateRequest,
+    SupportTicketReplyRequest,
     SupportTicketResponse,
     SupportTicketPublicResponse,
     SupportTicketListResponse,
@@ -39,7 +40,18 @@ from app.services.archive_service import (
 
 router = APIRouter()
 
-VALID_STATUSES = {"OPEN", "IN_PROGRESS", "WAITING_FOR_USER", "RESOLVED", "CLOSED"}
+VALID_STATUSES = {
+    "NEW",
+    "OPEN",
+    "WAITING_FOR_USER",
+    "WAITING_FOR_ADMIN",
+    "UNREAD",
+    "IN_PROGRESS",
+    "ON_HOLD",
+    "RESOLVED",
+    "CLOSED",
+    "ARCHIVED",
+}
 VALID_CATEGORIES = {
     "PAYMENT",
     "WALLET",
@@ -72,6 +84,19 @@ def _clean_ticket_doc(doc: dict) -> dict:
     item["archived_at"] = str(item.get("archived_at")) if item.get("archived_at") else None
     item["archived_by"] = item.get("archived_by")
     item["archive_reason"] = item.get("archive_reason")
+    raw_msgs = item.get("messages", [])
+    if not raw_msgs and item.get("description"):
+        raw_msgs = [
+            {
+                "id": "msg_initial",
+                "sender_id": item.get("user_id") or "user",
+                "sender_name": item.get("name", "Contender"),
+                "sender_role": "USER",
+                "message": item.get("description", ""),
+                "created_at": str(item.get("created_at") or datetime.now(timezone.utc).isoformat()),
+            }
+        ]
+    item["messages"] = raw_msgs
     return item
 
 
@@ -470,6 +495,164 @@ async def update_support_ticket(
     return SupportTicketResponse(**_clean_ticket_doc(updated_doc))
 
 
+@router.get("/users-with-tickets")
+async def get_users_with_support_tickets(
+    search: Optional[str] = None,
+    is_archived: bool = Query(False),
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    User-centric 1st-level organization:
+    Groups all tickets by user, reporting ticket counts, active statuses, and latest ticket activity.
+    """
+    match_query: dict = {"is_archived": True if is_archived else {"$ne": True}}
+    if search:
+        search_rgx = {"$regex": re.escape(search.strip()), "$options": "i"}
+        match_query["$or"] = [
+            {"email": search_rgx},
+            {"name": search_rgx},
+            {"ticket_id": search_rgx},
+            {"description": search_rgx},
+        ]
+
+    pipeline = [
+        {"$match": match_query},
+        {"$sort": {"created_at": -1}},
+        {
+            "$group": {
+                "_id": {"$ifNull": ["$email", "$user_id"]},
+                "email": {"$first": "$email"},
+                "user_name": {"$first": "$name"},
+                "user_id": {"$first": "$user_id"},
+                "total_tickets": {"$sum": 1},
+                "open_tickets": {
+                    "$sum": {
+                        "$cond": [{"$in": ["$status", ["OPEN", "NEW", "IN_PROGRESS", "WAITING_FOR_ADMIN", "UNREAD"]]}, 1, 0]
+                    }
+                },
+                "latest_activity": {"$first": "$created_at"},
+                "tickets": {"$push": "$$ROOT"},
+            }
+        },
+        {"$sort": {"open_tickets": -1, "latest_activity": -1}},
+    ]
+
+    results = await db.support_tickets.aggregate(pipeline).to_list(100)
+    for r in results:
+        r["tickets"] = [_clean_ticket_doc(t) for t in r.get("tickets", [])]
+    return results
+
+
+@router.post("/tickets/{ticket_id}/reply", response_model=SupportTicketResponse)
+async def reply_support_ticket(
+    ticket_id: str,
+    payload: SupportTicketReplyRequest,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Admin sends a direct reply in the ticket conversation thread.
+    - Appends to messages array
+    - Dispatches Brevo email to user's email address
+    - Dispatches in-app notification to user
+    - Updates ticket status (e.g. WAITING_FOR_USER)
+    - Records audit and support logs
+    """
+    import uuid
+    from app.services.notification import create_notification
+    from app.services.email_service import send_support_email
+
+    doc = await db.support_tickets.find_one({"$or": [{"_id": ticket_id}, {"ticket_id": ticket_id}, {"id": ticket_id}]})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Support ticket not found")
+
+    clean_tid = doc.get("ticket_id", ticket_id)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    actor_name = admin_user.display_name or admin_user.username or "Ametheus Arbiter"
+
+    reply_msg = {
+        "id": f"msg_{uuid.uuid4().hex[:10]}",
+        "sender_id": admin_user.id,
+        "sender_name": actor_name,
+        "sender_role": "ADMIN",
+        "message": payload.message.strip(),
+        "created_at": now_iso,
+    }
+
+    new_status = (payload.status or "WAITING_FOR_USER").strip().upper()
+    if new_status not in VALID_STATUSES:
+        new_status = "WAITING_FOR_USER"
+
+    reply_log = SupportLogEntry(
+        ticket_id=clean_tid,
+        action="ADMIN_REPLY",
+        timestamp=now_iso,
+        actor=actor_name,
+        actor_role="ADMIN",
+        details=f"Admin replied: {payload.message[:60]}...",
+    )
+    await db.support_logs.insert_one(reply_log.to_mongo())
+
+    update_fields = {
+        "status": new_status,
+        "updated_at": now_iso,
+    }
+    if new_status in ("RESOLVED", "CLOSED"):
+        update_fields["resolved_at"] = now_iso
+
+    await db.support_tickets.update_one(
+        {"_id": doc["_id"]},
+        {
+            "$set": update_fields,
+            "$push": {
+                "messages": reply_msg,
+                "logs": reply_log.to_mongo(),
+            },
+        },
+    )
+
+    user_id = doc.get("user_id")
+    if user_id and not str(user_id).startswith("guest"):
+        await create_notification(
+            db=db,
+            user_id=str(user_id),
+            title=f"Support Ticket Update [{clean_tid}]",
+            message=f"Admin response: {payload.message[:120]}",
+            notification_type="SUPPORT",
+            link="/support",
+        )
+
+    user_email = doc.get("email")
+    if user_email:
+        email_html = f"""
+        <div style="font-family: sans-serif; background-color: #05060a; color: #f4f6fa; padding: 24px;">
+            <div style="max-width: 600px; margin: 0 auto; background-color: #0b0d17; border: 1px solid #222; border-radius: 8px; padding: 24px;">
+                <h2 style="color: #3ef2ff; margin-top: 0;">Ametheus Support — Ticket Update</h2>
+                <p>Hello <strong>{doc.get('name', 'Contender')}</strong>,</p>
+                <p>An official support arbiter has responded to your ticket <strong>[{clean_tid}]</strong> ({doc.get('category')}):</p>
+                <div style="background-color: #121526; border-left: 4px solid #3ef2ff; padding: 16px; margin: 20px 0; border-radius: 4px;">
+                    <p style="margin: 0; white-space: pre-wrap; font-size: 14px;">{payload.message}</p>
+                </div>
+                <p style="font-size: 12px; color: #888;">Status: <strong style="color: #3ef2ff;">{new_status}</strong></p>
+                <p style="font-size: 12px; color: #888;">You can reply to this email or visit the platform support desk to follow up.</p>
+            </div>
+        </div>
+        """
+        try:
+            await send_support_email(
+                to_email=user_email,
+                subject=f"Re: [Ticket {clean_tid}] {doc.get('category')} — Ametheus Support",
+                text_content=payload.message,
+                html_content=email_html,
+            )
+        except Exception:
+            pass
+
+    refreshed = await db.support_tickets.find_one({"_id": doc["_id"]})
+    return SupportTicketResponse(**_clean_ticket_doc(refreshed))
+
+
 @router.post("/tickets/{ticket_id}/retry-email", response_model=SupportTicketResponse)
 async def retry_support_ticket_email(
     ticket_id: str,
@@ -590,3 +773,28 @@ async def get_my_support_tickets(
     cursor = db.support_tickets.find(query).sort("created_at", -1)
     docs = await cursor.to_list(length=50)
     return [SupportTicketResponse(**_clean_ticket_doc(d)) for d in docs]
+
+
+@router.post("/tickets/{ticket_id}/archive", response_model=SupportTicketResponse)
+async def toggle_archive_support_ticket(
+    ticket_id: str,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    doc = await db.support_tickets.find_one({"$or": [{"_id": ticket_id}, {"ticket_id": ticket_id}, {"id": ticket_id}]})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Ticket not found")
+    new_arch = not doc.get("is_archived", False)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    update_data = {"is_archived": new_arch, "updated_at": now_iso}
+    if new_arch:
+        update_data["status"] = "ARCHIVED"
+    elif doc.get("status") == "ARCHIVED":
+        update_data["status"] = "OPEN"
+
+    await db.support_tickets.update_one(
+        {"_id": doc["_id"]},
+        {"$set": update_data}
+    )
+    updated = await db.support_tickets.find_one({"_id": doc["_id"]})
+    return SupportTicketResponse(**_clean_ticket_doc(updated))

@@ -25,12 +25,12 @@ VALID_TRANSITIONS = {
     "CANCELLED": [],
 }
 
-def validate_tournament_transition(current_status: str, next_status: str):
+def validate_tournament_transition(current_status: str, next_status: str, is_admin: bool = False):
     curr = "LIVE" if current_status == "ONGOING" else current_status
     nxt = "LIVE" if next_status == "ONGOING" else next_status
-    if curr == nxt:
+    if curr == nxt or is_admin:
         return
-    allowed = VALID_TRANSITIONS.get(curr, [])
+    allowed = VALID_TRANSITIONS.get(curr, ["REGISTRATION_OPEN", "REGISTRATION_CLOSED", "LIVE", "COMPLETED", "CANCELLED"])
     if nxt not in allowed:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -93,6 +93,7 @@ class TournamentUpdatePayload(BaseModel):
     schedule: Optional[List[Dict[str, Any]]] = None
     prizes: Optional[List[Dict[str, Any]]] = None
     status: Optional[str] = None
+    registration_status: Optional[str] = None
 
 def slugify(text: str) -> str:
     s = text.lower().strip()
@@ -285,10 +286,16 @@ async def update_tournament(
         update_fields["min_team_size"] = payload.min_team_size
     if payload.max_team_size is not None:
         update_fields["max_team_size"] = payload.max_team_size
+    if payload.registration_status is not None:
+        update_fields["registration_status"] = payload.registration_status.strip().upper()
     if payload.status is not None:
         status_norm = "LIVE" if payload.status == "ONGOING" else payload.status
-        validate_tournament_transition(tourn.get("status", "DRAFT"), status_norm)
+        validate_tournament_transition(tourn.get("status", "DRAFT"), status_norm, is_admin=(organizer.role == "SUPER_ADMIN"))
         update_fields["status"] = status_norm
+        if status_norm == "REGISTRATION_CLOSED":
+            update_fields["registration_status"] = "CLOSED"
+        elif status_norm in ("REGISTRATION_OPEN", "UPCOMING"):
+            update_fields["registration_status"] = "OPEN"
     if payload.expected_start_date is not None:
         update_fields["expected_start_date"] = payload.expected_start_date
     if payload.registration_open_date is not None:
@@ -309,24 +316,17 @@ async def update_tournament(
         "payment_status": {"$in": ["PAID", "FREE"]},
     })
 
-    # If tournament transitioned to LIVE, ensure bracket matches exist and are LIVE
+    # If tournament transitioned to LIVE, update existing scheduled matches to LIVE
     if updated_tourn.get("status") in ["LIVE", "ONGOING"]:
-        from app.services.bracket_engine import generate_tournament_bracket
-        matches_count = await db.matches.count_documents({"$or": [{"tournament_id": tid}, {"tournament_id": tslug}]})
-        if matches_count == 0 and reg_count >= 2:
-            tourn_obj = Tournament.from_mongo(updated_tourn)
-            await generate_tournament_bracket(tournament=tourn_obj, db=db)
-            updated_tourn = await db.tournaments.find_one({"_id": tourn["_id"]})
-        else:
-            await db.matches.update_many(
-                {
-                    "$or": [{"tournament_id": tid}, {"tournament_id": tslug}],
-                    "team_a_id": {"$ne": None},
-                    "team_b_id": {"$ne": None},
-                    "status": {"$in": ["SCHEDULED", "CHECK_IN_OPEN"]},
-                },
-                {"$set": {"status": "LIVE"}}
-            )
+        await db.matches.update_many(
+            {
+                "$or": [{"tournament_id": tid}, {"tournament_id": tslug}],
+                "team_a_id": {"$ne": None},
+                "team_b_id": {"$ne": None},
+                "status": {"$in": ["SCHEDULED", "CHECK_IN_OPEN"]},
+            },
+            {"$set": {"status": "LIVE"}}
+        )
 
     return serialize_tournament_response(updated_tourn, game, reg_count)
 

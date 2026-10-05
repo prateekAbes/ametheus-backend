@@ -16,6 +16,7 @@ DEFAULT_SEED_REVIEWS = [
     {
         "user_id": "seed_rev_01",
         "user_name": "Aman 'Shadow' Sharma",
+        "user_email": "aman.shadow@ametheus.gg",
         "avatar_url": "https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150&auto=format&fit=crop",
         "rating": 5,
         "review_text": "The automated bracket progression and instant lobby credential delivery make Ametheus by far the cleanest tournament platform in Indian esports. Payouts via UPI took less than 10 minutes after grand finals.",
@@ -27,6 +28,7 @@ DEFAULT_SEED_REVIEWS = [
     {
         "user_id": "seed_rev_02",
         "user_name": "Rohan 'Viper' Verma",
+        "user_email": "rohan.viper@ametheus.gg",
         "avatar_url": "https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=150&auto=format&fit=crop",
         "rating": 5,
         "review_text": "Our squad competed in the Free Fire Max championship. Zero server lag, instant referee responses, and the WhatsApp group community links kept our teammates synced before every round.",
@@ -38,6 +40,7 @@ DEFAULT_SEED_REVIEWS = [
     {
         "user_id": "seed_rev_03",
         "user_name": "Priya 'Valkyrie' Patel",
+        "user_email": "priya.valkyrie@ametheus.gg",
         "avatar_url": "https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=150&auto=format&fit=crop",
         "rating": 5,
         "review_text": "The anti-cheat discipline and automated score verifications are top-tier. As a team captain, getting real-time Brevo email alerts for schedule adjustments made match management effortless.",

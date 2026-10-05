@@ -1,5 +1,6 @@
 import logging
-from typing import Optional
+from typing import Optional, Dict, Any
+from pydantic import BaseModel
 from fastapi import APIRouter, Depends, Query
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
@@ -62,11 +63,12 @@ async def get_public_platform_stats(db: AsyncIOMotorDatabase = Depends(get_db)):
     total_teams = await db.teams.count_documents({})
 
     pipeline = [
-        {"$match": {"status": "PAID"}},
+        {"$match": {"status": {"$in": ["PAID", "COMPLETED", "APPROVED"]}, "is_dummy": {"$ne": True}}},
         {"$group": {"_id": None, "total": {"$sum": "$amount_paise"}}},
     ]
-    agg = await db.payouts.aggregate(pipeline).to_list(1)
-    payout_paise = agg[0]["total"] if agg else 0
+    agg1 = await db.payouts.aggregate(pipeline).to_list(1)
+    agg2 = await db.game_payouts.aggregate(pipeline).to_list(1)
+    payout_paise = (agg1[0]["total"] if agg1 else 0) + (agg2[0]["total"] if agg2 else 0)
     payout_inr = payout_paise // 100
 
     return {
@@ -352,5 +354,65 @@ async def get_official_email_history(
         )
 
     return OfficialEmailHistoryResponse(total=total, items=items)
+
+
+class PersonalEmailSendRequest(BaseModel):
+    recipient_email: str
+    recipient_name: Optional[str] = "Contender"
+    sender_identity: Optional[str] = "official"
+    subject: str
+    message: str
+
+
+@admin_router.post("/send-personal")
+async def send_personal_admin_email(
+    payload: PersonalEmailSendRequest,
+    admin_user: User = Depends(require_super_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Sends a direct personal email from an admin to a specific user, organizer, or custom email address.
+    Returns real-time Brevo delivery status, error code, and error details.
+    """
+    from app.services.email_service import send_personal_email_with_details
+    from app.services.audit import record_audit_log
+
+    email_clean = payload.recipient_email.strip().lower()
+    snd_ident = payload.sender_identity.strip().lower() if payload.sender_identity else "official"
+    if snd_ident not in ("official", "support", "noreply"):
+        snd_ident = "official"
+
+    html_content = f"""
+    <div style="font-family: sans-serif; background-color: #05060a; color: #f4f6fa; padding: 24px;">
+        <div style="max-width: 600px; margin: 0 auto; background-color: #0b0d17; border: 1px solid #222; border-radius: 8px; padding: 24px;">
+            <h2 style="color: #3ef2ff; margin-top: 0;">Ametheus Esports — Administrative Communication</h2>
+            <p>Hello <strong>{payload.recipient_name or 'Contender'}</strong>,</p>
+            <div style="background-color: #121526; border-left: 4px solid #3ef2ff; padding: 16px; margin: 20px 0; border-radius: 4px;">
+                <p style="margin: 0; white-space: pre-wrap; font-size: 14px; color: #f4f6fa;">{payload.message}</p>
+            </div>
+            <p style="font-size: 12px; color: #888;">Dispatched by Ametheus Administration ({admin_user.username}).</p>
+        </div>
+    </div>
+    """
+
+    res = await send_personal_email_with_details(
+        sender_type=snd_ident,
+        recipient=email_clean,
+        subject=payload.subject.strip(),
+        text_content=payload.message.strip(),
+        html_content=html_content,
+    )
+
+    await record_audit_log(
+        db=db,
+        operator=admin_user.username,
+        role=admin_user.role,
+        action="SEND_PERSONAL_EMAIL",
+        target=f"{email_clean} ({payload.subject})",
+        details=f"Identity: {snd_ident}. Delivered: {res.get('success')}. Code: {res.get('error_code')}",
+    )
+
+    return res
+
 
 
