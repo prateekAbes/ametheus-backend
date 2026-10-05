@@ -48,6 +48,11 @@ class Team(BaseModel):
     payment_status: str = "UNPAID"  # UNPAID, PAYMENT_PENDING, PAID, PAYMENT_REJECTED
     payment_id: Optional[str] = None
     is_dummy: bool = False
+    status: str = "ACTIVE"  # ACTIVE, DISBANDED
+    is_disbanded: bool = False
+    disbanded_at: Optional[datetime] = None
+    disbanded_by: Optional[str] = None
+    disbanded_by_id: Optional[str] = None
     created_at: datetime = Field(default_factory=get_utc_now)
     updated_at: datetime = Field(default_factory=get_utc_now)
 

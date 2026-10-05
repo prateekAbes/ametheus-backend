@@ -64,6 +64,9 @@ async def serialize_team(team: Union[dict, Team], db: AsyncIOMotorDatabase) -> T
         max_substitutes=team_dict.get("max_substitutes", 1),
         payment_status=team_dict.get("payment_status", "UNPAID"),
         payment_id=team_dict.get("payment_id"),
+        status=team_dict.get("status", "ACTIVE"),
+        is_disbanded=bool(team_dict.get("is_disbanded", False) or team_dict.get("status") == "DISBANDED"),
+        disbanded_at=team_dict.get("disbanded_at"),
         members=[map_member(m, "MEMBER") for m in raw_members],
         substitutes=[map_member(m, "SUBSTITUTE") for m in raw_substitutes],
     )
@@ -76,7 +79,7 @@ async def list_teams(
     skip: int = 0,
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
-    query = {"is_dummy": {"$ne": True}}
+    query = {"is_dummy": {"$ne": True}, "is_disbanded": {"$ne": True}, "status": {"$ne": "DISBANDED"}}
     if game_slug:
         game = await db.games.find_one({"$or": [{"slug": game_slug}, {"_id": game_slug}, {"id": game_slug}]})
         if game:
@@ -134,6 +137,8 @@ async def create_team(
     existing_team = await db.teams.find_one({
         "game_id": gid,
         "is_dummy": {"$ne": True},
+        "is_disbanded": {"$ne": True},
+        "status": {"$ne": "DISBANDED"},
         "$or": [
             {"captain_id": current_user.id},
             {"members.user_id": current_user.id},
@@ -176,9 +181,13 @@ async def join_team(
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     clean_code = payload.invite_code.strip().upper()
-    team = await db.teams.find_one({"invite_code": clean_code})
+    team = await db.teams.find_one({
+        "invite_code": clean_code,
+        "is_disbanded": {"$ne": True},
+        "status": {"$ne": "DISBANDED"},
+    })
     if not team:
-        raise HTTPException(status_code=404, detail="Invalid invite code. No team found.")
+        raise HTTPException(status_code=404, detail="Invalid invite code. No active team found.")
 
     game_id = team.get("game_id")
     game = await db.games.find_one({"$or": [{"_id": game_id}, {"id": game_id}, {"slug": game_id}]})
@@ -197,6 +206,8 @@ async def join_team(
     existing_team = await db.teams.find_one({
         "game_id": game_id,
         "is_dummy": {"$ne": True},
+        "is_disbanded": {"$ne": True},
+        "status": {"$ne": "DISBANDED"},
         "$or": [
             {"captain_id": current_user.id},
             {"members.user_id": current_user.id},
@@ -265,6 +276,8 @@ async def get_my_teams(
             {"substitutes.user_id": current_user.id},
         ],
         "is_dummy": {"$ne": True},
+        "is_disbanded": {"$ne": True},
+        "status": {"$ne": "DISBANDED"},
     }
     if game_slug:
         game = await db.games.find_one({"slug": game_slug})
@@ -279,9 +292,13 @@ async def get_my_teams(
 @router.get("/code/{code}", response_model=TeamResponse)
 async def get_team_by_code(code: str, db: AsyncIOMotorDatabase = Depends(get_db)):
     clean_code = code.strip().upper()
-    team = await db.teams.find_one({"invite_code": clean_code})
+    team = await db.teams.find_one({
+        "invite_code": clean_code,
+        "is_disbanded": {"$ne": True},
+        "status": {"$ne": "DISBANDED"},
+    })
     if not team:
-        raise HTTPException(status_code=404, detail="Invalid invite code. No team found.")
+        raise HTTPException(status_code=404, detail="Invalid invite code. No active team found.")
     return await serialize_team(team, db)
 
 @router.get("/{id}", response_model=TeamResponse)
@@ -648,8 +665,19 @@ async def delete_team(
         details=f"Disbanded team. Cancelled {len(registrations)} registration(s). Refunded {refunded_payment_count} payment(s) totaling ₹{total_refunded_paise / 100:.2f} to player wallets.",
     )
 
-    # 8. Delete the team record from the database
-    await db.teams.delete_many({"$or": [{"_id": team["_id"]}, {"id": team_id}]})
+    # 8. Soft-delete the team record: mark as DISBANDED to preserve historical records, matches, and leaderboard points
+    await db.teams.update_many(
+        {"$or": [{"_id": team["_id"]}, {"id": team_id}]},
+        {
+            "$set": {
+                "status": "DISBANDED",
+                "is_disbanded": True,
+                "disbanded_at": now_utc,
+                "disbanded_by": current_user.username,
+                "disbanded_by_id": current_user.id,
+            }
+        }
+    )
 
     return {
         "status": "success",

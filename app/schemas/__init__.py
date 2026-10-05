@@ -184,6 +184,9 @@ class TeamResponse(BaseModel):
     payment_id: Optional[str] = None
     members: List[TeamMemberResponse] = []
     substitutes: List[TeamMemberResponse] = []
+    status: str = "ACTIVE"
+    is_disbanded: bool = False
+    disbanded_at: Optional[Any] = None
     model_config = ConfigDict(from_attributes=True)
 
 # Payment & UPI
@@ -680,6 +683,8 @@ class LeaderboardEntryResponse(BaseModel):
     category: str = "overall"
     rank: int = 1
     created_at: Optional[Any] = None
+    is_disbanded: Optional[bool] = False
+    status: Optional[str] = "ACTIVE"
     model_config = ConfigDict(from_attributes=True, extra="allow")
 
 # Stage & Round Schemas

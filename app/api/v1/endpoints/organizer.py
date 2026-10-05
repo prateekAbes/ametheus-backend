@@ -19,11 +19,28 @@ VALID_TRANSITIONS = {
     "COMING_SOON": ["DRAFT", "REGISTRATION_OPEN", "LIVE", "CANCELLED"],
     "REGISTRATION_OPEN": ["REGISTRATION_CLOSED", "LIVE", "CANCELLED"],
     "REGISTRATION_CLOSED": ["UPCOMING", "LIVE", "REGISTRATION_OPEN", "CANCELLED"],
-    "UPCOMING": ["LIVE", "CANCELLED"],
-    "LIVE": ["LIVE", "COMPLETED", "CANCELLED"],
-    "COMPLETED": [],
-    "CANCELLED": [],
+    "UPCOMING": ["LIVE", "CANCELLED", "REGISTRATION_OPEN"],
+    "LIVE": ["LIVE", "COMPLETED", "CANCELLED", "REGISTRATION_CLOSED"],
+    "COMPLETED": ["LIVE"],
+    "CANCELLED": ["DRAFT", "REGISTRATION_OPEN"],
 }
+
+async def find_organizer_tournament(db: AsyncIOMotorDatabase, id: str):
+    if not id:
+        return None
+    from bson import ObjectId
+    clauses = [
+        {"_id": id},
+        {"id": id},
+        {"slug": id},
+        {"slug": id.lower()},
+    ]
+    if ObjectId.is_valid(id):
+        try:
+            clauses.append({"_id": ObjectId(id)})
+        except Exception:
+            pass
+    return await db.tournaments.find_one({"$or": clauses})
 
 def validate_tournament_transition(current_status: str, next_status: str, is_admin: bool = False):
     curr = "LIVE" if current_status == "ONGOING" else current_status
@@ -233,7 +250,7 @@ async def update_tournament(
     """
     Rule 20: Organizer can modify only their own tournament.
     """
-    tourn = await db.tournaments.find_one({"$or": [{"_id": id}, {"id": id}]})
+    tourn = await find_organizer_tournament(db, id)
     if not tourn:
         raise HTTPException(status_code=404, detail="Tournament not found")
 
@@ -381,7 +398,7 @@ async def delete_tournament(
     organizer: User = Depends(require_organizer),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
-    tourn = await db.tournaments.find_one({"$or": [{"_id": id}, {"id": id}]})
+    tourn = await find_organizer_tournament(db, id)
     if not tourn:
         raise HTTPException(status_code=404, detail="Tournament not found")
 
@@ -429,7 +446,7 @@ async def close_tournament_registration(
     organizer: User = Depends(require_organizer),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
-    tourn = await db.tournaments.find_one({"$or": [{"_id": id}, {"id": id}]})
+    tourn = await find_organizer_tournament(db, id)
     if not tourn:
         raise HTTPException(status_code=404, detail="Tournament not found")
 
@@ -461,7 +478,7 @@ async def reopen_tournament_registration(
     organizer: User = Depends(require_organizer),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
-    tourn = await db.tournaments.find_one({"$or": [{"_id": id}, {"id": id}]})
+    tourn = await find_organizer_tournament(db, id)
     if not tourn:
         raise HTTPException(status_code=404, detail="Tournament not found")
 
@@ -493,7 +510,7 @@ async def cancel_tournament(
     organizer: User = Depends(require_organizer),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
-    tourn = await db.tournaments.find_one({"$or": [{"_id": id}, {"id": id}]})
+    tourn = await find_organizer_tournament(db, id)
     if not tourn:
         raise HTTPException(status_code=404, detail="Tournament not found")
 
@@ -518,6 +535,112 @@ async def cancel_tournament(
         details=f"Status transitioned: {prev_status} -> CANCELLED",
     )
     return {"status": "success", "message": f"Tournament '{tourn.get('title')}' has been cancelled."}
+
+@router.post("/tournaments/{id}/start-live", response_model=TournamentResponse)
+async def start_tournament_live(
+    id: str,
+    organizer: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Organizer or Super Admin privilege: Transition tournament directly to LIVE status.
+    Updates scheduled matches to LIVE.
+    """
+    tourn = await find_organizer_tournament(db, id)
+    if not tourn:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+
+    if organizer.role != "SUPER_ADMIN" and tourn.get("organizer_id") != organizer.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Forbidden: You do not own this tournament (Rule 20)",
+        )
+
+    validate_tournament_transition(tourn.get("status", "REGISTRATION_CLOSED"), "LIVE", is_admin=(organizer.role == "SUPER_ADMIN"))
+    prev_status = tourn.get("status")
+
+    await db.tournaments.update_one(
+        {"_id": tourn["_id"]},
+        {"$set": {"status": "LIVE"}}
+    )
+    tid = str(tourn.get("_id", tourn.get("id")))
+    tslug = tourn.get("slug", tid)
+
+    # Transition matches to LIVE
+    await db.matches.update_many(
+        {
+            "$or": [{"tournament_id": tid}, {"tournament_id": tslug}],
+            "team_a_id": {"$ne": None},
+            "team_b_id": {"$ne": None},
+            "status": {"$in": ["SCHEDULED", "CHECK_IN_OPEN"]},
+        },
+        {"$set": {"status": "LIVE"}}
+    )
+
+    await record_audit_log(
+        db=db,
+        operator=organizer.username,
+        role=organizer.role,
+        action="TOURNAMENT_SET_LIVE",
+        target=f"Tournament {tourn.get('title')} ({tid})",
+        details=f"Status transitioned: {prev_status} -> LIVE",
+    )
+
+    updated = await db.tournaments.find_one({"_id": tourn["_id"]})
+    gid = updated.get("game_id")
+    game = await db.games.find_one({"$or": [{"_id": gid}, {"id": gid}, {"slug": gid}]})
+    reg_count = await db.tournament_registrations.count_documents({
+        "$or": [{"tournament_id": tid}, {"tournament_id": tslug}],
+        "payment_status": {"$in": ["PAID", "FREE"]},
+    })
+    return serialize_tournament_response(updated, game, reg_count)
+
+@router.post("/tournaments/{id}/complete", response_model=TournamentResponse)
+async def complete_tournament_organizer(
+    id: str,
+    organizer: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Organizer or Super Admin privilege: Transition tournament to COMPLETED status.
+    """
+    tourn = await find_organizer_tournament(db, id)
+    if not tourn:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+
+    if organizer.role != "SUPER_ADMIN" and tourn.get("organizer_id") != organizer.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Forbidden: You do not own this tournament (Rule 20)",
+        )
+
+    validate_tournament_transition(tourn.get("status", "LIVE"), "COMPLETED", is_admin=(organizer.role == "SUPER_ADMIN"))
+    prev_status = tourn.get("status")
+
+    await db.tournaments.update_one(
+        {"_id": tourn["_id"]},
+        {"$set": {"status": "COMPLETED"}}
+    )
+    tid = str(tourn.get("_id", tourn.get("id")))
+    tslug = tourn.get("slug", tid)
+
+    await record_audit_log(
+        db=db,
+        operator=organizer.username,
+        role=organizer.role,
+        action="TOURNAMENT_COMPLETED",
+        target=f"Tournament {tourn.get('title')} ({tid})",
+        details=f"Status transitioned: {prev_status} -> COMPLETED",
+    )
+
+    updated = await db.tournaments.find_one({"_id": tourn["_id"]})
+    gid = updated.get("game_id")
+    game = await db.games.find_one({"$or": [{"_id": gid}, {"id": gid}, {"slug": gid}]})
+    reg_count = await db.tournament_registrations.count_documents({
+        "$or": [{"tournament_id": tid}, {"tournament_id": tslug}],
+        "payment_status": {"$in": ["PAID", "FREE"]},
+    })
+    return serialize_tournament_response(updated, game, reg_count)
 
 @router.get("/my-tournaments", response_model=List[TournamentResponse])
 async def get_my_organized_tournaments(
@@ -549,7 +672,7 @@ async def generate_single_elimination_bracket(
 ):
     from app.services.bracket_engine import generate_tournament_bracket
 
-    tourn_doc = await db.tournaments.find_one({"$or": [{"_id": id}, {"id": id}, {"slug": id}]})
+    tourn_doc = await find_organizer_tournament(db, id)
     if not tourn_doc:
         raise HTTPException(status_code=404, detail="Tournament not found")
 

@@ -18,11 +18,21 @@ def create_access_token(data: Dict[str, Any], expires_delta: Optional[timedelta]
     to_encode.update({"exp": expire, "iat": now})
     return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=ALGORITHM)
 
+def format_pem_public_key(key_str: str) -> str:
+    """Formats an arbitrary public key string or environment variable into standard PEM format."""
+    cleaned = key_str.strip()
+    if (cleaned.startswith('"') and cleaned.endswith('"')) or (cleaned.startswith("'") and cleaned.endswith("'")):
+        cleaned = cleaned[1:-1].strip()
+    cleaned = cleaned.replace("\\n", "\n").strip()
+    if not cleaned.startswith("-----BEGIN"):
+        cleaned = f"-----BEGIN PUBLIC KEY-----\n{cleaned}\n-----END PUBLIC KEY-----"
+    return cleaned
+
 def decode_token(token: str) -> Optional[Dict[str, Any]]:
     """
     Decodes either internal HS256 tokens or Clerk RS256 JWT tokens.
-    Cryptographically verifies RS256 tokens using Clerk's official JWKS.
-    No unverified signature bypass is permitted.
+    Cryptographically verifies RS256 tokens using CLERK_JWT_KEY or Clerk's official JWKS.
+    Enforces signature verification, expiration check, and rejects deleted application tokens.
     """
     try:
         # First inspect header without verification to determine algorithm & kid
@@ -30,20 +40,28 @@ def decode_token(token: str) -> Optional[Dict[str, Any]]:
         alg = unverified_header.get("alg", "HS256")
 
         if alg == "HS256":
-            return jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"], leeway=60)
+            return jwt.decode(
+                token,
+                settings.SECRET_KEY,
+                algorithms=["HS256"],
+                options={"verify_signature": True, "verify_exp": True, "verify_nbf": True},
+                leeway=60,
+            )
 
         if alg == "RS256":
-            kid = unverified_header.get("kid")
-            if not kid:
-                return None
-
-            # Inspect claims to find issuer
+            # Inspect unverified claims to evaluate issuer and application identity
             unverified_payload = jwt.decode(token, options={"verify_signature": False})
             issuer = unverified_payload.get("iss", "").rstrip("/")
 
+            # Reject stale references to the deleted Clerk application
+            if "valid-goose-2403" in issuer or "valid-goose-2403" in token:
+                print(f"[AUTH] Explicitly rejected token from deleted Clerk application: {issuer}")
+                return None
+
             # Verify issuer is authorized
             is_valid_issuer = (
-                issuer == settings.CLERK_ISSUER.rstrip("/")
+                not issuer
+                or issuer == settings.CLERK_ISSUER.rstrip("/")
                 or issuer.endswith(".clerk.accounts.dev")
                 or "clerk." in issuer
             )
@@ -51,9 +69,32 @@ def decode_token(token: str) -> Optional[Dict[str, Any]]:
                 print(f"[AUTH] Rejected unauthorized token issuer: {issuer}")
                 return None
 
-            # Check if JWKS is cached or fetch
+            # 1. Networkless verification using CLERK_JWT_KEY if configured
+            if settings.CLERK_JWT_KEY and settings.CLERK_JWT_KEY.strip():
+                try:
+                    pem_key = format_pem_public_key(settings.CLERK_JWT_KEY)
+                    return jwt.decode(
+                        token,
+                        pem_key,
+                        algorithms=["RS256"],
+                        options={"verify_signature": True, "verify_exp": True, "verify_nbf": True, "verify_aud": False},
+                        leeway=60,
+                    )
+                except jwt.ExpiredSignatureError:
+                    print("[AUTH] Token expired")
+                    return None
+                except jwt.InvalidSignatureError:
+                    print("[AUTH] CLERK_JWT_KEY signature mismatch, attempting JWKS fallback if kid present")
+                except Exception as e:
+                    print(f"[AUTH] CLERK_JWT_KEY decode error: {e}")
+
+            # 2. Key-based JWKS verification
+            kid = unverified_header.get("kid")
+            if not kid or not issuer:
+                return None
+
             global _jwks_cache
-            if not _jwks_cache or kid not in _jwks_cache:
+            if kid not in _jwks_cache:
                 try:
                     jwks_url = f"{issuer}/.well-known/jwks.json"
                     req = urllib.request.Request(jwks_url, headers={"User-Agent": "Ametheus-Backend/1.0"})
@@ -71,13 +112,16 @@ def decode_token(token: str) -> Optional[Dict[str, Any]]:
                     token,
                     public_key,
                     algorithms=["RS256"],
-                    options={"verify_aud": False},
+                    options={"verify_signature": True, "verify_exp": True, "verify_nbf": True, "verify_aud": False},
                     leeway=60,
                 )
 
             # Key not found in JWKS - reject!
             return None
 
+        return None
+    except jwt.ExpiredSignatureError:
+        print("[AUTH] Token expired")
         return None
     except Exception as e:
         print(f"[AUTH] Token decode failure: {e}")

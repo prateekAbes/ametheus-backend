@@ -19,12 +19,17 @@ class Settings(BaseSettings):
     DATABASE_URL: str = "sqlite+aiosqlite:///./ametheus.db"
     SECRET_KEY: str = "ametheus_solar_vanguard_secure_key_2026"
     CORS_ORIGINS: Union[List[str], str] = [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
         "http://localhost:3000",
         "http://127.0.0.1:3000",
         "http://localhost:8000",
         "https://ametheus-frontend.vercel.app",
     ]
     CLERK_ISSUER: str = "https://clerk.ametheus.gg"
+    CLERK_PUBLISHABLE_KEY: Optional[str] = None
+    CLERK_SECRET_KEY: Optional[str] = None
+    CLERK_JWT_KEY: Optional[str] = None
     SUPER_ADMIN_EMAIL: str = "admin@ametheus.gg"
     SUPPORT_PHONE: str = "+91 98765 43210"
     SUPPORT_ADMIN_EMAIL: str = "support@ametheus.games"

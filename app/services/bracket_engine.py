@@ -171,10 +171,10 @@ async def build_single_elimination_bracket(
         if bm.winner_team_id:
             await advance_bracket_match(tournament.id, bm, bm.winner_team_id, db)
 
-    # Rule 5 & 11: Tournament NEVER has LIVE status. It remains REGISTRATION_CLOSED.
+    # Tournament transitions to LIVE upon bracket generation
     await db.tournaments.update_one(
         {"$or": [{"_id": tournament.id}, {"id": tournament.id}]},
-        {"$set": {"bracket_rounds": bracket_tree, "status": "REGISTRATION_CLOSED"}}
+        {"$set": {"bracket_rounds": bracket_tree, "status": "LIVE"}}
     )
     return {"total_rounds": total_rounds, "bracket": bracket_tree}
 
@@ -275,10 +275,10 @@ async def build_double_elimination_bracket(
     await db.matches.insert_one(gf_match.to_mongo())
     bracket_tree.append({"round_number": upper_rounds + lower_rounds + 1, "round_name": "Grand Final", "matches": [{"id": gf_match.id, "stage": gf_stage, "match_type": "GRAND_FINAL", "status": "SCHEDULED"}]})
 
-    # Rule 5 & 11: Tournament NEVER has LIVE status.
+    # Tournament transitions to LIVE
     await db.tournaments.update_one(
         {"$or": [{"_id": tournament.id}, {"id": tournament.id}]},
-        {"$set": {"bracket_rounds": bracket_tree, "status": "REGISTRATION_CLOSED"}}
+        {"$set": {"bracket_rounds": bracket_tree, "status": "LIVE"}}
     )
     return {"total_rounds": len(bracket_tree), "bracket": bracket_tree}
 
@@ -361,7 +361,7 @@ async def build_consolation_bracket(
 
     await db.tournaments.update_one(
         {"$or": [{"_id": tournament.id}, {"id": tournament.id}]},
-        {"$set": {"bracket_rounds": bracket_tree, "status": "REGISTRATION_CLOSED"}}
+        {"$set": {"bracket_rounds": bracket_tree, "status": "LIVE"}}
     )
     return {"total_rounds": len(bracket_tree), "bracket": bracket_tree}
 
@@ -429,7 +429,7 @@ async def build_round_robin_schedule(
 
     await db.tournaments.update_one(
         {"$or": [{"_id": tournament.id}, {"id": tournament.id}]},
-        {"$set": {"bracket_rounds": bracket_tree, "status": "REGISTRATION_CLOSED"}}
+        {"$set": {"bracket_rounds": bracket_tree, "status": "LIVE"}}
     )
     return {"total_rounds": total_rounds, "bracket": bracket_tree}
 
@@ -486,7 +486,7 @@ async def build_double_round_robin_schedule(
     final_tree = [rounds_map[k] for k in sorted(rounds_map.keys())]
     await db.tournaments.update_one(
         {"$or": [{"_id": tournament.id}, {"id": tournament.id}]},
-        {"$set": {"bracket_rounds": final_tree, "status": "REGISTRATION_CLOSED"}}
+        {"$set": {"bracket_rounds": final_tree, "status": "LIVE"}}
     )
     return {"total_rounds": len(final_tree), "bracket": final_tree}
 
@@ -624,7 +624,7 @@ async def build_ladder_structure(
 
     await db.tournaments.update_one(
         {"$or": [{"_id": tournament.id}, {"id": tournament.id}]},
-        {"$set": {"bracket_rounds": bracket_tree, "status": "REGISTRATION_CLOSED"}}
+        {"$set": {"bracket_rounds": bracket_tree, "status": "LIVE"}}
     )
     return {"total_rounds": len(bracket_tree), "bracket": bracket_tree}
 
@@ -739,7 +739,7 @@ async def build_group_stage_knockout(
 
     await db.tournaments.update_one(
         {"$or": [{"_id": tournament.id}, {"id": tournament.id}]},
-        {"$set": {"bracket_rounds": bracket_tree, "status": "REGISTRATION_CLOSED"}}
+        {"$set": {"bracket_rounds": bracket_tree, "status": "LIVE"}}
     )
     return {"total_rounds": len(bracket_tree), "bracket": bracket_tree}
 
@@ -840,7 +840,19 @@ async def advance_bracket_match(
             slot = (completed_match.next_match_slot or "A").upper()
             is_team_a = (slot != "B")
 
-    # Case B: Standard round-advancement pair
+    # Case B: Explicit slot referencing via slot_a_source_match_id or slot_b_source_match_id
+    if not next_match_doc:
+        downstream = await db.matches.find_one({
+            "$or": [
+                {"slot_a_source_match_id": completed_match.id},
+                {"slot_b_source_match_id": completed_match.id},
+            ]
+        })
+        if downstream:
+            next_match_doc = downstream
+            is_team_a = (downstream.get("slot_a_source_match_id") == completed_match.id)
+
+    # Case C: Standard round-advancement pair
     if not next_match_doc:
         next_round_num = (completed_match.round_number or 1) + 1
         m_num = completed_match.match_number or 1
@@ -878,9 +890,11 @@ async def advance_bracket_match(
                 team_a_id=winner_team_id if is_team_a else None,
                 team_a_name=winner_name if is_team_a else None,
                 team_a_placeholder=None if is_team_a else f"Winner of Match {feeder_other}",
+                slot_a_source_match_id=completed_match.id if is_team_a else None,
                 team_b_id=winner_team_id if not is_team_a else None,
                 team_b_name=winner_name if not is_team_a else None,
                 team_b_placeholder=None if not is_team_a else f"Winner of Match {feeder_other}",
+                slot_b_source_match_id=completed_match.id if not is_team_a else None,
                 previous_match_ids=[completed_match.id],
             )
             await db.matches.insert_one(new_downstream_match.to_mongo())
@@ -890,22 +904,6 @@ async def advance_bracket_match(
     if next_match_doc:
         next_match = Match.from_mongo(next_match_doc)
 
-        # Safety Check for Result Editing:
-        # If downstream match is already active (LIVE, COMPLETED, PENDING_VERIFICATION) or has scores:
-        is_downstream_active = (
-            next_match.status in ["LIVE", "COMPLETED", "PENDING_VERIFICATION"] or
-            (next_match.score_a is not None and next_match.score_a > 0) or
-            (next_match.score_b is not None and next_match.score_b > 0) or
-            (next_match.winner_team_id is not None)
-        )
-        existing_occupant = next_match.team_a_id if is_team_a else next_match.team_b_id
-
-        if is_downstream_active and existing_occupant and existing_occupant != winner_team_id:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Cannot change winner of Match {completed_match.match_number}: downstream match ({next_match.stage or next_match.round_name}) is already in progress or completed. Reset downstream match result first."
-            )
-
         update_data = {}
         if is_team_a:
             next_match.team_a_id = winner_team_id
@@ -914,6 +912,7 @@ async def advance_bracket_match(
             update_data["team_a_id"] = winner_team_id
             update_data["team_a_name"] = winner_name
             update_data["team_a_placeholder"] = None
+            update_data["slot_a_source_match_id"] = completed_match.id
         else:
             next_match.team_b_id = winner_team_id
             next_match.team_b_name = winner_name
@@ -921,6 +920,7 @@ async def advance_bracket_match(
             update_data["team_b_id"] = winner_team_id
             update_data["team_b_name"] = winner_name
             update_data["team_b_placeholder"] = None
+            update_data["slot_b_source_match_id"] = completed_match.id
 
         if next_match.status != "LIVE":
             next_match.status = "SCHEDULED"
@@ -975,18 +975,20 @@ async def advance_bracket_match(
         except Exception as e:
             print(f"[Tournament Bracket Update Warning]: {e}")
 
-    else:
-        # Check if all tournament matches are completed
-        tourn_id_str = str(tournament_id)
-        remaining = await db.matches.count_documents({
-            "$or": [{"tournament_id": tourn_id_str}, {"tournament_id": tournament_id}],
-            "status": {"$in": ["LIVE", "SCHEDULED", "CHECK_IN_OPEN", "PENDING_VERIFICATION", "DISPUTED"]}
-        })
-        if remaining == 0:
-            await db.tournaments.update_one(
-                {"$or": [{"_id": tournament_id}, {"id": tournament_id}]},
-                {"$set": {"status": "COMPLETED"}}
-            )
+    # Check if all tournament matches are completed
+    tourn_id_str = str(tournament_id)
+    remaining = await db.matches.count_documents({
+        "$or": [{"tournament_id": tourn_id_str}, {"tournament_id": tournament_id}],
+        "status": {"$in": ["LIVE", "SCHEDULED", "CHECK_IN_OPEN", "PENDING_VERIFICATION", "DISPUTED"]}
+    })
+    total_m = await db.matches.count_documents({
+        "$or": [{"tournament_id": tourn_id_str}, {"tournament_id": tournament_id}],
+    })
+    if total_m > 0 and remaining == 0:
+        await db.tournaments.update_one(
+            {"$or": [{"_id": tournament_id}, {"id": tournament_id}, {"slug": tournament_id}]},
+            {"$set": {"status": "COMPLETED"}}
+        )
 
     return next_match
 

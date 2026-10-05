@@ -38,6 +38,8 @@ class Match(BaseModel):
     advancement: Optional[dict] = None  # Tracks suggested and confirmed advancement destinations
     next_match_id: Optional[str] = None  # ID of downstream match to advance winner to
     next_match_slot: Optional[str] = None  # "A" or "B"
+    slot_a_source_match_id: Optional[str] = None  # Source match whose winner occupies slot A
+    slot_b_source_match_id: Optional[str] = None  # Source match whose winner occupies slot B
     advancement_label: Optional[str] = None  # Human-readable destination label (e.g. "Round 2 Match 1 Slot A")
     previous_match_ids: list[str] = Field(default_factory=list)
     notified_captains: list[str] = Field(default_factory=list)

@@ -86,7 +86,7 @@ class Tournament(BaseModel):
     name: Optional[str] = None
     prize_pool_inr: int = 0
     entry_fee_inr: int = 0
-    status: str = "REGISTRATION_OPEN"  # COMING_SOON, REGISTRATION_OPEN, REGISTRATION_CLOSED, COMPLETED, CANCELLED
+    status: str = "REGISTRATION_OPEN"  # COMING_SOON, REGISTRATION_OPEN, REGISTRATION_CLOSED, LIVE, COMPLETED, CANCELLED
     expected_start_date: Optional[str] = None
     registration_open_date: Optional[str] = None
     announcement_text: Optional[str] = None
@@ -160,12 +160,18 @@ class Tournament(BaseModel):
         if not d.get("title") and d.get("name"):
             d["title"] = d["name"]
 
-        # Rule 5 & 11: Tournament NEVER has LIVE or ONGOING status. Live belongs strictly to individual matches.
+        # Authentic Tournament Lifecycle: COMING_SOON, REGISTRATION_OPEN, REGISTRATION_CLOSED, LIVE, COMPLETED, CANCELLED
         raw_status = str(d.get("status", "REGISTRATION_OPEN")).upper()
         if raw_status in ["LIVE", "ONGOING", "IN_PROGRESS"]:
-            d["status"] = "REGISTRATION_CLOSED"
+            d["status"] = "LIVE"
         elif raw_status in ["UPCOMING", "DRAFT"]:
             d["status"] = "COMING_SOON"
+        elif raw_status in ["CLOSED"]:
+            d["status"] = "REGISTRATION_CLOSED"
+        elif raw_status in ["OPEN"]:
+            d["status"] = "REGISTRATION_OPEN"
+        else:
+            d["status"] = raw_status
 
         # Migrate legacy match_format / series_format - BO5 mapped strictly to BO3
         raw_fmt = d.get("match_format") or d.get("format") or "Single Elimination"

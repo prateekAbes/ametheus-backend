@@ -81,7 +81,17 @@ async def list_tournaments(
 ):
     filter_query = {"is_dummy": {"$ne": True}}
     if status:
-        filter_query["status"] = status
+        stat_upper = status.upper()
+        if stat_upper == "LIVE":
+            filter_query["status"] = {"$in": ["LIVE", "ONGOING", "IN_PROGRESS"]}
+        elif stat_upper in ["COMING_SOON", "UPCOMING"]:
+            filter_query["status"] = {"$in": ["COMING_SOON", "UPCOMING", "DRAFT"]}
+        elif stat_upper in ["REGISTRATION_OPEN", "OPEN"]:
+            filter_query["status"] = {"$in": ["REGISTRATION_OPEN", "OPEN"]}
+        elif stat_upper in ["REGISTRATION_CLOSED", "CLOSED"]:
+            filter_query["status"] = {"$in": ["REGISTRATION_CLOSED", "CLOSED"]}
+        else:
+            filter_query["status"] = status
     else:
         filter_query["status"] = {"$nin": ["DELETED", "CANCELLED", "HIDDEN", "DRAFT"]}
 
@@ -128,7 +138,16 @@ async def list_tournaments(
         } for m in live_m]
 
         raw_stat = str(t.get("status", "REGISTRATION_OPEN")).upper()
-        norm_status = "REGISTRATION_CLOSED" if raw_stat in ["LIVE", "ONGOING", "IN_PROGRESS"] else ("COMING_SOON" if raw_stat in ["DRAFT", "UPCOMING"] else raw_stat)
+        if raw_stat in ["LIVE", "ONGOING", "IN_PROGRESS"]:
+            norm_status = "LIVE"
+        elif raw_stat in ["DRAFT", "UPCOMING"]:
+            norm_status = "COMING_SOON"
+        elif raw_stat in ["CLOSED"]:
+            norm_status = "REGISTRATION_CLOSED"
+        elif raw_stat in ["OPEN"]:
+            norm_status = "REGISTRATION_OPEN"
+        else:
+            norm_status = raw_stat
 
         response.append(
             TournamentResponse(
@@ -442,7 +461,16 @@ async def get_tournament_by_slug(slug: str, db: AsyncIOMotorDatabase = Depends(g
     } for m in live_m]
 
     raw_stat = str(t.get("status", "REGISTRATION_OPEN")).upper()
-    norm_status = "REGISTRATION_CLOSED" if raw_stat in ["LIVE", "ONGOING", "IN_PROGRESS"] else ("COMING_SOON" if raw_stat in ["DRAFT", "UPCOMING"] else raw_stat)
+    if raw_stat in ["LIVE", "ONGOING", "IN_PROGRESS"]:
+        norm_status = "LIVE"
+    elif raw_stat in ["DRAFT", "UPCOMING"]:
+        norm_status = "COMING_SOON"
+    elif raw_stat in ["CLOSED"]:
+        norm_status = "REGISTRATION_CLOSED"
+    elif raw_stat in ["OPEN"]:
+        norm_status = "REGISTRATION_OPEN"
+    else:
+        norm_status = raw_stat
 
     return TournamentResponse(
         id=tid,

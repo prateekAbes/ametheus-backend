@@ -1850,6 +1850,84 @@ async def reopen_tournament_registration_admin(
         "message": f'Tournament "{tourn.get("title")}" registration has been REOPENED. Contenders can register again!',
     }
 
+@router.post("/tournaments/{id}/start-live")
+async def start_tournament_live_admin(
+    id: str,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Super Admin / Organizer transitions tournament directly to LIVE status.
+    Updates scheduled matches with teams to LIVE.
+    """
+    tourn = await db.tournaments.find_one({"$or": [{"_id": id}, {"id": id}, {"slug": id}]})
+    if not tourn:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+
+    tid = str(tourn.get("_id", tourn.get("id")))
+    tslug = tourn.get("slug", tid)
+
+    await db.tournaments.update_one(
+        {"_id": tourn["_id"]},
+        {"$set": {"status": "LIVE"}}
+    )
+
+    await db.matches.update_many(
+        {
+            "$or": [{"tournament_id": tid}, {"tournament_id": tslug}],
+            "team_a_id": {"$ne": None},
+            "team_b_id": {"$ne": None},
+            "status": {"$in": ["SCHEDULED", "CHECK_IN_OPEN"]},
+        },
+        {"$set": {"status": "LIVE"}}
+    )
+
+    await record_audit_log(
+        db=db,
+        operator=admin_user.username,
+        role=admin_user.role,
+        action="TOURNAMENT_SET_LIVE",
+        target=f"Tournament {tourn.get('title')}",
+        details="Tournament status transitioned to LIVE by admin.",
+    )
+
+    return {
+        "status": "success",
+        "message": f'Tournament "{tourn.get("title")}" is now LIVE! Live matches are in progress.',
+    }
+
+@router.post("/tournaments/{id}/complete")
+async def complete_tournament_admin(
+    id: str,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Super Admin / Organizer transitions tournament to COMPLETED status.
+    """
+    tourn = await db.tournaments.find_one({"$or": [{"_id": id}, {"id": id}, {"slug": id}]})
+    if not tourn:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+
+    await db.tournaments.update_one(
+        {"_id": tourn["_id"]},
+        {"$set": {"status": "COMPLETED"}}
+    )
+
+    await record_audit_log(
+        db=db,
+        operator=admin_user.username,
+        role=admin_user.role,
+        action="TOURNAMENT_COMPLETED",
+        target=f"Tournament {tourn.get('title')}",
+        details="Tournament status transitioned to COMPLETED by admin.",
+    )
+
+    return {
+        "status": "success",
+        "message": f'Tournament "{tourn.get("title")}" has been marked as COMPLETED.',
+    }
+
 @router.get("/tournaments/{id}/registered-rosters")
 async def get_tournament_registered_rosters(
     id: str,

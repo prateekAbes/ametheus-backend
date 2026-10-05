@@ -194,7 +194,11 @@ async def get_leaderboard_stats(db: AsyncIOMotorDatabase = Depends(get_db)):
 
         real_contenders = len(contender_user_ids)
 
-    real_squads = await db.teams.count_documents({"is_dummy": {"$ne": True}})
+    real_squads = await db.teams.count_documents({
+        "is_dummy": {"$ne": True},
+        "is_disbanded": {"$ne": True},
+        "status": {"$ne": "DISBANDED"},
+    })
 
     # Real total awarded prizes from completed payouts
     paid_payouts = await db.payouts.find({"status": "PAID", "is_dummy": {"$ne": True}}).to_list(500)
@@ -540,6 +544,9 @@ async def get_leaderboard(
             }).to_list(length=100)
             real_earnings = sum(int(p.get("amount_paise", 0)) // 100 for p in payout_docs)
 
+            is_disbanded = bool(team.get("is_disbanded", False) or team.get("status") == "DISBANDED")
+            team_status = "DISBANDED" if is_disbanded else "ACTIVE"
+
             entries.append({
                 "rank": idx + 1,
                 "id": team_id,
@@ -559,6 +566,8 @@ async def get_leaderboard(
                 "form": form if form else ["-"],
                 "is_verified": True,
                 "category": game_cat,
+                "is_disbanded": is_disbanded,
+                "status": team_status,
             })
 
         # Also query custom leaderboard entries (admin-created entries only)
@@ -585,6 +594,8 @@ async def get_leaderboard(
                 "form": c.get("form", []),
                 "is_verified": bool(c.get("is_verified", False)),
                 "category": c.get("category", "pc"),
+                "is_disbanded": bool(c.get("is_disbanded", False)),
+                "status": c.get("status", "ACTIVE"),
             })
     except Exception as e:
         print(f"[Leaderboard DB Query Notice]: {e}")
@@ -619,17 +630,17 @@ async def get_leaderboard(
     except Exception as e:
         print(f"[Leaderboard Disqualification Filter Notice]: {e}")
 
-    # Dynamic metric sorting
+    # Dynamic metric sorting with deterministic tie-breaking (rating -> wins -> win_rate)
     if sort_metric == "win_rate":
-        entries.sort(key=lambda x: (x["win_rate"], x["wins"]), reverse=True)
+        entries.sort(key=lambda x: (x["win_rate"], x["wins"], x["rating"]), reverse=True)
     elif sort_metric == "earnings":
-        entries.sort(key=lambda x: (x["earnings"], x["wins"]), reverse=True)
+        entries.sort(key=lambda x: (x["earnings"], x["wins"], x["rating"]), reverse=True)
     elif sort_metric == "wins":
-        entries.sort(key=lambda x: (x["wins"], x["win_rate"]), reverse=True)
+        entries.sort(key=lambda x: (x["wins"], x["win_rate"], x["rating"]), reverse=True)
     elif sort_metric == "matches_played":
-        entries.sort(key=lambda x: (x["matches_played"], x["wins"]), reverse=True)
+        entries.sort(key=lambda x: (x["matches_played"], x["wins"], x["rating"]), reverse=True)
     else:  # rating
-        entries.sort(key=lambda x: x["rating"], reverse=True)
+        entries.sort(key=lambda x: (x["rating"], x["wins"], x["win_rate"]), reverse=True)
 
     for rank, entry in enumerate(entries, start=1):
         entry["rank"] = rank
