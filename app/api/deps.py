@@ -123,7 +123,19 @@ async def get_current_user(
             except Exception:
                 pass
 
+    if not user_doc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User account could not be found or provisioned",
+        )
+
     user = User.from_mongo(user_doc)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Failed to load user profile",
+        )
+
     user_curr_email = (user.email or clean_email or "").strip().lower()
 
     is_super_admin = (
@@ -153,13 +165,14 @@ async def get_current_user(
 
 async def get_current_user_optional(
     authorization: Optional[str] = Header(None),
+    x_user_email: Optional[str] = Header(None, alias="X-User-Email"),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ) -> Optional[User]:
     if not authorization or not authorization.startswith("Bearer "):
         return None
     try:
-        return await get_current_user(authorization=authorization, db=db)
-    except HTTPException:
+        return await get_current_user(authorization=authorization, x_user_email=x_user_email, db=db)
+    except Exception:
         return None
 
 async def require_player(

@@ -202,32 +202,36 @@ async def create_support_ticket(
     admin_mail_ok = False
     admin_mail_err = None
 
-    try:
-        user_mail_ok, user_mail_err = await asyncio.wait_for(
-            send_ticket_confirmation_email(ticket_dict),
-            timeout=2.0,
+    # Dispatch emails concurrently with defensive error isolation
+    async def _send_user_mail():
+        return await send_ticket_confirmation_email(ticket_dict)
+
+    async def _send_admin_mail():
+        return await send_admin_ticket_notification_email(
+            ticket_dict,
+            admin_recipient=configured_support_email,
         )
-    except asyncio.TimeoutError:
-        user_mail_ok = False
-        user_mail_err = "Email dispatch timeout (proceeding in background)"
-    except Exception as e:
-        user_mail_ok = False
-        user_mail_err = f"Exception sending user confirmation: {str(e)}"
 
     try:
-        admin_mail_ok, admin_mail_err = await asyncio.wait_for(
-            send_admin_ticket_notification_email(
-                ticket_dict,
-                admin_recipient=configured_support_email,
-            ),
+        results = await asyncio.wait_for(
+            asyncio.gather(_send_user_mail(), _send_admin_mail(), return_exceptions=True),
             timeout=2.0,
         )
+        if isinstance(results[0], tuple):
+            user_mail_ok, user_mail_err = results[0]
+        elif isinstance(results[0], Exception):
+            user_mail_err = str(results[0])
+
+        if isinstance(results[1], tuple):
+            admin_mail_ok, admin_mail_err = results[1]
+        elif isinstance(results[1], Exception):
+            admin_mail_err = str(results[1])
     except asyncio.TimeoutError:
-        admin_mail_ok = False
+        user_mail_err = "Email dispatch timeout (proceeding in background)"
         admin_mail_err = "Email dispatch timeout (proceeding in background)"
     except Exception as e:
-        admin_mail_ok = False
-        admin_mail_err = f"Exception sending admin notification: {str(e)}"
+        user_mail_err = str(e)
+        admin_mail_err = str(e)
 
     if user_mail_ok and admin_mail_ok:
         email_status = "SENT"
