@@ -172,6 +172,16 @@ async def create_team(
     team_doc = team.to_mongo()
     await db.teams.insert_one(team_doc)
 
+    await create_notification(
+        db=db,
+        user_id=current_user.id,
+        title="Team Created",
+        message=f"You successfully formed team '{team.name}'. Share your team code ({team.invite_code}) to recruit members.",
+        notification_type="TEAM",
+        category="TEAM",
+        link="/teams",
+    )
+
     return await serialize_team(team_doc, db)
 
 @router.post("/join", response_model=TeamResponse)
@@ -261,6 +271,28 @@ async def join_team(
         )
 
     updated_team = await db.teams.find_one({"_id": team["_id"]})
+
+    await create_notification(
+        db=db,
+        user_id=current_user.id,
+        title="Team Joined",
+        message=f"You joined team '{team.get('name')}' as a {'substitute' if payload.is_substitute else 'player'}.",
+        notification_type="TEAM",
+        category="TEAM",
+        link="/teams",
+    )
+    captain_id = team.get("captain_id")
+    if captain_id and str(captain_id) != str(current_user.id):
+        await create_notification(
+            db=db,
+            user_id=captain_id,
+            title="New Team Member",
+            message=f"{current_user.username or 'A player'} joined your team '{team.get('name')}'.",
+            notification_type="TEAM",
+            category="TEAM",
+            link="/teams",
+        )
+
     return await serialize_team(updated_team, db)
 
 @router.get("/my-teams", response_model=List[TeamResponse])
@@ -337,6 +369,19 @@ async def leave_team(
             }
         }
     )
+
+    captain_id = team.get("captain_id")
+    if captain_id and str(captain_id) not in valid_user_ids:
+        await create_notification(
+            db=db,
+            user_id=captain_id,
+            title="Team Roster Update",
+            message=f"{current_user.username or 'A player'} left team '{team.get('name')}'.",
+            notification_type="TEAM",
+            category="TEAM",
+            link="/teams",
+        )
+
     return {"status": "success", "message": f"Successfully left team {team['name']}"}
 
 @router.post("/{id}/transfer-leadership/{new_captain_id}", response_model=TeamResponse)
@@ -418,6 +463,7 @@ async def transfer_team_leadership(
         title="Team Leadership Transferred",
         message=f"You are now the team captain of '{team.get('name')}'.",
         notification_type="TEAM",
+        category="TEAM",
         link="/teams",
     )
 
@@ -469,6 +515,17 @@ async def kick_team_member(
             }
         }
     )
+
+    await create_notification(
+        db=db,
+        user_id=user_id,
+        title="Team Roster Update",
+        message=f"You have been removed from team '{team.get('name')}'.",
+        notification_type="TEAM",
+        category="TEAM",
+        link="/teams",
+    )
+
     return {"status": "success", "message": "Member removed from team roster"}
 
 @router.delete("/{id}")
@@ -668,6 +725,7 @@ async def delete_team(
             title="Team Disbanded",
             message=f"Team '{team_name}' has been disbanded. Any tournament registrations have been cancelled and eligible entry fees refunded to your Ametheus wallet.",
             notification_type="TEAM",
+            category="TEAM",
             link="/dashboard",
         )
 

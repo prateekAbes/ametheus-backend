@@ -1,6 +1,8 @@
+import re
 from typing import List, Optional, Dict, Any
+from datetime import datetime, timezone, timedelta
 from pydantic import BaseModel
-from fastapi import APIRouter, Depends, HTTPException, status, Request
+from fastapi import APIRouter, Depends, HTTPException, status, Request, Response
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from app.api.deps import get_db, get_current_user, require_super_admin, require_organizer
 from app.models.user import User
@@ -97,12 +99,27 @@ async def assign_tournament_admin(
     )
     return {"status": "success", "message": "Tournament Admin successfully assigned"}
 
+def _format_audit_ts(val: Any) -> Optional[str]:
+    if val is None:
+        return None
+    if isinstance(val, datetime):
+        if val.tzinfo is None:
+            return val.replace(tzinfo=timezone.utc).isoformat()
+        return val.isoformat()
+    s = str(val).strip()
+    if s in ("None", "null", ""):
+        return None
+    return s
+
+
 @router.get("/audit-logs", response_model=List[AuditLogResponse])
 async def list_audit_logs(
+    response: Response,
     is_archived: bool = False,
     search: Optional[str] = None,
     action: Optional[str] = None,
     operator: Optional[str] = None,
+    date_range: Optional[str] = None,
     limit: int = 100,
     skip: int = 0,
     admin_user: User = Depends(require_super_admin),
@@ -115,7 +132,7 @@ async def list_audit_logs(
         query["is_archived"] = {"$ne": True}
 
     if action and action.upper() != "ALL":
-        query["action"] = action.upper()
+        query["action"] = {"$regex": re.escape(action.strip()), "$options": "i"}
     if operator and operator.strip():
         query["operator"] = {"$regex": re.escape(operator.strip()), "$options": "i"}
     if search and search.strip():
@@ -123,26 +140,95 @@ async def list_audit_logs(
         rgx = {"$regex": re.escape(s), "$options": "i"}
         query["$or"] = [{"operator": rgx}, {"action": rgx}, {"target": rgx}, {"details": rgx}]
 
+    if date_range and date_range.upper() != "ALL":
+        now = datetime.now(timezone.utc)
+        dr = date_range.upper()
+        if dr == "TODAY":
+            start_date = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+            query["created_at"] = {"$gte": start_date}
+        elif dr == "YESTERDAY":
+            start_date = datetime(now.year, now.month, now.day, tzinfo=timezone.utc) - timedelta(days=1)
+            end_date = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+            query["created_at"] = {"$gte": start_date, "$lt": end_date}
+        elif dr == "LAST_7_DAYS":
+            query["created_at"] = {"$gte": now - timedelta(days=7)}
+        elif dr == "LAST_30_DAYS":
+            query["created_at"] = {"$gte": now - timedelta(days=30)}
+
+    total = await db.audit_logs.count_documents(query)
+    response.headers["X-Total-Count"] = str(total)
+
     cursor = db.audit_logs.find(query).sort("created_at", -1).skip(skip).limit(limit)
     logs = await cursor.to_list(length=limit)
-    return [
-        AuditLogResponse(
-            id=str(l.get("_id", l.get("id"))),
-            timestamp=str(l.get("created_at")),
-            operator=l["operator"],
-            role=l["role"],
-            action=l["action"],
-            target=l["target"],
-            ip_address=l.get("ip_address", "127.0.0.1"),
-            prev_hash=l.get("prev_hash"),
-            record_hash=l.get("record_hash"),
-            is_archived=bool(l.get("is_archived", False)),
-            archived_at=str(l.get("archived_at")) if l.get("archived_at") else None,
-            archived_by=l.get("archived_by"),
-            archive_reason=l.get("archive_reason"),
+
+    results = []
+    for l in logs:
+        ts = _format_audit_ts(l.get("created_at")) or _format_audit_ts(l.get("timestamp"))
+        results.append(
+            AuditLogResponse(
+                id=str(l.get("_id", l.get("id"))),
+                timestamp=ts,
+                created_at=ts,
+                operator=l.get("operator", "SYSTEM"),
+                role=l.get("role", "SUPER_ADMIN"),
+                action=l.get("action", "EVENT"),
+                target=l.get("target", "N/A"),
+                details=l.get("details"),
+                ip_address=l.get("ip_address", "127.0.0.1"),
+                prev_hash=l.get("prev_hash"),
+                record_hash=l.get("record_hash"),
+                is_archived=bool(l.get("is_archived", False)),
+                archived_at=_format_audit_ts(l.get("archived_at")),
+                archived_by=l.get("archived_by"),
+                archive_reason=l.get("archive_reason"),
+            )
         )
-        for l in logs
-    ]
+    return results
+
+
+@router.get("/audit-logs/count")
+async def get_audit_logs_count(
+    is_archived: bool = False,
+    search: Optional[str] = None,
+    action: Optional[str] = None,
+    operator: Optional[str] = None,
+    date_range: Optional[str] = None,
+    admin_user: User = Depends(require_super_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    query: Dict[str, Any] = {}
+    if is_archived:
+        query["is_archived"] = True
+    else:
+        query["is_archived"] = {"$ne": True}
+
+    if action and action.upper() != "ALL":
+        query["action"] = {"$regex": re.escape(action.strip()), "$options": "i"}
+    if operator and operator.strip():
+        query["operator"] = {"$regex": re.escape(operator.strip()), "$options": "i"}
+    if search and search.strip():
+        s = search.strip()
+        rgx = {"$regex": re.escape(s), "$options": "i"}
+        query["$or"] = [{"operator": rgx}, {"action": rgx}, {"target": rgx}, {"details": rgx}]
+
+    if date_range and date_range.upper() != "ALL":
+        now = datetime.now(timezone.utc)
+        dr = date_range.upper()
+        if dr == "TODAY":
+            start_date = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+            query["created_at"] = {"$gte": start_date}
+        elif dr == "YESTERDAY":
+            start_date = datetime(now.year, now.month, now.day, tzinfo=timezone.utc) - timedelta(days=1)
+            end_date = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+            query["created_at"] = {"$gte": start_date, "$lt": end_date}
+        elif dr == "LAST_7_DAYS":
+            query["created_at"] = {"$gte": now - timedelta(days=7)}
+        elif dr == "LAST_30_DAYS":
+            query["created_at"] = {"$gte": now - timedelta(days=30)}
+
+    total = await db.audit_logs.count_documents(query)
+    return {"total": total}
+
 
 # ----------------- TOURNAMENT ADMIN (SCOPED) -----------------
 
@@ -966,7 +1052,8 @@ async def approve_payment(
         user_id=payment["user_id"],
         title="Payment Approved",
         message=f"Your payment of ₹{payment.get('amount_inr', 0)} for {payment.get('payment_type', 'Platform Service')} has been verified and approved.",
-        notification_type="PAYMENT",
+        notification_type="WALLET",
+        category="WALLET",
         link="/dashboard",
     )
 
@@ -1062,7 +1149,8 @@ async def reject_payment(
             user_id=payment["user_id"],
             title="Payment Rejected",
             message=f"Your payment of ₹{payment.get('amount_inr', 0)} was rejected: {reason}",
-            notification_type="PAYMENT",
+            notification_type="WALLET",
+            category="WALLET",
             link="/dashboard",
         )
     except Exception as e:
@@ -1232,7 +1320,8 @@ async def complete_payout(
         user_id=payout["user_id"],
         title="Payout Processed",
         message=f"Your payout of ₹{amt_inr:.2f} has been completed via UPI. Reference UTR: {out_utr}.",
-        notification_type="PAYMENT",
+        notification_type="WALLET",
+        category="WALLET",
         link="/dashboard",
     )
 
@@ -1289,7 +1378,8 @@ async def reject_payout(
         user_id=payout["user_id"],
         title="Payout Request Rejected",
         message=f"Your withdrawal request of ₹{amt_inr:.2f} was rejected: {payload.rejection_reason}. Reserved funds have been returned to your wallet.",
-        notification_type="PAYMENT",
+        notification_type="WALLET",
+        category="WALLET",
         link="/dashboard",
     )
 
@@ -3060,21 +3150,29 @@ async def send_admin_notification(
         if not user:
             user = await db.users.find_one({"_id": str(uid)})
         if user:
-            u_id_str = str(user.get("_id", user.get("id")))
+            notif_title = payload.title
+            if notif_title.strip().lower() == "response":
+                notif_title = "Admin Response"
             await create_notification(
                 db=db,
                 user_id=u_id_str,
-                title=payload.title,
+                title=notif_title,
                 message=payload.message,
                 notification_type=payload.notification_type or "ADMIN",
+                category=payload.category,
+                sender_role=admin_user.role,
+                sender_name=admin_user.username,
+                label="Admin Response",
                 link=payload.link,
             )
             await ws_manager.broadcast({
                 "type": "NOTIFICATION_RECEIVED",
                 "user_id": u_id_str,
-                "title": payload.title,
+                "title": notif_title,
                 "message": payload.message,
                 "link": payload.link,
+                "sender_role": admin_user.role,
+                "label": "Admin Response",
             })
             sent_count += 1
 

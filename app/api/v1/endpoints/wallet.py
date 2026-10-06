@@ -92,6 +92,16 @@ async def request_wallet_withdrawal(
         details=f"Reserved ₹{payload.amount_inr} to UPI {clean_upi}",
     )
 
+    await create_notification(
+        db=db,
+        user_id=current_user.id,
+        title="Withdrawal Requested",
+        message=f"Withdrawal request for ₹{payload.amount_inr:.2f} to {clean_upi} submitted. Funds are reserved pending admin review.",
+        notification_type="WALLET",
+        category="WALLET",
+        link="/wallet",
+    )
+
     return {
         "status": "success",
         "message": f"Withdrawal request for ₹{payload.amount_inr:.2f} submitted for admin review.",
@@ -183,7 +193,8 @@ async def deposit_wallet_funds(
             user_id=current_user.id,
             title="Deposit Submitted",
             message=f"Deposit reference {clean_utr} received. Wallet will be credited upon admin verification.",
-            notification_type="PAYMENT",
+            notification_type="WALLET",
+            category="WALLET",
             link="/wallet",
         )
 

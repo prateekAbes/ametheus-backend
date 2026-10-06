@@ -180,6 +180,9 @@ async def handle_organizer_match_request_action(
             title=f"Live Match Request {new_st}",
             message=f"Your request for '{req_doc.get('title')}' in {req_doc.get('tournament_title')} has been {new_st.lower()}. Notes: {payload.admin_notes or 'No admin notes provided.'}",
             notification_type="TOURNAMENT",
+            sender_role=admin_user.role or "SUPER_ADMIN",
+            sender_name=admin_user.username or "Ametheus Administration",
+            label="Admin Response",
             link="/organizer",
         )
 
@@ -393,9 +396,12 @@ async def admin_reply_organizer_email_thread(
         await create_notification(
             db=db,
             user_id=org_id,
-            title=f"Admin Message: {doc.get('subject')[:35]}",
+            title="Admin Response",
             message=f"Admin reply: {payload.message[:120]}",
             notification_type="SYSTEM",
+            sender_role=admin_user.role or "SUPER_ADMIN",
+            sender_name=admin_user.username or "Ametheus Administration",
+            label="Admin Response",
             link="/organizer",
         )
 

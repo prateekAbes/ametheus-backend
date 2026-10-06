@@ -178,6 +178,8 @@ async def init_db_indexes(db: AsyncIOMotorDatabase):
                 {"youtube_live_url": {"$exists": False}, "live_link": {"$ne": None}},
                 [{"$set": {"youtube_live_url": "$live_link"}}]
             )
+            from app.services.notification import migrate_notification_categories
+            await migrate_notification_categories(db)
         except Exception:
             pass
     except Exception as e:

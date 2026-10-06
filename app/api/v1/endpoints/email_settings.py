@@ -238,6 +238,20 @@ async def send_official_admin_email(
         async for u in cursor:
             add_recipient(u.get("email"), u.get("display_name") or u.get("username"))
 
+    elif rec_type in ("ALL_ORGANIZERS", "ORGANIZERS"):
+        cursor = db.users.find(
+            {
+                "$or": [
+                    {"role": {"$in": ["ORGANIZER", "organizer", "TOURNAMENT_ADMIN"]}},
+                    {"is_organizer": True},
+                ],
+                "email": {"$exists": True, "$ne": None},
+            },
+            {"email": 1, "display_name": 1, "username": 1}
+        )
+        async for u in cursor:
+            add_recipient(u.get("email"), u.get("display_name") or u.get("username"))
+
     elif rec_type == "SELECTED_USERS":
         if not payload.user_ids:
             raise HTTPException(status_code=400, detail="user_ids cannot be empty when recipient_type is 'SELECTED_USERS'")

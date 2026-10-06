@@ -217,3 +217,36 @@ async def test_bracket_advancement_and_completion(mock_db):
     final_in_db = await mock_db.matches.find_one({"_id": "final_1"})
     assert final_in_db["team_a_id"] == "team_w"
     assert final_in_db["team_a_name"] == "Winners"
+
+
+@pytest.mark.asyncio
+async def test_all_organizers_email_broadcast(client, mock_db):
+    """Test admin broadcasting official email to all registered organizers specifically."""
+    # Insert organizers and normal player
+    await mock_db.users.insert_one({"_id": "org_1", "id": "org_1", "email": "org1@test.com", "role": "ORGANIZER", "display_name": "OrgOne"})
+    await mock_db.users.insert_one({"_id": "org_2", "id": "org_2", "email": "org2@test.com", "role": "ORGANIZER", "display_name": "OrgTwo"})
+    await mock_db.users.insert_one({"_id": "player_1", "id": "player_1", "email": "player@test.com", "role": "PLAYER", "display_name": "PlayerOne"})
+
+    # 1. Dispatch using ALL_ORGANIZERS
+    payload1 = {
+        "recipient_type": "ALL_ORGANIZERS",
+        "subject": "Organizer Briefing",
+        "message": "Tournament operations protocol update.",
+    }
+    resp1 = await client.post("/api/v1/admin/email/official/send", json=payload1)
+    assert resp1.status_code == 200
+    data1 = resp1.json()
+    assert data1["recipient_count"] == 2
+    assert "2 recipient(s)" in data1["message"]
+
+    # 2. Dispatch using ORGANIZERS alias
+    payload2 = {
+        "recipient_type": "ORGANIZERS",
+        "subject": "Organizer Briefing 2",
+        "message": "Protocol update follow-up.",
+    }
+    resp2 = await client.post("/api/v1/admin/email/official/send", json=payload2)
+    assert resp2.status_code == 200
+    data2 = resp2.json()
+    assert data2["recipient_count"] == 2
+

@@ -204,3 +204,137 @@ async def test_team_creation_and_join_resilience(client, mock_db):
     assert len(joined_data["members"]) == 2
     assert any(m["game_handle"] == "p2#IND" for m in joined_data["members"])
 
+
+@pytest.mark.asyncio
+async def test_upi_account_permanent_delete_and_historical_integrity(client, mock_db):
+    """Verify permanent UPI deletion from database while preserving historical payment snapshots."""
+    # 1. Insert UPI account
+    await mock_db.upi_accounts.insert_one({
+        "_id": "upi_acc_99",
+        "code": "UPI99",
+        "upi_id": "merchant@bank",
+        "payee_name": "Ametheus Esports",
+        "qr_url": "media/qr_99.png",
+        "status": "ACTIVE",
+    })
+
+    # 2. Insert historical payment linked to this UPI account with snapshotted fields
+    await mock_db.game_payments.insert_one({
+        "_id": "pay_hist_1",
+        "user_id": "admin_123",
+        "amount_inr": 500.0,
+        "payment_account_id": "upi_acc_99",
+        "payment_account_code": "UPI99",
+        "upi_id": "merchant@bank",
+        "payee_name": "Ametheus Esports",
+        "qr_url": "media/qr_99.png",
+        "utr": "UTR123456",
+        "status": "APPROVED",
+    })
+
+    # 3. Permanently delete UPI account
+    del_resp = await client.delete("/api/v1/admin/upi-accounts/upi_acc_99")
+    assert del_resp.status_code == 200
+    assert del_resp.json()["status"] == "success"
+
+    # Verify UPI account is permanently gone from DB
+    in_db = await mock_db.upi_accounts.find_one({"_id": "upi_acc_99"})
+    assert in_db is None
+
+    # Verify historical payment record is untouched and still has all snapshotted details
+    pay_record = await mock_db.game_payments.find_one({"_id": "pay_hist_1"})
+    assert pay_record is not None
+    assert pay_record["upi_id"] == "merchant@bank"
+    assert pay_record["payment_account_code"] == "UPI99"
+    assert pay_record["qr_url"] == "media/qr_99.png"
+
+
+@pytest.mark.asyncio
+async def test_notification_clear_and_clear_all(client, mock_db):
+    """Verify clearing notifications hides them from active view but preserves DB records."""
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+
+    await mock_db.notifications.insert_one({
+        "_id": "notif_1",
+        "user_id": "admin_123",
+        "title": "Match Ready",
+        "message": "Your lobby is live",
+        "type": "MATCH",
+        "is_read": False,
+        "created_at": now,
+    })
+    await mock_db.notifications.insert_one({
+        "_id": "notif_2",
+        "user_id": "admin_123",
+        "title": "Wallet Credited",
+        "message": "Funds added",
+        "type": "WALLET",
+        "is_read": True,
+        "created_at": now,
+    })
+
+    # 1. Clear single notification
+    clr_resp = await client.post("/api/v1/notifications/notif_1/clear")
+    assert clr_resp.status_code == 200
+    assert clr_resp.json()["is_cleared"] is True
+
+    # Check active list returns only notif_2
+    active_resp = await client.get("/api/v1/notifications")
+    assert active_resp.status_code == 200
+    active_items = active_resp.json()["items"]
+    assert len(active_items) == 1
+    assert active_items[0]["id"] == "notif_2"
+
+    # Verify notif_1 is still in DB
+    db_notif1 = await mock_db.notifications.find_one({"_id": "notif_1"})
+    assert db_notif1 is not None
+    assert db_notif1["is_cleared"] is True
+
+    # 2. Clear all notifications
+    clr_all_resp = await client.post("/api/v1/notifications/clear-all")
+    assert clr_all_resp.status_code == 200
+
+    # Active list is now empty
+    active_empty = await client.get("/api/v1/notifications")
+    assert len(active_empty.json()["items"]) == 0
+
+    # But both records still exist in DB
+    total_db_count = await mock_db.notifications.count_documents({"user_id": "admin_123"})
+    assert total_db_count == 2
+
+
+@pytest.mark.asyncio
+async def test_audit_logs_timestamp_and_filtering(client, mock_db):
+    """Verify audit logs return valid timestamps, headers, and count endpoint."""
+    from datetime import datetime, timezone
+    dt = datetime(2026, 10, 6, 18, 30, 0, tzinfo=timezone.utc)
+
+    await mock_db.audit_logs.insert_one({
+        "_id": "log_1",
+        "operator": "superadmin",
+        "role": "SUPER_ADMIN",
+        "action": "PAYMENT_APPROVED",
+        "target": "Payment #1",
+        "created_at": dt,
+        "details": "Verified via UTR",
+    })
+
+    resp = await client.get("/api/v1/admin/audit-logs")
+    assert resp.status_code == 200
+    items = resp.json()
+    assert len(items) >= 1
+    assert "X-Total-Count" in resp.headers
+
+    # Verify timestamp and created_at are valid ISO strings, not 'None' or invalid
+    log_item = [x for x in items if x["id"] == "log_1"][0]
+    assert log_item["timestamp"] == dt.isoformat()
+    assert log_item["created_at"] == dt.isoformat()
+    assert log_item["details"] == "Verified via UTR"
+
+    # Verify count endpoint
+    count_resp = await client.get("/api/v1/admin/audit-logs/count?action=PAYMENT_APPROVED")
+    assert count_resp.status_code == 200
+    assert count_resp.json()["total"] >= 1
+
+

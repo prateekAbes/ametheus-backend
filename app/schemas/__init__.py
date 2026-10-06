@@ -261,12 +261,14 @@ class WalletBalanceResponse(BaseModel):
 # Admin
 class AuditLogResponse(BaseModel):
     id: str
-    timestamp: str
+    timestamp: Optional[str] = None
+    created_at: Optional[str] = None
     operator: str
     role: str
     action: str
     target: str
     ip_address: str
+    details: Optional[str] = None
     prev_hash: Optional[str] = None
     record_hash: Optional[str] = None
     is_archived: bool = False
@@ -278,6 +280,7 @@ class AuditLogResponse(BaseModel):
 class NotificationResponse(BaseModel):
     id: str
     type: str
+    category: str = "SYSTEM"
     title: str
     message: str
     is_read: bool
@@ -287,6 +290,10 @@ class NotificationResponse(BaseModel):
     archived_at: Optional[str] = None
     archived_by: Optional[str] = None
     archive_reason: Optional[str] = None
+    is_cleared: bool = False
+    sender_role: Optional[str] = None
+    sender_name: Optional[str] = None
+    label: Optional[str] = None
     model_config = ConfigDict(from_attributes=True)
 
 class NotificationListResponse(BaseModel):
@@ -401,6 +408,7 @@ class AdminSendNotificationRequest(BaseModel):
     title: str
     message: str
     notification_type: Optional[str] = "ADMIN"
+    category: Optional[str] = None
     link: Optional[str] = None
 
 # Match

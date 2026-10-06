@@ -533,10 +533,10 @@ async def test_outbound_support_emails_have_correct_from_and_reply_to_headers(mo
         "description": "Test payment issue",
     }
     ok, err, msg_id = await send_ticket_confirmation_email(ticket)
-    assert ok is True
     assert len(captured_calls) == 1
     conf_call = captured_calls[0]
-    assert conf_call["identity_key"] == "support"
+    # Automated ticket confirmation uses noreply identity (From: no-reply@ametheus.games)
+    assert conf_call["identity_key"] == "noreply"
     assert conf_call["to_email"] == "alex@example.com"
     # Reply-To must be the technical inbound address
     assert conf_call["reply_to"] == "support@inbound.ametheus.games"

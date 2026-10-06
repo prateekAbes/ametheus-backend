@@ -84,7 +84,7 @@ class SendTestEmailResponse(BaseModel):
 class OfficialEmailSendRequest(BaseModel):
     recipient_type: str = Field(
         ...,
-        description="Target audience: 'ALL_USERS', 'SELECTED_USERS', 'SELECTED_TEAMS', or 'CUSTOM_EMAILS'",
+        description="Target audience: 'ALL_USERS', 'ALL_ORGANIZERS', 'SELECTED_USERS', 'SELECTED_TEAMS', or 'CUSTOM_EMAILS'",
     )
     user_ids: Optional[list[str]] = Field(default=None, description="List of user IDs when recipient_type is 'SELECTED_USERS'")
     team_ids: Optional[list[str]] = Field(default=None, description="List of team IDs when recipient_type is 'SELECTED_TEAMS'")
@@ -96,8 +96,12 @@ class OfficialEmailSendRequest(BaseModel):
     @classmethod
     def validate_type(cls, v: str) -> str:
         clean = (v or "").strip().upper()
-        if clean not in ("ALL_USERS", "SELECTED_USERS", "SELECTED_TEAMS", "CUSTOM_EMAILS"):
-            raise ValueError("recipient_type must be one of: 'ALL_USERS', 'SELECTED_USERS', 'SELECTED_TEAMS', 'CUSTOM_EMAILS'")
+        if clean in ("ORGANIZERS", "ALL_ORGANIZERS", "ORGANIZER"):
+            return "ALL_ORGANIZERS"
+        if clean in ("CUSTOM_AUDIENCE", "CUSTOM"):
+            return "CUSTOM_EMAILS"
+        if clean not in ("ALL_USERS", "ALL_ORGANIZERS", "SELECTED_USERS", "SELECTED_TEAMS", "CUSTOM_EMAILS"):
+            raise ValueError("recipient_type must be one of: 'ALL_USERS', 'ALL_ORGANIZERS', 'SELECTED_USERS', 'SELECTED_TEAMS', 'CUSTOM_EMAILS'")
         return clean
 
 

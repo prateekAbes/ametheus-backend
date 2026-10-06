@@ -617,113 +617,134 @@ https://ametheus.gg
 # EXISTING APPLICATION EMAIL ROUTING IMPLEMENTATIONS (PRESERVED TEMPLATES)
 # =========================================================================
 
+def format_friendly_ticket_status(status_raw: Optional[str]) -> str:
+    """Returns customer-friendly status for support emails and customer notifications."""
+    s = (status_raw or "").strip().lower()
+    if s in ("waiting_for_admin", "waiting_for_support"):
+        return "Waiting for Support"
+    if s in ("waiting_for_user", "waiting_for_player", "waiting_for_contender", "waiting_for_response"):
+        return "Waiting for Your Response"
+    if s in ("open", "new"):
+        return "Open"
+    if s in ("in_progress", "investigating", "in-progress"):
+        return "In Progress"
+    if s in ("resolved", "solved"):
+        return "Resolved"
+    if s in ("closed", "concluded"):
+        return "Closed"
+    return s.replace("_", " ").title() if s else "Waiting for Support"
+
+
 async def send_ticket_confirmation_email(ticket: dict, db: Optional[AsyncIOMotorDatabase] = None) -> Tuple[bool, Optional[str], Optional[str]]:
     """
-    Sends confirmation receipt email to the user using the SUPPORT identity (support@ametheus.games).
-    Reply-To points directly to support@ametheus.games.
+    Sends automated confirmation receipt email to the user using the NO-REPLY / SYSTEM identity (no-reply@ametheus.games).
+    Reply-To points strictly to support@inbound.ametheus.games so user replies route via Resend into the support thread.
+    Message threading headers (Message-ID) are generated and returned for threading tracking.
     """
     ticket_id = ticket.get("ticket_id") or ticket.get("id") or "AMT-000000"
     user_name = ticket.get("name", "Contender")
     category = ticket.get("category", "General Inquiry").replace("_", " ").title()
-    payment_type = ticket.get("payment_type")
-    description = ticket.get("description", "")
-    created_at = ticket.get("created_at", "Just now")
+    description = (ticket.get("description") or "").strip()
+    status_friendly = format_friendly_ticket_status(ticket.get("status", "WAITING_FOR_ADMIN"))
     recipient = (ticket.get("email") or "").strip().lower()
 
     if not recipient:
-        return False, "Recipient email is missing"
+        return False, "Recipient email is missing", None
 
-    support_cfg = get_identity_config("support")
-    support_addr = support_cfg["email"]
-    subject = f"Ametheus Support Ticket Created — {ticket_id}"
-
-    payment_line_text = f"Payment Method / Type: {payment_type}\n" if payment_type and payment_type != "NOT_APPLICABLE" else ""
-    payment_line_html = f"<tr><td style='padding: 8px; color: #64748B;'>Payment Type:</td><td style='padding: 8px; font-weight: bold; color: #0F172A;'>{payment_type}</td></tr>" if payment_type and payment_type != "NOT_APPLICABLE" else ""
+    subject = f"Your support ticket has been created — #{ticket_id}"
 
     text_body = f"""Hello {user_name},
 
-Thank you for contacting Ametheus Operations Support.
-We have received your support request and assigned it the following official Ticket ID:
+Your support ticket has been created.
 
-Ticket ID: {ticket_id}
+Ticket ID: #{ticket_id}
+Status: {status_friendly}
 Category: {category}
-{payment_line_text}Submitted At: {created_at}
+
+We've received your request and our support team will review it.
 
 Issue Summary:
 {description}
 
-Our competition administration team investigates payment and tournament requests with priority.
-You can reply to this email directly or contact support at {support_addr} quoting your Ticket ID: {ticket_id}.
+Simply reply to this email to continue the conversation.
 
 —
-Ametheus Support Operations
-https://ametheus.gg
+Ametheus Support
 """
 
-    html_body = f"""
-<!DOCTYPE html>
+    html_body = f"""<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
   <title>{subject}</title>
 </head>
-<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background-color: #0B0E16; margin: 0; padding: 24px; color: #F8FAFC;">
-  <table width="100%" border="0" cellspacing="0" cellpadding="0" style="max-width: 600px; margin: 0 auto; background-color: #111622; border-radius: 12px; border: 1px solid #242C3D; overflow: hidden; box-shadow: 0 4px 10px rgba(0,0,0,0.5);">
+<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: #05060A; margin: 0; padding: 24px; color: #F4F6FA;">
+  <table width="100%" border="0" cellspacing="0" cellpadding="0" style="max-width: 600px; margin: 0 auto; background-color: #0B0E16; border: 1px solid #242C3D; border-radius: 4px; overflow: hidden;">
     <tr>
-      <td style="background-color: #1A2234; padding: 20px 24px; border-bottom: 2px solid #E56A10;">
-        <h1 style="color: #FFFFFF; margin: 0; font-size: 20px; font-weight: 800; letter-spacing: 1px;">AMETHEUS <span style="color: #E56A10;">SUPPORT</span></h1>
-        <p style="color: #94A3B8; margin: 4px 0 0 0; font-size: 11px; text-transform: uppercase; letter-spacing: 2px;">Official Ticket Receipt</p>
+      <td style="padding: 24px; border-bottom: 1px solid #242C3D; background-color: #0E121E;">
+        <h1 style="color: #FFFFFF; margin: 0; font-size: 18px; font-weight: 800; letter-spacing: 1.5px; text-transform: uppercase;">
+          AMETHEUS <span style="color: #3EF2FF;">SUPPORT</span>
+        </h1>
       </td>
     </tr>
     <tr>
-      <td style="padding: 28px 24px;">
-        <p style="margin: 0 0 16px 0; font-size: 14px; color: #94A3B8;">
-          Hello <strong style="color: #FFFFFF;">{user_name}</strong>,
+      <td style="padding: 32px 24px;">
+        <p style="margin: 0 0 16px 0; font-size: 16px; font-weight: 600; color: #FFFFFF;">
+          Hello {user_name},
         </p>
-        <p style="margin: 0 0 20px 0; font-size: 13px; line-height: 1.6; color: #CBD5E1;">
-          We have received your support inquiry. An operations specialist has been notified and will review your case.
+        <p style="margin: 0 0 24px 0; font-size: 14px; line-height: 1.6; color: #CBD5E1;">
+          Your support ticket has been created. We've received your request and our support team will review it.
         </p>
 
-        <div style="background-color: #0B0E16; border: 1px solid #E56A10; border-radius: 8px; padding: 18px; margin-bottom: 24px; text-align: center;">
-          <span style="font-size: 11px; font-family: monospace; text-transform: uppercase; letter-spacing: 1.5px; color: #94A3B8;">Official Ticket ID</span>
-          <div style="font-size: 26px; font-family: monospace; font-weight: 800; color: #E56A10; margin-top: 4px; letter-spacing: 2px;">
-            {ticket_id}
-          </div>
+        <div style="background-color: #121624; border: 1px solid #242C3D; border-left: 4px solid #3EF2FF; padding: 18px 20px; margin-bottom: 24px;">
+          <table width="100%" border="0" cellspacing="0" cellpadding="4" style="font-size: 13px;">
+            <tr>
+              <td style="color: #8C94A8; width: 100px; text-transform: uppercase; font-size: 11px; letter-spacing: 1px;">Ticket ID:</td>
+              <td style="color: #3EF2FF; font-weight: bold; font-family: monospace; font-size: 15px;">#{ticket_id}</td>
+            </tr>
+            <tr>
+              <td style="color: #8C94A8; text-transform: uppercase; font-size: 11px; letter-spacing: 1px;">Status:</td>
+              <td style="color: #10B981; font-weight: bold;">{status_friendly}</td>
+            </tr>
+            <tr>
+              <td style="color: #8C94A8; text-transform: uppercase; font-size: 11px; letter-spacing: 1px;">Category:</td>
+              <td style="color: #F8FAFC;">{category}</td>
+            </tr>
+          </table>
         </div>
 
-        <table width="100%" border="0" cellspacing="0" cellpadding="8" style="font-size: 13px; font-family: monospace; margin-bottom: 20px;">
-          <tr style="border-bottom: 1px solid #242C3D;">
-            <td style="color: #94A3B8; width: 140px;">Category:</td>
-            <td style="color: #FFFFFF; font-weight: bold;">{category}</td>
-          </tr>
-          {payment_line_html}
-          <tr style="border-bottom: 1px solid #242C3D;">
-            <td style="color: #94A3B8;">Submitted At:</td>
-            <td style="color: #94A3B8;">{created_at}</td>
-          </tr>
-        </table>
-
-        <div style="background-color: #0B0E16; border: 1px solid #242C3D; border-radius: 8px; padding: 16px; margin-bottom: 24px;">
-          <div style="font-size: 11px; font-family: monospace; text-transform: uppercase; color: #E56A10; margin-bottom: 8px; font-weight: bold;">Issue Summary:</div>
+        <div style="background-color: #0E121E; border: 1px solid #1E2536; padding: 16px; margin-bottom: 24px;">
+          <div style="font-size: 11px; text-transform: uppercase; color: #8C94A8; margin-bottom: 8px; letter-spacing: 1px; font-weight: 600;">Issue Summary:</div>
           <div style="font-size: 13px; line-height: 1.6; color: #E2E8F0; white-space: pre-wrap;">{description}</div>
         </div>
 
-        <p style="margin: 0; font-size: 12px; color: #94A3B8; line-height: 1.6;">
-          For expedited resolution, please quote <strong style="color: #E56A10;">{ticket_id}</strong> in any correspondence or email us at <a href="mailto:{support_addr}" style="color: #E56A10;">{support_addr}</a>.
+        <p style="margin: 0 0 8px 0; font-size: 13px; color: #CBD5E1; line-height: 1.6;">
+          Simply reply to this email to continue the conversation.
         </p>
       </td>
     </tr>
     <tr>
-      <td style="background-color: #0B0E16; padding: 16px 24px; text-align: center; border-top: 1px solid #242C3D; font-size: 11px; color: #64748B;">
-        &copy; 2026 AMETHEUS Esports Platform. All competitive integrity rights reserved.
+      <td style="background-color: #07090F; padding: 16px 24px; text-align: center; border-top: 1px solid #1E2536; font-size: 11px; color: #64748B;">
+        &copy; 2026 AMETHEUS Esports Platform. All rights reserved.
       </td>
     </tr>
   </table>
 </body>
-</html>
-"""
+</html>"""
 
-    return await send_support_email_threaded(recipient, subject, text_body, html_body)
+    # Send using NOREPLY identity (From: no-reply@ametheus.games) with technical Reply-To: support@inbound.ametheus.games
+    ok, err_code, err_det, msg_id, _ = await asyncio.to_thread(
+        _send_identity_smtp_sync,
+        "noreply",
+        recipient,
+        subject,
+        text_body,
+        html_body,
+        getattr(settings, "SUPPORT_INBOUND_EMAIL", "support@inbound.ametheus.games"),
+        None,
+        None,
+    )
+    return ok, err_det, msg_id
 
 
 async def send_admin_ticket_notification_email(

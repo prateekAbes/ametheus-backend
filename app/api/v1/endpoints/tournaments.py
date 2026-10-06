@@ -706,7 +706,8 @@ async def register_team_for_tournament(
             user_id=current_user.id,
             title="Tournament Registered",
             message=f'You are confirmed as a solo contender for "{tourn.get("title", "Tournament")}". Check bracket schedule for match timings.',
-            notification_type="TOURNAMENT",
+            notification_type="REGISTRATION",
+            category="REGISTRATION",
             link=f"/tournaments/{tourn.get('slug', tid)}",
         )
 
@@ -838,7 +839,8 @@ async def register_team_for_tournament(
         user_id=current_user.id,
         title="Tournament Registered",
         message=f'Team "{team["name"]}" is confirmed for "{tourn.get("title", "Tournament")}". Check bracket schedule for match timings.',
-        notification_type="TOURNAMENT",
+        notification_type="REGISTRATION",
+        category="REGISTRATION",
         link=f"/tournaments/{tourn.get('slug', tid)}",
     )
 
@@ -1261,7 +1263,8 @@ async def submit_tournament_upi_utr(
         user_id=current_user.id,
         title="Tournament UPI Payment Submitted",
         message=f"UTR {clean_utr} submitted for tournament registration. Slot held pending admin verification.",
-        notification_type="PAYMENT",
+        notification_type="WALLET",
+        category="WALLET",
         link=f"/tournaments/{id}",
     )
 

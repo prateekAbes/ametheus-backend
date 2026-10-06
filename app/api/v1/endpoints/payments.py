@@ -242,7 +242,8 @@ async def submit_payment_utr(
         user_id=current_user.id,
         title="Payment Submitted",
         message=f"UTR reference {clean_utr} submitted successfully. Wallet will be credited upon admin verification.",
-        notification_type="PAYMENT",
+        notification_type="WALLET",
+        category="WALLET",
         link="/dashboard",
     )
 

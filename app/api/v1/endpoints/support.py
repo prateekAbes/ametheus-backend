@@ -23,6 +23,7 @@ from app.schemas.support import (
 from app.services.email_service import (
     send_ticket_confirmation_email,
     send_admin_ticket_notification_email,
+    format_friendly_ticket_status,
 )
 from app.services.audit import record_audit_log
 from app.core.config import settings
@@ -276,7 +277,11 @@ async def create_support_ticket(
                 title=f"Support Ticket Submitted [{ticket_id}]",
                 message=f"Your support ticket for '{cat_upper}' has been received. Our operations team will review it shortly.",
                 notification_type="SYSTEM",
+                category="SYSTEM",
+                sender_role="SYSTEM",
+                label="System Notification",
                 link="/support",
+                send_email_copy=False,
             )
         except Exception:
             pass
@@ -307,10 +312,13 @@ async def create_support_ticket(
         return await send_ticket_confirmation_email(ticket_dict)
 
     async def _send_admin_mail():
-        return await send_admin_ticket_notification_email(
-            ticket_dict,
-            admin_recipient=configured_support_email,
-        )
+        # Only notify internal support desk if configured address is not the sender's own email
+        if configured_support_email and configured_support_email.lower() != email_clean:
+            return await send_admin_ticket_notification_email(
+                ticket_dict,
+                admin_recipient=configured_support_email,
+            )
+        return True, None
 
     try:
         results = await asyncio.wait_for(
@@ -750,25 +758,76 @@ async def reply_support_ticket(
     admin_msg_id = None
 
     if user_email:
-        email_html = f"""
-        <div style="font-family: sans-serif; background-color: #05060a; color: #f4f6fa; padding: 24px;">
-            <div style="max-width: 600px; margin: 0 auto; background-color: #0b0d17; border: 1px solid #222; border-radius: 8px; padding: 24px;">
-                <h2 style="color: #3ef2ff; margin-top: 0;">Ametheus Support — Ticket Update</h2>
-                <p>Hello <strong>{doc.get('name', 'Contender')}</strong>,</p>
-                <p>An official support arbiter has responded to your ticket <strong>[{clean_tid}]</strong> ({doc.get('category')}):</p>
-                <div style="background-color: #121526; border-left: 4px solid #3ef2ff; padding: 16px; margin: 20px 0; border-radius: 4px;">
-                    <p style="margin: 0; white-space: pre-wrap; font-size: 14px;">{payload.message}</p>
-                </div>
-                <p style="font-size: 12px; color: #888;">Status: <strong style="color: #3ef2ff;">{new_status}</strong></p>
-                <p style="font-size: 12px; color: #888;">You can reply directly to this email to follow up.</p>
-            </div>
+        friendly_status = format_friendly_ticket_status(new_status)
+        email_text = f"""Hello {doc.get('name', 'Contender')},
+
+Our support team has responded to your ticket [#{clean_tid}]:
+
+{payload.message.strip()}
+
+Status: {friendly_status}
+
+For replies to this ticket, simply reply to this email.
+
+—
+Ametheus Support
+"""
+
+        email_html = f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>{email_subject}</title>
+</head>
+<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: #05060A; color: #F4F6FA; padding: 24px; margin: 0;">
+  <table width="100%" border="0" cellspacing="0" cellpadding="0" style="max-width: 600px; margin: 0 auto; background-color: #0B0E16; border: 1px solid #242C3D; border-radius: 4px; overflow: hidden;">
+    <tr>
+      <td style="padding: 20px 24px; border-bottom: 1px solid #242C3D; background-color: #0E121E;">
+        <h2 style="color: #FFFFFF; margin: 0; font-size: 16px; font-weight: 800; letter-spacing: 1px; text-transform: uppercase;">
+          AMETHEUS <span style="color: #3EF2FF;">SUPPORT</span> — TICKET UPDATE
+        </h2>
+      </td>
+    </tr>
+    <tr>
+      <td style="padding: 28px 24px;">
+        <p style="margin: 0 0 12px 0; font-size: 15px; font-weight: 600; color: #FFFFFF;">
+          Hello {doc.get('name', 'Contender')},
+        </p>
+        <p style="margin: 0 0 20px 0; font-size: 13px; color: #CBD5E1; line-height: 1.6;">
+          Our support team has responded to your ticket <strong>[#{clean_tid}]</strong>:
+        </p>
+
+        <div style="background-color: #121624; border: 1px solid #242C3D; border-left: 4px solid #3EF2FF; padding: 18px 20px; margin: 20px 0;">
+          <p style="margin: 0; white-space: pre-wrap; font-size: 14px; line-height: 1.6; color: #F8FAFC;">{payload.message.strip()}</p>
         </div>
-        """
+
+        <div style="background-color: #0E121E; border: 1px solid #1E2536; padding: 12px 16px; margin-bottom: 20px;">
+          <table width="100%" border="0" cellspacing="0" cellpadding="2" style="font-size: 12px;">
+            <tr>
+              <td style="color: #8C94A8; width: 80px; text-transform: uppercase; font-size: 11px;">Status:</td>
+              <td style="color: #3EF2FF; font-weight: bold;">{friendly_status}</td>
+            </tr>
+          </table>
+        </div>
+
+        <p style="margin: 0; font-size: 13px; color: #CBD5E1; line-height: 1.6;">
+          For replies to this ticket, simply reply to this email.
+        </p>
+      </td>
+    </tr>
+    <tr>
+      <td style="background-color: #07090F; padding: 14px 24px; text-align: center; border-top: 1px solid #1E2536; font-size: 11px; color: #64748B;">
+        &copy; 2026 AMETHEUS Esports Platform. All rights reserved.
+      </td>
+    </tr>
+  </table>
+</body>
+</html>"""
         try:
             _, _, admin_msg_id = await send_support_email_threaded(
                 to_email=user_email,
                 subject=email_subject,
-                text_content=payload.message.strip(),
+                text_content=email_text,
                 html_content=email_html,
                 in_reply_to=in_reply_to,
                 references=references_header,
@@ -835,12 +894,18 @@ async def reply_support_ticket(
     user_id = doc.get("user_id")
     if user_id and not str(user_id).startswith("guest"):
         try:
+            admin_role = getattr(admin_user, "role", "ADMIN")
+            admin_name = getattr(admin_user, "username", None) or "Ametheus Support Team"
             await create_notification(
                 db=db,
                 user_id=str(user_id),
-                title=f"Support Ticket Update [{clean_tid}]",
-                message=f"Admin response: {payload.message[:120]}",
+                title="Admin Response",
+                message=f"Your support ticket has received a new response from the Ametheus support team: {payload.message[:120]}",
                 notification_type="SUPPORT",
+                category="SYSTEM",
+                sender_role=admin_role,
+                sender_name=admin_name,
+                label="Admin Response",
                 link="/support",
             )
         except Exception:

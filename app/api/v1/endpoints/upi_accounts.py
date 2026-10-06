@@ -253,3 +253,49 @@ async def upload_account_qr_base64(
         "media_id": media_result["id"],
         "account": UpiAccountResponse(**cleaned),
     }
+
+
+@router.delete("/{id}")
+async def delete_upi_account(
+    id: str,
+    admin_user: User = Depends(require_super_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Permanently delete a receiving UPI/QR account from MongoDB.
+    Historical payment records are completely safe and retain their snapshotted
+    payment-time data (UPI ID, payee name, QR URL, and account code).
+    """
+    from bson import ObjectId
+
+    find_clauses = [{"_id": id}, {"id": id}]
+    if ObjectId.is_valid(id):
+        find_clauses.append({"_id": ObjectId(id)})
+
+    acc = await db.upi_accounts.find_one({"$or": find_clauses})
+    if not acc:
+        raise HTTPException(status_code=404, detail="UPI account not found")
+
+    acc_id_str = str(acc.get("_id", acc.get("id")))
+    acc_code = acc.get("code", "UNKNOWN")
+    acc_upi = acc.get("upi_id", "")
+
+    # Permanently delete the specific UPI QR record from the database
+    await db.upi_accounts.delete_one({"_id": acc["_id"]})
+
+    # Log the permanent deletion into the cryptographic audit trail
+    await record_audit_log(
+        db=db,
+        operator=admin_user.username,
+        role="SUPER_ADMIN",
+        action="DELETE_UPI_ACCOUNT",
+        target=f"UPI Account {acc_code} ({acc_upi})",
+        details=f"Permanently deleted receiving UPI/QR account {acc_code}. Historical payment records retain payment-time snapshots.",
+    )
+
+    return {
+        "status": "success",
+        "message": f"UPI account {acc_code} ({acc_upi}) permanently deleted from system.",
+        "deleted_id": acc_id_str,
+    }
+

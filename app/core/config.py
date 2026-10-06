@@ -56,8 +56,8 @@ class Settings(BaseSettings):
     SUPPORT_EMAIL: str = "support@ametheus.games"
     SUPPORT_EMAIL_NAME: str = "Ametheus Support"
 
-    NOREPLY_EMAIL: str = "noreply@ametheus.games"
-    NOREPLY_EMAIL_NAME: str = "Ametheus"
+    NOREPLY_EMAIL: str = "no-reply@ametheus.games"
+    NOREPLY_EMAIL_NAME: str = "Ametheus Support"
 
     # Default reply-to address
     EMAIL_REPLY_TO: str = "support@ametheus.games"
