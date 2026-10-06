@@ -62,8 +62,17 @@ class Settings(BaseSettings):
     # Default reply-to address
     EMAIL_REPLY_TO: str = "support@ametheus.games"
 
+    # Technical inbound reply-to address for routing user email replies through Resend
+    SUPPORT_INBOUND_EMAIL: str = "support@inbound.ametheus.games"
+
     # Compatibility alias
     AUTOMATED_EMAIL: str = "noreply@ametheus.games"
+
+    # =========================================================
+    # RESEND INBOUND EMAIL CONFIGURATION
+    # =========================================================
+    RESEND_API_KEY: Optional[str] = None
+    RESEND_WEBHOOK_SECRET: Optional[str] = None
 
     @field_validator(
         "EMAIL_ENABLED",

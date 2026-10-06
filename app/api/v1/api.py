@@ -19,6 +19,7 @@ from app.api.v1.endpoints import (
     genres,
     reviews,
     organizer_communications,
+    webhooks,
 )
 
 api_router = APIRouter()
@@ -45,3 +46,4 @@ api_router.include_router(tournaments.router, prefix="/tournaments", tags=["Tour
 api_router.include_router(matches.router, prefix="/matches", tags=["Matches"])
 api_router.include_router(support.router, prefix="/support", tags=["Support & Tickets"])
 api_router.include_router(regulations.router, prefix="/regulations", tags=["Tournament Regulations & Discipline"])
+api_router.include_router(webhooks.router, prefix="/webhooks", tags=["Inbound Webhooks"])

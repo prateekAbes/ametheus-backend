@@ -44,7 +44,7 @@ def get_identity_config(identity: str) -> Dict[str, Any]:
             "username": username,
             "password": password,
             "use_tls": use_tls,
-            "reply_to": settings.SUPPORT_EMAIL.strip(),
+            "reply_to": getattr(settings, "SUPPORT_INBOUND_EMAIL", "support@inbound.ametheus.games").strip(),
         }
     elif norm in ("noreply", "no-reply", "automated", "system"):
         return {
@@ -81,6 +81,8 @@ def _send_identity_smtp_sync(
     text_content: str,
     html_content: str,
     reply_to: Optional[str] = None,
+    in_reply_to: Optional[str] = None,
+    references: Optional[str] = None,
 ) -> Tuple[bool, Optional[str], Optional[str], Optional[str], str]:
     """
     Synchronous SMTP delivery through Brevo SMTP using the selected sender identity.
@@ -97,7 +99,7 @@ def _send_identity_smtp_sync(
 
     if not settings.EMAIL_ENABLED:
         logger.info(f"[Ametheus Email] Email delivery disabled (EMAIL_ENABLED=False). Mocking delivery to <{to_email_clean}> | Subject: '{subject}'")
-        return True, None, None, f"MOCK-{uuid.uuid4().hex[:8].upper()}", sender_used
+        return True, None, None, f"MOCK-{uuid.uuid4().hex[:8].upper()}@ametheus.games", sender_used
 
     if not cfg["password"] or not cfg["username"] or not cfg["host"]:
         logger.warning(
@@ -113,6 +115,15 @@ def _send_identity_smtp_sync(
     msg["To"] = to_email_clean
     msg["Message-ID"] = f"<{msg_id}>"
     msg["Reply-To"] = reply_to or cfg["reply_to"]
+
+    if in_reply_to:
+        clean_in_reply_to = in_reply_to.strip()
+        if not clean_in_reply_to.startswith("<"):
+            clean_in_reply_to = f"<{clean_in_reply_to}>"
+        msg["In-Reply-To"] = clean_in_reply_to
+
+    if references:
+        msg["References"] = references.strip()
 
     part1 = MIMEText(text_content, "plain", "utf-8")
     part2 = MIMEText(html_content, "html", "utf-8")
@@ -223,6 +234,34 @@ async def send_support_email(
         html_content=html_content,
         reply_to=reply_to or settings.SUPPORT_EMAIL,
     )
+
+
+async def send_support_email_threaded(
+    to_email: str,
+    subject: str,
+    text_content: str,
+    html_content: str,
+    reply_to: Optional[str] = None,
+    in_reply_to: Optional[str] = None,
+    references: Optional[str] = None,
+) -> Tuple[bool, Optional[str], Optional[str]]:
+    """
+    Sends an email using the SUPPORT identity (support@ametheus.games) with email threading headers (In-Reply-To, References).
+    Routes strictly via existing Brevo SMTP.
+    Returns: (success: bool, error_details: Optional[str], message_id: Optional[str])
+    """
+    ok, err_code, err_det, msg_id, _ = await asyncio.to_thread(
+        _send_identity_smtp_sync,
+        "support",
+        to_email,
+        subject,
+        text_content,
+        html_content,
+        reply_to or getattr(settings, "SUPPORT_INBOUND_EMAIL", "support@inbound.ametheus.games"),
+        in_reply_to,
+        references,
+    )
+    return ok, err_det, msg_id
 
 
 async def send_noreply_email(
@@ -578,7 +617,7 @@ https://ametheus.gg
 # EXISTING APPLICATION EMAIL ROUTING IMPLEMENTATIONS (PRESERVED TEMPLATES)
 # =========================================================================
 
-async def send_ticket_confirmation_email(ticket: dict, db: Optional[AsyncIOMotorDatabase] = None) -> Tuple[bool, Optional[str]]:
+async def send_ticket_confirmation_email(ticket: dict, db: Optional[AsyncIOMotorDatabase] = None) -> Tuple[bool, Optional[str], Optional[str]]:
     """
     Sends confirmation receipt email to the user using the SUPPORT identity (support@ametheus.games).
     Reply-To points directly to support@ametheus.games.
@@ -684,7 +723,7 @@ https://ametheus.gg
 </html>
 """
 
-    return await send_support_email(recipient, subject, text_body, html_body)
+    return await send_support_email_threaded(recipient, subject, text_body, html_body)
 
 
 async def send_admin_ticket_notification_email(

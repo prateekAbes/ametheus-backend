@@ -51,6 +51,38 @@ class SupportLogResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True, extra="ignore")
 
 
+class SupportAttachmentResponse(BaseModel):
+    id: str
+    filename: str
+    content_type: str = "application/octet-stream"
+    size: int = 0
+    url: Optional[str] = None
+    model_config = ConfigDict(from_attributes=True, extra="ignore")
+
+
+class SupportMessageResponse(BaseModel):
+    id: str
+    ticket_id: str
+    thread_id: Optional[str] = None
+    sender_id: Optional[str] = None
+    sender_email: Optional[str] = None
+    sender_name: str = "User"
+    recipient_email: Optional[str] = None
+    subject: Optional[str] = None
+    body_text: Optional[str] = None
+    body_html: Optional[str] = None
+    message: str = ""
+    message_id: Optional[str] = None
+    in_reply_to: Optional[str] = None
+    references: Optional[List[str]] = None
+    direction: str = "inbound"
+    message_type: str = "USER"
+    sender_role: str = "USER"
+    attachments: List[SupportAttachmentResponse] = Field(default_factory=list)
+    created_at: str
+    model_config = ConfigDict(from_attributes=True, extra="ignore")
+
+
 class SupportTicketResponse(BaseModel):
     id: str
     ticket_id: str
@@ -67,7 +99,10 @@ class SupportTicketResponse(BaseModel):
     email_error: Optional[str] = None
     user_email_status: Optional[str] = None
     support_email_status: Optional[str] = None
-    messages: List[dict] = Field(default_factory=list)
+    has_new_reply: bool = False
+    last_message_at: Optional[str] = None
+    last_message_by: Optional[str] = None
+    messages: List[SupportMessageResponse] = Field(default_factory=list)
     logs: List[SupportLogResponse] = Field(default_factory=list)
     is_archived: bool = False
     archived_at: Optional[str] = None

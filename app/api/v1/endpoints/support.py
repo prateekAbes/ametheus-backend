@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from app.api.deps import get_db, get_current_user, get_current_user_optional, require_organizer
 from app.models.user import User
-from app.models.support import SupportTicket, SupportLogEntry, generate_ticket_id
+from app.models.support import SupportTicket, SupportMessage, SupportLogEntry, generate_ticket_id
 from app.schemas.support import (
     SupportTicketCreateRequest,
     SupportTicketUpdateRequest,
@@ -74,6 +74,38 @@ async def _get_configured_support_email(db: AsyncIOMotorDatabase) -> str:
     return getattr(settings, "SUPPORT_ADMIN_EMAIL", None) or "support@tenetadmissions.com"
 
 
+def _clean_message_dict(m: dict, ticket_id: str) -> dict:
+    msg = dict(m)
+    msg["id"] = str(msg.get("id") or msg.get("_id") or f"msg_{datetime.now(timezone.utc).timestamp()}")
+    msg["ticket_id"] = str(msg.get("ticket_id") or ticket_id)
+    msg["sender_name"] = str(msg.get("sender_name") or "User")
+    msg["message"] = str(msg.get("message") or msg.get("body_text") or "")
+    role = str(msg.get("sender_role") or "USER").upper()
+    if role not in ("USER", "ADMIN", "SYSTEM"):
+        role = "USER"
+    msg["sender_role"] = role
+    mtype = str(msg.get("message_type") or role).upper()
+    if mtype not in ("USER", "ADMIN", "SYSTEM"):
+        mtype = role
+    msg["message_type"] = mtype
+    msg["direction"] = str(msg.get("direction") or ("outbound" if role in ("ADMIN", "SYSTEM") else "inbound"))
+    msg["created_at"] = str(msg.get("created_at") or datetime.now(timezone.utc).isoformat())
+    raw_attachments = msg.get("attachments", [])
+    clean_attachments = []
+    if isinstance(raw_attachments, list):
+        for att in raw_attachments:
+            if isinstance(att, dict):
+                clean_attachments.append({
+                    "id": str(att.get("id") or "att_1"),
+                    "filename": str(att.get("filename") or "attachment"),
+                    "content_type": str(att.get("content_type") or att.get("contentType") or "application/octet-stream"),
+                    "size": int(att.get("size") or 0),
+                    "url": att.get("url") or att.get("download_url"),
+                })
+    msg["attachments"] = clean_attachments
+    return msg
+
+
 def _clean_ticket_doc(doc: dict) -> dict:
     item = dict(doc)
     item["id"] = str(item.get("_id", item.get("id", "")))
@@ -85,31 +117,39 @@ def _clean_ticket_doc(doc: dict) -> dict:
     item["archived_at"] = str(item.get("archived_at")) if item.get("archived_at") else None
     item["archived_by"] = item.get("archived_by")
     item["archive_reason"] = item.get("archive_reason")
+    item["has_new_reply"] = bool(item.get("has_new_reply", False))
+    item["last_message_at"] = item.get("last_message_at")
+    item["last_message_by"] = item.get("last_message_by")
 
-    # Strict normalization to the 5 standard support ticket statuses
+    # Strict normalization to the standard support ticket statuses
     raw_status = str(item.get("status", "OPEN")).strip().upper().replace(" ", "_")
     if raw_status in ("NEW", "UNREAD"):
         raw_status = "OPEN"
-    elif raw_status in ("WAITING_FOR_ADMIN", "ON_HOLD"):
+    elif raw_status == "ON_HOLD":
         raw_status = "IN_PROGRESS"
-    elif raw_status not in ("OPEN", "IN_PROGRESS", "WAITING_FOR_USER", "RESOLVED", "CLOSED", "ARCHIVED"):
+    elif raw_status not in ("OPEN", "IN_PROGRESS", "WAITING_FOR_USER", "WAITING_FOR_ADMIN", "RESOLVED", "CLOSED", "ARCHIVED"):
         # Prevent tournament/game statuses like REGISTRATION_OPEN from ever appearing
         raw_status = "OPEN"
     item["status"] = raw_status
 
+    tid = item.get("ticket_id") or item.get("id", "")
     raw_msgs = item.get("messages", [])
     if not raw_msgs and item.get("description"):
         raw_msgs = [
             {
                 "id": "msg_initial",
+                "ticket_id": tid,
                 "sender_id": item.get("user_id") or "user",
                 "sender_name": item.get("name", "Contender"),
                 "sender_role": "USER",
+                "message_type": "USER",
+                "direction": "inbound",
                 "message": item.get("description", ""),
                 "created_at": str(item.get("created_at") or datetime.now(timezone.utc).isoformat()),
+                "attachments": [],
             }
         ]
-    item["messages"] = raw_msgs
+    item["messages"] = [_clean_message_dict(m, tid) for m in raw_msgs]
     return item
 
 
@@ -183,14 +223,38 @@ async def create_support_ticket(
         category=cat_upper,
         payment_type=payment_type,
         description=desc,
-        status="OPEN",
+        status="WAITING_FOR_ADMIN",
+        has_new_reply=True,
+        last_message_at=now_iso,
+        last_message_by=raw_name,
         email_status="PENDING",
+        messages=[],
         logs=[init_log],
         created_at=now_iso,
         updated_at=now_iso,
     )
 
+    initial_user_msg = SupportMessage(
+        ticket_id=ticket_id,
+        thread_id=ticket_id,
+        sender_id=user_id,
+        sender_email=email_clean,
+        sender_name=raw_name,
+        recipient_email=settings.SUPPORT_EMAIL,
+        subject=payload.subject or f"Support Ticket [{ticket_id}]",
+        body_text=desc,
+        message=desc,
+        message_id=f"<AMT-INIT-{ticket_id}@ametheus.games>",
+        direction="inbound",
+        message_type="USER",
+        sender_role="USER",
+        created_at=now_iso,
+    )
+    initial_user_msg_doc = initial_user_msg.to_mongo()
+    await db.support_messages.insert_one(initial_user_msg_doc)
+
     doc = ticket.to_mongo()
+    doc["messages"] = [initial_user_msg_doc]
     await db.support_tickets.insert_one(doc)
     await db.support_logs.insert_one(init_log.to_mongo())
 
@@ -234,6 +298,7 @@ async def create_support_ticket(
 
     user_mail_ok = False
     user_mail_err = None
+    confirm_msg_id = None
     admin_mail_ok = False
     admin_mail_err = None
 
@@ -253,12 +318,15 @@ async def create_support_ticket(
             timeout=2.0,
         )
         if isinstance(results[0], tuple):
-            user_mail_ok, user_mail_err = results[0]
+            user_mail_ok = results[0][0]
+            user_mail_err = results[0][1] if len(results[0]) > 1 else None
+            confirm_msg_id = results[0][2] if len(results[0]) > 2 else None
         elif isinstance(results[0], Exception):
             user_mail_err = str(results[0])
 
         if isinstance(results[1], tuple):
-            admin_mail_ok, admin_mail_err = results[1]
+            admin_mail_ok = results[1][0]
+            admin_mail_err = results[1][1] if len(results[1]) > 1 else None
         elif isinstance(results[1], Exception):
             admin_mail_err = str(results[1])
     except asyncio.TimeoutError:
@@ -297,6 +365,24 @@ async def create_support_ticket(
         details="Confirmation email delivered to user and admin" if email_status == "SENT" else f"Email status: {email_status}. Notes: {email_error_summary}",
     )
 
+    system_confirm_msg = SupportMessage(
+        ticket_id=ticket_id,
+        thread_id=ticket_id,
+        sender_email=settings.SUPPORT_EMAIL,
+        sender_name="Ametheus System",
+        recipient_email=email_clean,
+        subject=f"Ametheus Support Ticket Created — {ticket_id}",
+        body_text=f"Automated confirmation receipt dispatched to {email_clean}." if user_mail_ok else f"Automated confirmation attempted. Status: {user_mail_err or 'queued'}",
+        message=f"Automated confirmation receipt dispatched to {email_clean}." if user_mail_ok else f"Automated confirmation attempted. Status: {user_mail_err or 'queued'}",
+        message_id=confirm_msg_id or f"<AMT-CONFIRM-{ticket_id}@ametheus.games>",
+        direction="outbound",
+        message_type="SYSTEM",
+        sender_role="SYSTEM",
+        created_at=datetime.now(timezone.utc).isoformat(),
+    )
+    sys_doc = system_confirm_msg.to_mongo()
+    await db.support_messages.insert_one(sys_doc)
+
     try:
         await db.support_logs.insert_one(email_log.to_mongo())
         await db.support_tickets.update_one(
@@ -308,7 +394,10 @@ async def create_support_ticket(
                     "user_email_status": user_email_status,
                     "support_email_status": support_email_status,
                 },
-                "$push": {"logs": email_log.to_mongo()},
+                "$push": {
+                    "messages": sys_doc,
+                    "logs": email_log.to_mongo(),
+                },
             },
         )
     except Exception:
@@ -465,11 +554,25 @@ async def get_support_ticket_details(
             detail=f"Support ticket '{ticket_id}' not found.",
         )
 
+    clean_tid = doc.get("ticket_id", ticket_id)
+
+    # Retrieve all standalone messages associated with this ticket
+    msg_cursor = db.support_messages.find({"ticket_id": clean_tid}).sort("created_at", 1)
+    db_msgs = await msg_cursor.to_list(length=200)
+
     # Retrieve all standalone logs associated with this ticket
-    log_cursor = db.support_logs.find({"ticket_id": doc.get("ticket_id", ticket_id)}).sort("timestamp", 1)
+    log_cursor = db.support_logs.find({"ticket_id": clean_tid}).sort("timestamp", 1)
     db_logs = await log_cursor.to_list(length=100)
 
     cleaned = _clean_ticket_doc(doc)
+    if db_msgs:
+        existing_msg_ids = {m["id"] for m in cleaned.get("messages", [])}
+        for m in db_msgs:
+            m_id = str(m.get("id") or m.get("_id"))
+            if m_id not in existing_msg_ids:
+                cleaned.setdefault("messages", []).append(_clean_message_dict(m, clean_tid))
+        cleaned["messages"].sort(key=lambda x: str(x.get("created_at", "")))
+
     if db_logs:
         # Merge logs cleanly
         log_ids = {l["id"] for l in cleaned.get("logs", [])}
@@ -504,12 +607,12 @@ async def update_support_ticket(
         st_upper = payload.status.strip().upper().replace(" ", "_")
         if st_upper in ("NEW", "UNREAD"):
             st_upper = "OPEN"
-        elif st_upper in ("WAITING_FOR_ADMIN", "ON_HOLD"):
+        elif st_upper == "ON_HOLD":
             st_upper = "IN_PROGRESS"
         if st_upper not in VALID_STATUSES:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Invalid status '{payload.status}'. Allowed: ['OPEN', 'IN_PROGRESS', 'WAITING_FOR_USER', 'RESOLVED', 'CLOSED']",
+                detail=f"Invalid status '{payload.status}'. Allowed: ['OPEN', 'IN_PROGRESS', 'WAITING_FOR_USER', 'WAITING_FOR_ADMIN', 'RESOLVED', 'CLOSED']",
             )
         old_status = doc.get("status", "OPEN")
         if old_status != st_upper:
@@ -609,15 +712,16 @@ async def reply_support_ticket(
 ):
     """
     Admin sends a direct reply in the ticket conversation thread.
-    - Appends to messages array
-    - Dispatches Brevo email to user's email address
+    - Sends email via Brevo SMTP with In-Reply-To and References threading headers
+    - Saves ADMIN SupportMessage to support_messages collection and ticket.messages
+    - Transitions ticket status to WAITING_FOR_USER (or RESOLVED/CLOSED if specified)
+    - Resets has_new_reply flag to False
     - Dispatches in-app notification to user
-    - Updates ticket status (e.g. WAITING_FOR_USER)
     - Records audit and support logs
     """
-    import uuid
+    import secrets
     from app.services.notification import create_notification
-    from app.services.email_service import send_support_email
+    from app.services.email_service import send_support_email_threaded
 
     doc = await db.support_tickets.find_one({"$or": [{"_id": ticket_id}, {"ticket_id": ticket_id}, {"id": ticket_id}]})
     if not doc:
@@ -627,18 +731,75 @@ async def reply_support_ticket(
     now_iso = datetime.now(timezone.utc).isoformat()
     actor_name = admin_user.display_name or admin_user.username or "Ametheus Arbiter"
 
-    reply_msg = {
-        "id": f"msg_{uuid.uuid4().hex[:10]}",
-        "sender_id": admin_user.id,
-        "sender_name": actor_name,
-        "sender_role": "ADMIN",
-        "message": payload.message.strip(),
-        "created_at": now_iso,
-    }
-
-    new_status = (payload.status or "WAITING_FOR_USER").strip().upper()
-    if new_status not in VALID_STATUSES:
+    # Status transition: Admin reply sets status to WAITING_FOR_USER unless RESOLVED or CLOSED was chosen
+    raw_target_status = (payload.status or "WAITING_FOR_USER").strip().upper().replace(" ", "_")
+    if raw_target_status in ("RESOLVED", "CLOSED"):
+        new_status = raw_target_status
+    else:
         new_status = "WAITING_FOR_USER"
+
+    # Fetch previous messages to extract Message-IDs for threading
+    prev_messages = await db.support_messages.find({"ticket_id": clean_tid}).sort("created_at", 1).to_list(length=200)
+    all_msg_ids = [m.get("message_id") for m in prev_messages if m.get("message_id")]
+    last_msg_id = all_msg_ids[-1] if all_msg_ids else None
+    in_reply_to = last_msg_id
+    references_header = " ".join(all_msg_ids) if all_msg_ids else None
+
+    user_email = (doc.get("email") or "").strip().lower()
+    email_subject = f"Re: [Ticket {clean_tid}] {doc.get('category')} — Ametheus Support"
+    admin_msg_id = None
+
+    if user_email:
+        email_html = f"""
+        <div style="font-family: sans-serif; background-color: #05060a; color: #f4f6fa; padding: 24px;">
+            <div style="max-width: 600px; margin: 0 auto; background-color: #0b0d17; border: 1px solid #222; border-radius: 8px; padding: 24px;">
+                <h2 style="color: #3ef2ff; margin-top: 0;">Ametheus Support — Ticket Update</h2>
+                <p>Hello <strong>{doc.get('name', 'Contender')}</strong>,</p>
+                <p>An official support arbiter has responded to your ticket <strong>[{clean_tid}]</strong> ({doc.get('category')}):</p>
+                <div style="background-color: #121526; border-left: 4px solid #3ef2ff; padding: 16px; margin: 20px 0; border-radius: 4px;">
+                    <p style="margin: 0; white-space: pre-wrap; font-size: 14px;">{payload.message}</p>
+                </div>
+                <p style="font-size: 12px; color: #888;">Status: <strong style="color: #3ef2ff;">{new_status}</strong></p>
+                <p style="font-size: 12px; color: #888;">You can reply directly to this email to follow up.</p>
+            </div>
+        </div>
+        """
+        try:
+            _, _, admin_msg_id = await send_support_email_threaded(
+                to_email=user_email,
+                subject=email_subject,
+                text_content=payload.message.strip(),
+                html_content=email_html,
+                in_reply_to=in_reply_to,
+                references=references_header,
+            )
+        except Exception:
+            pass
+
+    if not admin_msg_id:
+        admin_msg_id = f"<AMT-REPLY-{secrets.token_hex(6)}@ametheus.games>"
+
+    # Save ADMIN SupportMessage
+    admin_msg = SupportMessage(
+        ticket_id=clean_tid,
+        thread_id=clean_tid,
+        sender_id=admin_user.id,
+        sender_email=settings.SUPPORT_EMAIL,
+        sender_name=actor_name,
+        recipient_email=user_email,
+        subject=email_subject,
+        body_text=payload.message.strip(),
+        message=payload.message.strip(),
+        message_id=admin_msg_id,
+        in_reply_to=in_reply_to,
+        references=all_msg_ids,
+        direction="outbound",
+        message_type="ADMIN",
+        sender_role="ADMIN",
+        created_at=now_iso,
+    )
+    admin_msg_doc = admin_msg.to_mongo()
+    await db.support_messages.insert_one(admin_msg_doc)
 
     reply_log = SupportLogEntry(
         ticket_id=clean_tid,
@@ -652,6 +813,9 @@ async def reply_support_ticket(
 
     update_fields = {
         "status": new_status,
+        "has_new_reply": False,
+        "last_message_at": now_iso,
+        "last_message_by": actor_name,
         "updated_at": now_iso,
     }
     if new_status in ("RESOLVED", "CLOSED"):
@@ -662,7 +826,7 @@ async def reply_support_ticket(
         {
             "$set": update_fields,
             "$push": {
-                "messages": reply_msg,
+                "messages": admin_msg_doc,
                 "logs": reply_log.to_mongo(),
             },
         },
@@ -670,43 +834,25 @@ async def reply_support_ticket(
 
     user_id = doc.get("user_id")
     if user_id and not str(user_id).startswith("guest"):
-        await create_notification(
-            db=db,
-            user_id=str(user_id),
-            title=f"Support Ticket Update [{clean_tid}]",
-            message=f"Admin response: {payload.message[:120]}",
-            notification_type="SUPPORT",
-            link="/support",
-        )
-
-    user_email = doc.get("email")
-    if user_email:
-        email_html = f"""
-        <div style="font-family: sans-serif; background-color: #05060a; color: #f4f6fa; padding: 24px;">
-            <div style="max-width: 600px; margin: 0 auto; background-color: #0b0d17; border: 1px solid #222; border-radius: 8px; padding: 24px;">
-                <h2 style="color: #3ef2ff; margin-top: 0;">Ametheus Support — Ticket Update</h2>
-                <p>Hello <strong>{doc.get('name', 'Contender')}</strong>,</p>
-                <p>An official support arbiter has responded to your ticket <strong>[{clean_tid}]</strong> ({doc.get('category')}):</p>
-                <div style="background-color: #121526; border-left: 4px solid #3ef2ff; padding: 16px; margin: 20px 0; border-radius: 4px;">
-                    <p style="margin: 0; white-space: pre-wrap; font-size: 14px;">{payload.message}</p>
-                </div>
-                <p style="font-size: 12px; color: #888;">Status: <strong style="color: #3ef2ff;">{new_status}</strong></p>
-                <p style="font-size: 12px; color: #888;">You can reply to this email or visit the platform support desk to follow up.</p>
-            </div>
-        </div>
-        """
         try:
-            await send_support_email(
-                to_email=user_email,
-                subject=f"Re: [Ticket {clean_tid}] {doc.get('category')} — Ametheus Support",
-                text_content=payload.message,
-                html_content=email_html,
+            await create_notification(
+                db=db,
+                user_id=str(user_id),
+                title=f"Support Ticket Update [{clean_tid}]",
+                message=f"Admin response: {payload.message[:120]}",
+                notification_type="SUPPORT",
+                link="/support",
             )
         except Exception:
             pass
 
     refreshed = await db.support_tickets.find_one({"_id": doc["_id"]})
-    return SupportTicketResponse(**_clean_ticket_doc(refreshed))
+    clean_resp = _clean_ticket_doc(refreshed)
+    # Ensure all messages including newest are returned
+    all_current_msgs = await db.support_messages.find({"ticket_id": clean_tid}).sort("created_at", 1).to_list(length=200)
+    if all_current_msgs:
+        clean_resp["messages"] = [_clean_message_dict(m, clean_tid) for m in all_current_msgs]
+    return SupportTicketResponse(**clean_resp)
 
 
 @router.post("/tickets/{ticket_id}/retry-email", response_model=SupportTicketResponse)

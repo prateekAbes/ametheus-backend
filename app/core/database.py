@@ -147,10 +147,26 @@ async def init_db_indexes(db: AsyncIOMotorDatabase):
         await db.notifications.create_index([("user_id", 1), ("is_read", 1)])
         await db.notifications.create_index("is_archived")
 
-        # Support Tickets & Payments Archival Indexes
+        # Support Tickets & Messages Indexes
         await db.game_payments.create_index("is_archived")
         await db.wallet_ledger.create_index("is_archived")
         await db.support_tickets.create_index("is_archived")
+        await db.support_tickets.create_index("ticket_id")
+        await db.support_tickets.create_index("email")
+        await db.support_tickets.create_index("has_new_reply")
+
+        # Inbound Support Messages Collection Indexes
+        await db.support_messages.create_index(
+            "message_id",
+            unique=True,
+            sparse=True,
+            partialFilterExpression={"message_id": {"$type": "string"}},
+            name="support_msg_id_unique",
+        )
+        await db.support_messages.create_index("ticket_id")
+        await db.support_messages.create_index("in_reply_to")
+        await db.support_messages.create_index("references")
+        await db.support_messages.create_index("created_at")
 
         # Data Migration: Rule 5 & 11 - Normalize tournament status and match live links
         try:

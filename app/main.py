@@ -125,6 +125,14 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 app.include_router(api_router, prefix=settings.API_V1_STR)
 
+# Top-level webhook alias for Resend Inbound endpoint
+from app.api.v1.endpoints.webhooks import resend_inbound_webhook
+
+@app.post("/api/webhooks/resend/inbound")
+async def api_webhooks_resend_inbound_alias(request: Request):
+    db = get_database()
+    return await resend_inbound_webhook(request, db)
+
 @app.get("/")
 async def root():
     return {
