@@ -468,6 +468,9 @@ async def remove_entry_direct(
 async def get_leaderboard(
     category: Optional[str] = Query(None),
     game: Optional[str] = Query(None),
+    limit: Optional[int] = Query(None),
+    skip: Optional[int] = Query(None),
+    include_disqualified: Optional[bool] = Query(False),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """
@@ -621,12 +624,19 @@ async def get_leaderboard(
         dq_names = {str(d.get("entity_name", "")).lower() for d in dq_docs if d.get("entity_name")}
         dq_tags = {str(d.get("entity_tag", "")).lower() for d in dq_docs if d.get("entity_tag")}
 
-        entries = [
-            e for e in entries
-            if str(e.get("id", "")) not in dq_ids
-            and str(e.get("name", "")).lower() not in dq_names
-            and (not e.get("tag") or str(e.get("tag", "")).lower() not in dq_tags)
-        ]
+        for e in entries:
+            is_dq = (
+                str(e.get("id", "")) in dq_ids
+                or str(e.get("name", "")).lower() in dq_names
+                or (bool(e.get("tag")) and str(e.get("tag", "")).lower() in dq_tags)
+                or e.get("status") == "DISQUALIFIED"
+            )
+            e["is_disqualified"] = is_dq
+            if is_dq:
+                e["status"] = "DISQUALIFIED"
+
+        if not include_disqualified:
+            entries = [e for e in entries if not e.get("is_disqualified")]
     except Exception as e:
         print(f"[Leaderboard Disqualification Filter Notice]: {e}")
 
@@ -644,5 +654,10 @@ async def get_leaderboard(
 
     for rank, entry in enumerate(entries, start=1):
         entry["rank"] = rank
+
+    if skip and skip > 0:
+        entries = entries[skip:]
+    if limit and limit > 0:
+        entries = entries[:limit]
 
     return [LeaderboardEntryResponse(**e) for e in entries]

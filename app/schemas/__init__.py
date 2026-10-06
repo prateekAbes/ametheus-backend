@@ -684,6 +684,7 @@ class LeaderboardEntryResponse(BaseModel):
     rank: int = 1
     created_at: Optional[Any] = None
     is_disbanded: Optional[bool] = False
+    is_disqualified: Optional[bool] = False
     status: Optional[str] = "ACTIVE"
     model_config = ConfigDict(from_attributes=True, extra="allow")
 
