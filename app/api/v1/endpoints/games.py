@@ -1,3 +1,4 @@
+import re
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from motor.motor_asyncio import AsyncIOMotorDatabase
@@ -31,6 +32,287 @@ GAME_FALLBACK_IMAGES = {
         "logo": "https://images.unsplash.com/photo-1579783902614-a3fb3927b675?q=80&w=300&auto=format&fit=crop",
     },
 }
+
+DEFAULT_GAMES = [
+    # Active games
+    {
+        "slug": "bgmi",
+        "name": "Battlegrounds Mobile India",
+        "category": "battle-royale",
+        "genre_name": "Battle Royale",
+        "platform": "Mobile (Android / iOS)",
+        "tag": "BGMI",
+        "is_team_game": True,
+        "min_team_size": 4,
+        "max_team_size": 4,
+        "max_substitutes": 1,
+        "entry_fee_inr": 0,
+        "prize_pool_inr": 25000,
+        "banner_url": "https://images.unsplash.com/photo-1538481199705-c710c4e965fc?q=80&w=1200&auto=format&fit=crop",
+        "logo_url": "https://images.unsplash.com/photo-1563089145-599997674d42?q=80&w=300&auto=format&fit=crop",
+        "description": "Squad battle royale on Erangel and Miramar. Shrinking blue zone, airdrops, and high-tension tactical survival.",
+        "status": "ACTIVE",
+        "accent_color": "#E56A10",
+    },
+    {
+        "slug": "valorant",
+        "name": "Valorant",
+        "category": "tactical-fps",
+        "genre_name": "Tactical FPS",
+        "platform": "PC",
+        "tag": "VALORANT",
+        "is_team_game": True,
+        "min_team_size": 5,
+        "max_team_size": 5,
+        "max_substitutes": 1,
+        "entry_fee_inr": 0,
+        "prize_pool_inr": 50000,
+        "banner_url": "https://images.unsplash.com/photo-1542751371-adc38448a05e?q=80&w=1200&auto=format&fit=crop",
+        "logo_url": "https://images.unsplash.com/photo-1550745165-9bc0b252726f?q=80&w=300&auto=format&fit=crop",
+        "description": "5v5 character-based tactical shooter. Precise gunplay paired with unique agent abilities in high-stakes Spike defusal.",
+        "status": "ACTIVE",
+        "accent_color": "#FF4655",
+    },
+    {
+        "slug": "free-fire",
+        "name": "Free Fire Max",
+        "category": "battle-royale",
+        "genre_name": "Battle Royale",
+        "platform": "Mobile (Android / iOS)",
+        "tag": "FF MAX",
+        "is_team_game": True,
+        "min_team_size": 4,
+        "max_team_size": 4,
+        "max_substitutes": 1,
+        "entry_fee_inr": 0,
+        "prize_pool_inr": 20000,
+        "banner_url": "https://images.unsplash.com/photo-1518709268805-4e9042af9f23?q=80&w=1200&auto=format&fit=crop",
+        "logo_url": "https://images.unsplash.com/photo-1579783902614-a3fb3927b675?q=80&w=300&auto=format&fit=crop",
+        "description": "Fast-paced 50-player mobile survival shooter with 10-minute matches, gloo walls, and character skill builds.",
+        "status": "ACTIVE",
+        "accent_color": "#FFAA00",
+    },
+    {
+        "slug": "cod-mobile",
+        "name": "Call of Duty: Mobile",
+        "category": "tactical-fps",
+        "genre_name": "Tactical FPS",
+        "platform": "Mobile (Android / iOS)",
+        "tag": "CODM",
+        "is_team_game": True,
+        "min_team_size": 5,
+        "max_team_size": 5,
+        "max_substitutes": 1,
+        "entry_fee_inr": 0,
+        "prize_pool_inr": 20000,
+        "banner_url": "https://images.unsplash.com/photo-1511512578047-dfb367046420?q=80&w=1200&auto=format&fit=crop",
+        "logo_url": "https://images.unsplash.com/photo-1579373903781-fd5c0c30c4cd?q=80&w=300&auto=format&fit=crop",
+        "description": "Iconic Call of Duty maps and multiplayer modes including Search & Destroy, Hardpoint, and Domination on mobile.",
+        "status": "ACTIVE",
+        "accent_color": "#00F0FF",
+    },
+    {
+        "slug": "chess",
+        "name": "Chess Blitz Arenas",
+        "category": "strategy",
+        "genre_name": "Strategy & Board",
+        "platform": "Cross-Platform",
+        "tag": "CHESS",
+        "is_team_game": False,
+        "min_team_size": 1,
+        "max_team_size": 1,
+        "max_substitutes": 0,
+        "entry_fee_inr": 0,
+        "prize_pool_inr": 10000,
+        "banner_url": "https://images.unsplash.com/photo-1529699211952-734e80c4d42b?q=80&w=1200&auto=format&fit=crop",
+        "logo_url": "https://images.unsplash.com/photo-1586165368502-1bad197a6461?q=80&w=300&auto=format&fit=crop",
+        "description": "Blitz, Rapid, and Bullet chess arenas. Pure tactical calculation, Swiss bracket rounds, and FIDE-rated Elo mechanics.",
+        "status": "ACTIVE",
+        "accent_color": "#3EF2FF",
+    },
+    # Coming Soon games
+    {
+        "slug": "counter-strike-2",
+        "name": "Counter-Strike 2",
+        "category": "tactical-fps",
+        "genre_name": "Tactical FPS",
+        "platform": "PC",
+        "tag": "CS2",
+        "is_team_game": True,
+        "min_team_size": 5,
+        "max_team_size": 5,
+        "max_substitutes": 1,
+        "entry_fee_inr": 0,
+        "prize_pool_inr": 0,
+        "banner_url": "https://images.unsplash.com/photo-1511512578047-dfb367046420?q=80&w=1200&auto=format&fit=crop",
+        "logo_url": "https://images.unsplash.com/photo-1579373903781-fd5c0c30c4cd?q=80&w=300&auto=format&fit=crop",
+        "description": "Source 2 sub-tick responsiveness, responsive smokes, and classic competitive Bomb Defusal arenas.",
+        "status": "COMING_SOON",
+        "accent_color": "#DE9B35",
+        "expected_release_date": "Q4 2026",
+        "announcement_text": "Sub-tick tournament lobbies coming soon",
+    },
+    {
+        "slug": "rocket-league",
+        "name": "Rocket League",
+        "category": "sports",
+        "genre_name": "Sports & Racing",
+        "platform": "Cross-Platform",
+        "tag": "RL",
+        "is_team_game": True,
+        "min_team_size": 3,
+        "max_team_size": 3,
+        "max_substitutes": 1,
+        "entry_fee_inr": 0,
+        "prize_pool_inr": 0,
+        "banner_url": "https://images.unsplash.com/photo-1550745165-9bc0b252726f?q=80&w=1200&auto=format&fit=crop",
+        "logo_url": "https://images.unsplash.com/photo-1542751371-adc38448a05e?q=80&w=300&auto=format&fit=crop",
+        "description": "High-powered hybrid of arcade-style soccer and vehicular mayhem. Aerial rotations, wall pinches, and 3v3 arenas.",
+        "status": "COMING_SOON",
+        "accent_color": "#0088FF",
+        "expected_release_date": "Q4 2026",
+        "announcement_text": "Supersonic acrobatic tournament brackets",
+    },
+    {
+        "slug": "clash-royale",
+        "name": "Clash Royale",
+        "category": "strategy",
+        "genre_name": "Strategy & Board",
+        "platform": "Mobile (Android / iOS)",
+        "tag": "CR",
+        "is_team_game": False,
+        "min_team_size": 1,
+        "max_team_size": 1,
+        "max_substitutes": 0,
+        "entry_fee_inr": 0,
+        "prize_pool_inr": 0,
+        "banner_url": "https://images.unsplash.com/photo-1529699211952-734e80c4d42b?q=80&w=1200&auto=format&fit=crop",
+        "logo_url": "https://images.unsplash.com/photo-1586165368502-1bad197a6461?q=80&w=300&auto=format&fit=crop",
+        "description": "Real-time head-to-head tower rush battles combining card collection, tower defense, and multiplayer online battle arena.",
+        "status": "COMING_SOON",
+        "accent_color": "#FFBB00",
+        "expected_release_date": "Q4 2026",
+        "announcement_text": "Tournament standard 1v1 duel brackets",
+    },
+    {
+        "slug": "brawl-stars",
+        "name": "Brawl Stars",
+        "category": "battle-royale",
+        "genre_name": "Battle Royale",
+        "platform": "Mobile (Android / iOS)",
+        "tag": "BS",
+        "is_team_game": True,
+        "min_team_size": 3,
+        "max_team_size": 3,
+        "max_substitutes": 1,
+        "entry_fee_inr": 0,
+        "prize_pool_inr": 0,
+        "banner_url": "https://images.unsplash.com/photo-1518709268805-4e9042af9f23?q=80&w=1200&auto=format&fit=crop",
+        "logo_url": "https://images.unsplash.com/photo-1579783902614-a3fb3927b675?q=80&w=300&auto=format&fit=crop",
+        "description": "Fast-paced 3v3 multiplayer and battle royale combat across Gem Grab, Brawl Ball, and Knockout modes.",
+        "status": "COMING_SOON",
+        "accent_color": "#FF5500",
+        "expected_release_date": "Q4 2026",
+        "announcement_text": "3v3 mobile tournament integration",
+    },
+    {
+        "slug": "league-of-legends",
+        "name": "League of Legends",
+        "category": "strategy",
+        "genre_name": "Strategy & Board",
+        "platform": "PC",
+        "tag": "LOL",
+        "is_team_game": True,
+        "min_team_size": 5,
+        "max_team_size": 5,
+        "max_substitutes": 1,
+        "entry_fee_inr": 0,
+        "prize_pool_inr": 0,
+        "banner_url": "https://images.unsplash.com/photo-1542751371-adc38448a05e?q=80&w=1200&auto=format&fit=crop",
+        "logo_url": "https://images.unsplash.com/photo-1550745165-9bc0b252726f?q=80&w=300&auto=format&fit=crop",
+        "description": "Summoner's Rift 5v5 competitive MOBA. Team synergy, lane macro, dragon soul control, and Baron Nashor teamfights.",
+        "status": "COMING_SOON",
+        "accent_color": "#C89B3C",
+        "expected_release_date": "Q4 2026",
+        "announcement_text": "5v5 Summoner's Rift competitive ladder",
+    },
+    {
+        "slug": "smash-karts",
+        "name": "Smash Karts",
+        "category": "sports",
+        "genre_name": "Sports & Racing",
+        "platform": "Cross-Platform",
+        "tag": "SMASH",
+        "is_team_game": False,
+        "min_team_size": 1,
+        "max_team_size": 1,
+        "max_substitutes": 0,
+        "entry_fee_inr": 0,
+        "prize_pool_inr": 0,
+        "banner_url": "https://images.unsplash.com/photo-1511512578047-dfb367046420?q=80&w=1200&auto=format&fit=crop",
+        "logo_url": "https://images.unsplash.com/photo-1579373903781-fd5c0c30c4cd?q=80&w=300&auto=format&fit=crop",
+        "description": "3D multiplayer kart battle arena. Power-ups, rocket launchers, and chaotic fast-paced round-robin matches.",
+        "status": "COMING_SOON",
+        "accent_color": "#FF2D55",
+        "expected_release_date": "Q4 2026",
+        "announcement_text": "Browser-based multiplayer tournament cups",
+    },
+    {
+        "slug": "mini-militia",
+        "name": "Mini Militia (Doodle Army 2)",
+        "category": "tactical-fps",
+        "genre_name": "Tactical FPS",
+        "platform": "Mobile (Android / iOS)",
+        "tag": "MILITIA",
+        "is_team_game": True,
+        "min_team_size": 3,
+        "max_team_size": 3,
+        "max_substitutes": 1,
+        "entry_fee_inr": 0,
+        "prize_pool_inr": 0,
+        "banner_url": "https://images.unsplash.com/photo-1538481199705-c710c4e965fc?q=80&w=1200&auto=format&fit=crop",
+        "logo_url": "https://images.unsplash.com/photo-1563089145-599997674d42?q=80&w=300&auto=format&fit=crop",
+        "description": "Intense multiplayer combat with up to 6 players online in 2D cartoon themed cross between Soldat and Halo.",
+        "status": "COMING_SOON",
+        "accent_color": "#4CD964",
+        "expected_release_date": "Q4 2026",
+        "announcement_text": "Custom room 3v3 team deathmatches",
+    },
+    {
+        "slug": "mirror-blades",
+        "name": "Mirror Blades",
+        "category": "tactical-fps",
+        "genre_name": "Tactical FPS",
+        "platform": "PC",
+        "tag": "BLADES",
+        "is_team_game": False,
+        "min_team_size": 1,
+        "max_team_size": 1,
+        "max_substitutes": 0,
+        "entry_fee_inr": 0,
+        "prize_pool_inr": 0,
+        "banner_url": "https://images.unsplash.com/photo-1542751371-adc38448a05e?q=80&w=1200&auto=format&fit=crop",
+        "logo_url": "https://images.unsplash.com/photo-1550745165-9bc0b252726f?q=80&w=300&auto=format&fit=crop",
+        "description": "Reflexive sword dueling and precision parry arenas in futuristic neon cyber-dojos.",
+        "status": "COMING_SOON",
+        "accent_color": "#5856D6",
+        "expected_release_date": "Q4 2026",
+        "announcement_text": "1v1 melee tournament duels",
+    },
+]
+
+async def seed_games_if_needed(db: AsyncIOMotorDatabase):
+    count = await db.games.count_documents({})
+    if count == 0:
+        for dg in DEFAULT_GAMES:
+            g_doc = Game(**dg)
+            mongo_doc = g_doc.to_mongo()
+            if dg.get("genre_name"):
+                genre_match = await db.genres.find_one({"name": {"$regex": f"^{re.escape(dg['genre_name'])}$", "$options": "i"}})
+                if genre_match:
+                    mongo_doc["genre_id"] = str(genre_match.get("_id", genre_match.get("id")))
+                    mongo_doc["genre_name"] = genre_match.get("name")
+            await db.games.insert_one(mongo_doc)
 
 def normalize_category_slug(category: Optional[str]) -> str:
     if not category:
@@ -98,6 +380,7 @@ async def list_games(
     category: Optional[str] = Query(None, description="Filter games by category"),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
+    await seed_games_if_needed(db)
     query = {"is_dummy": {"$ne": True}}
     if status:
         query["status"] = status.upper()
@@ -118,6 +401,7 @@ async def list_games(
 
 @router.get("/{slug}", response_model=GameResponse)
 async def get_game_by_slug(slug: str, db: AsyncIOMotorDatabase = Depends(get_db)):
+    await seed_games_if_needed(db)
     from bson import ObjectId
     or_clauses = [{"slug": slug}, {"slug": slug.lower()}, {"_id": slug}, {"id": slug}]
     if ObjectId.is_valid(slug):
@@ -210,10 +494,14 @@ async def update_game(
     update_data = {k: v for k, v in payload.model_dump(exclude_unset=True).items() if v is not None}
     if "category" in update_data:
         update_data["category"] = normalize_category_slug(update_data["category"])
-    if "genre_id" in update_data and not update_data.get("genre_name"):
-        genre_doc = await db.genres.find_one({"$or": [{"_id": update_data["genre_id"]}, {"id": update_data["genre_id"]}, {"slug": update_data["genre_id"]}]})
-        if genre_doc:
-            update_data["genre_name"] = genre_doc.get("name")
+    if "genre_id" in update_data:
+        if not update_data["genre_id"]:
+            update_data["genre_id"] = None
+            update_data["genre_name"] = None
+        elif not update_data.get("genre_name"):
+            genre_doc = await db.genres.find_one({"$or": [{"_id": update_data["genre_id"]}, {"id": update_data["genre_id"]}, {"slug": update_data["genre_id"]}]})
+            if genre_doc:
+                update_data["genre_name"] = genre_doc.get("name")
     if update_data:
         await db.games.update_one({"_id": game["_id"]}, {"$set": update_data})
 

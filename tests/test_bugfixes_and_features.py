@@ -25,9 +25,13 @@ async def client(mock_db):
         username="clerk_player",
         role="ORGANIZER",
     )
+    from app.api.deps import get_current_user_optional
     app.dependency_overrides[get_current_user] = lambda: test_user
+    app.dependency_overrides[get_current_user_optional] = lambda: test_user
     app.dependency_overrides[require_super_admin] = lambda: test_user
     app.dependency_overrides[require_organizer] = lambda: test_user
+
+    await mock_db.users.insert_one(test_user.to_mongo())
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
@@ -190,3 +194,117 @@ async def test_organizer_match_request_lifecycle(client, mock_db):
     items = filter_resp.json()
     assert len(items) == 1
     assert items[0]["id"] == req_id
+
+@pytest.mark.asyncio
+async def test_support_ticket_notification_and_admin_target(client, mock_db):
+    """Verify support ticket creation generates in-app user notification and routes to support@tenetadmissions.com."""
+    payload = {
+        "name": "Test Contender",
+        "email": "player@ametheus.gg",
+        "category": "PAYMENT",
+        "payment_type": "UPI",
+        "description": "Payment deduction issue during tournament entry",
+    }
+    resp = await client.post("/api/v1/support/tickets", json=payload)
+    assert resp.status_code == 201
+    data = resp.json()
+    ticket_id = data["ticket_id"]
+
+    # Verify persistent user notification created in db.notifications
+    user_notif = await mock_db.notifications.find_one({"user_id": "mongo_user_123"})
+    assert user_notif is not None
+    assert ticket_id in user_notif["title"]
+
+    # Verify ticket in support_tickets collection
+    t_doc = await mock_db.support_tickets.find_one({"ticket_id": ticket_id})
+    assert t_doc is not None
+    assert t_doc["category"] == "PAYMENT"
+    assert t_doc["payment_type"] == "UPI"
+
+@pytest.mark.asyncio
+async def test_review_persistent_notifications(client, mock_db):
+    """Verify review submission creates user notification and admin notification."""
+    # Ensure an admin exists in db.users
+    await mock_db.users.insert_one({
+        "_id": "admin_user_999",
+        "id": "admin_user_999",
+        "role": "SUPER_ADMIN",
+        "is_super_admin": True,
+        "username": "chief_admin",
+    })
+
+    payload = {
+        "rating": 5,
+        "review_text": "Ametheus tournament brackets and automated matchmaking are phenomenal!",
+        "category": "TOURNAMENTS",
+    }
+    resp = await client.post("/api/v1/reviews", json=payload)
+    assert resp.status_code == 201
+
+    # Verify user notification in db.notifications
+    user_notif = await mock_db.notifications.find_one({"user_id": "mongo_user_123", "title": "Review Submitted ⭐"})
+    assert user_notif is not None
+
+    # Verify admin notification in db.notifications
+    admin_notif = await mock_db.notifications.find_one({"user_id": "admin_user_999"})
+    assert admin_notif is not None
+    assert "New Review" in admin_notif["title"]
+
+@pytest.mark.asyncio
+async def test_games_auto_seeding_and_coming_soon(client, mock_db):
+    """Verify GET /games automatically seeds and returns active & coming soon games."""
+    resp = await client.get("/api/v1/games")
+    assert resp.status_code == 200
+    games = resp.json()
+    assert len(games) >= 10
+
+    slugs = [g["slug"] for g in games]
+    assert "bgmi" in slugs
+    assert "valorant" in slugs
+    assert "counter-strike-2" in slugs
+    assert "rocket-league" in slugs
+
+    cs2 = next(g for g in games if g["slug"] == "counter-strike-2")
+    assert cs2["status"] == "COMING_SOON"
+
+@pytest.mark.asyncio
+async def test_support_ticket_dedicated_statuses(client, mock_db):
+    """Verify support ticket dedicated status system: default OPEN, valid transitions, and DB persistence."""
+    # 1. Create a support ticket
+    create_payload = {
+        "name": "Status Tester",
+        "email": "tester@ametheus.gg",
+        "category": "TECHNICAL_ISSUE",
+        "description": "Connection issue to custom lobby",
+    }
+    resp = await client.post("/api/v1/support/tickets", json=create_payload)
+    assert resp.status_code == 201
+    ticket_id = resp.json()["ticket_id"]
+    assert resp.json()["status"] == "OPEN"
+
+    # 2. Update to IN_PROGRESS
+    p1 = await client.patch(f"/api/v1/support/tickets/{ticket_id}", json={"status": "IN_PROGRESS"})
+    assert p1.status_code == 200
+    assert p1.json()["status"] == "IN_PROGRESS"
+
+    # 3. Update to WAITING_FOR_USER
+    p2 = await client.patch(f"/api/v1/support/tickets/{ticket_id}", json={"status": "WAITING_FOR_USER"})
+    assert p2.status_code == 200
+    assert p2.json()["status"] == "WAITING_FOR_USER"
+
+    # 4. Update to RESOLVED
+    p3 = await client.patch(f"/api/v1/support/tickets/{ticket_id}", json={"status": "RESOLVED"})
+    assert p3.status_code == 200
+    assert p3.json()["status"] == "RESOLVED"
+
+    # 5. Update to CLOSED
+    p4 = await client.patch(f"/api/v1/support/tickets/{ticket_id}", json={"status": "CLOSED"})
+    assert p4.status_code == 200
+    assert p4.json()["status"] == "CLOSED"
+
+    # 6. Verify persistence in MongoDB
+    t_doc = await mock_db.support_tickets.find_one({"ticket_id": ticket_id})
+    assert t_doc is not None
+    assert t_doc["status"] == "CLOSED"
+
+

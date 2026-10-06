@@ -70,8 +70,8 @@ VALID_CATEGORIES = {
 from app.services.email_config_service import get_support_email
 
 async def _get_configured_support_email(db: AsyncIOMotorDatabase) -> str:
-    """Returns the platform-configured support destination email from centralized config service."""
-    return await get_support_email(db)
+    """Returns the platform-configured support destination email for admin alerts."""
+    return getattr(settings, "SUPPORT_ADMIN_EMAIL", None) or "support@tenetadmissions.com"
 
 
 def _clean_ticket_doc(doc: dict) -> dict:
@@ -85,6 +85,18 @@ def _clean_ticket_doc(doc: dict) -> dict:
     item["archived_at"] = str(item.get("archived_at")) if item.get("archived_at") else None
     item["archived_by"] = item.get("archived_by")
     item["archive_reason"] = item.get("archive_reason")
+
+    # Strict normalization to the 5 standard support ticket statuses
+    raw_status = str(item.get("status", "OPEN")).strip().upper().replace(" ", "_")
+    if raw_status in ("NEW", "UNREAD"):
+        raw_status = "OPEN"
+    elif raw_status in ("WAITING_FOR_ADMIN", "ON_HOLD"):
+        raw_status = "IN_PROGRESS"
+    elif raw_status not in ("OPEN", "IN_PROGRESS", "WAITING_FOR_USER", "RESOLVED", "CLOSED", "ARCHIVED"):
+        # Prevent tournament/game statuses like REGISTRATION_OPEN from ever appearing
+        raw_status = "OPEN"
+    item["status"] = raw_status
+
     raw_msgs = item.get("messages", [])
     if not raw_msgs and item.get("description"):
         raw_msgs = [
@@ -181,6 +193,29 @@ async def create_support_ticket(
     doc = ticket.to_mongo()
     await db.support_tickets.insert_one(doc)
     await db.support_logs.insert_one(init_log.to_mongo())
+
+    # Create persistent user in-app notification in DB
+    target_uid = user_id
+    if not target_uid and email_clean:
+        try:
+            u_doc = await db.users.find_one({"email": email_clean})
+            if u_doc:
+                target_uid = u_doc.get("id") or str(u_doc.get("_id"))
+        except Exception:
+            pass
+    if target_uid and not str(target_uid).startswith("guest"):
+        try:
+            from app.services.notification import create_notification
+            await create_notification(
+                db=db,
+                user_id=str(target_uid),
+                title=f"Support Ticket Submitted [{ticket_id}]",
+                message=f"Your support ticket for '{cat_upper}' has been received. Our operations team will review it shortly.",
+                notification_type="SYSTEM",
+                link="/support",
+            )
+        except Exception:
+            pass
 
     # Dispatch emails asynchronously with defensive error isolation
     ticket_dict = {
@@ -467,10 +502,14 @@ async def update_support_ticket(
 
     if payload.status:
         st_upper = payload.status.strip().upper().replace(" ", "_")
+        if st_upper in ("NEW", "UNREAD"):
+            st_upper = "OPEN"
+        elif st_upper in ("WAITING_FOR_ADMIN", "ON_HOLD"):
+            st_upper = "IN_PROGRESS"
         if st_upper not in VALID_STATUSES:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Invalid status '{payload.status}'. Allowed: {list(VALID_STATUSES)}",
+                detail=f"Invalid status '{payload.status}'. Allowed: ['OPEN', 'IN_PROGRESS', 'WAITING_FOR_USER', 'RESOLVED', 'CLOSED']",
             )
         old_status = doc.get("status", "OPEN")
         if old_status != st_upper:

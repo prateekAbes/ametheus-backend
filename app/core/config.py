@@ -34,7 +34,7 @@ class Settings(BaseSettings):
     CLERK_JWT_KEY: Optional[str] = None
     SUPER_ADMIN_EMAIL: str = "admin@ametheus.gg"
     SUPPORT_PHONE: str = "+91 98765 43210"
-    SUPPORT_ADMIN_EMAIL: str = "support@ametheus.games"
+    SUPPORT_ADMIN_EMAIL: str = "support@tenetadmissions.com"
     ESCROW_SECRET_KEY: str = "ametheus_escrow_vault_secret_2026"
 
     # =========================================================

@@ -163,6 +163,47 @@ async def submit_review(
     )
     await db.reviews.insert_one(review.to_mongo())
 
+    # Create persistent user notification in DB
+    target_uid = user_id
+    if not target_uid or target_uid == "guest_player":
+        if user_email and user_email != "contender@ametheus.gg":
+            try:
+                u_doc = await db.users.find_one({"email": user_email})
+                if u_doc:
+                    target_uid = u_doc.get("id") or str(u_doc.get("_id"))
+            except Exception:
+                pass
+    if target_uid and not str(target_uid).startswith("guest"):
+        try:
+            from app.services.notification import create_notification
+            await create_notification(
+                db=db,
+                user_id=str(target_uid),
+                title="Review Submitted ⭐",
+                message=f"Thank you for reviewing Ametheus! Your {payload.rating}-star review for {payload.category or 'PLATFORM'} has been submitted.",
+                notification_type="SYSTEM",
+                link="/#reviews",
+            )
+        except Exception:
+            pass
+
+    # Notify administrators of new review
+    try:
+        from app.services.notification import create_notification
+        admins = await db.users.find({"$or": [{"role": {"$in": ["SUPER_ADMIN", "ORGANIZER"]}}, {"is_super_admin": True}]}).to_list(10)
+        for admin in admins:
+            admin_id = str(admin.get("id") or admin.get("_id"))
+            await create_notification(
+                db=db,
+                user_id=admin_id,
+                title=f"New Review: {payload.rating}★ from {user_name}",
+                message=f"{sanitized_text[:120]}...",
+                notification_type="SYSTEM",
+                link="/admin",
+            )
+    except Exception:
+        pass
+
     return serialize_review_doc(review.to_mongo())
 
 # Admin Operations

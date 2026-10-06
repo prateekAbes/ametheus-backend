@@ -705,7 +705,7 @@ async def send_admin_ticket_notification_email(
     description = ticket.get("description", "")
     created_at = ticket.get("created_at", "Just now")
 
-    target_recipient = admin_recipient or settings.SUPPORT_EMAIL
+    target_recipient = admin_recipient or getattr(settings, "SUPPORT_ADMIN_EMAIL", None) or "support@tenetadmissions.com"
 
     subject = f"New Ametheus Support Ticket — {ticket_id} — {category}"
 
