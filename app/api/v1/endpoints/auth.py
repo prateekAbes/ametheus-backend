@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, Header, status
+from fastapi import APIRouter, Depends, HTTPException, Header, status, Request
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from app.api.deps import get_db, get_current_user
 from app.core.security import decode_token
@@ -33,6 +33,7 @@ class UserSyncRequest(BaseModel):
 @router.post("/sync", response_model=UserResponse)
 async def sync_clerk_user(
     payload: UserSyncRequest,
+    request: Request,
     authorization: Optional[str] = Header(None),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
@@ -219,10 +220,35 @@ async def sync_clerk_user(
     except Exception:
         pass
 
-    return User.from_mongo(final_doc)
+    # Login Security & IP Detection
+    try:
+        from app.services.login_security import process_login_security_check, get_client_ip
+        client_ip = get_client_ip(request)
+
+        if is_newly_created:
+            await db.users.update_one(
+                {"_id": final_doc["_id"]},
+                {
+                    "$set": {
+                        "known_ips": [client_ip],
+                        "last_login_ip": client_ip,
+                        "last_login_at": now,
+                    }
+                }
+            )
+        else:
+            await process_login_security_check(db=db, user_doc=final_doc, request=request)
+    except Exception as e:
+        import logging
+        logging.getLogger("ametheus.auth").warning(f"Login security check error: {e}")
+
+    # Re-fetch after security IP updates
+    fresh_user_doc = await db.users.find_one({"_id": final_doc["_id"]})
+    return User.from_mongo(fresh_user_doc or final_doc)
 
 @router.get("/me", response_model=UserResponse)
 async def get_current_user_profile(
+    request: Request,
     current_user: User = Depends(get_current_user),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
@@ -234,6 +260,18 @@ async def get_current_user_profile(
         if current_user.role != "SUPER_ADMIN":
             current_user.role = "SUPER_ADMIN"
             await db.users.update_one({"_id": current_user.id}, {"$set": {"role": "SUPER_ADMIN"}})
+
+    try:
+        from app.services.login_security import process_login_security_check
+        user_doc = await db.users.find_one({"$or": [{"_id": current_user.id}, {"id": current_user.id}]})
+        if user_doc:
+            await process_login_security_check(db=db, user_doc=user_doc, request=request)
+            fresh_doc = await db.users.find_one({"_id": user_doc["_id"]})
+            if fresh_doc:
+                return User.from_mongo(fresh_doc)
+    except Exception:
+        pass
+
     return current_user
 
 class UserProfileUpdateRequest(BaseModel):
@@ -242,15 +280,20 @@ class UserProfileUpdateRequest(BaseModel):
     riot_id: Optional[str] = None
     steam_id: Optional[str] = None
     avatar_url: Optional[str] = None
+    preferences: Optional[dict] = None
+    privacy_settings: Optional[dict] = None
 
 @router.put("/profile", response_model=UserResponse)
+@router.patch("/profile", response_model=UserResponse)
+@router.put("/me", response_model=UserResponse)
+@router.patch("/me", response_model=UserResponse)
 async def update_user_profile(
     payload: UserProfileUpdateRequest,
     current_user: User = Depends(get_current_user),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """
-    Update competitive player profile handles (Username, Display Name, Riot ID, Steam ID, Avatar).
+    Update competitive player profile handles (Username, Display Name, Riot ID, Steam ID, Avatar, Preferences, Privacy).
     Username changes are validated for case-insensitive uniqueness and reserved name restrictions.
     """
     update_data = {}
@@ -297,6 +340,12 @@ async def update_user_profile(
     if payload.avatar_url is not None:
         update_data["avatar_url"] = payload.avatar_url.strip()
         current_user.avatar_url = update_data["avatar_url"]
+    if payload.preferences is not None:
+        update_data["preferences"] = payload.preferences
+        current_user.preferences = payload.preferences
+    if payload.privacy_settings is not None:
+        update_data["privacy_settings"] = payload.privacy_settings
+        current_user.privacy_settings = payload.privacy_settings
 
     if update_data:
         from bson import ObjectId
@@ -339,4 +388,45 @@ async def update_user_profile(
         return User.from_mongo(fresh_doc)
 
     return current_user
+
+@router.delete("/me")
+@router.delete("/account")
+async def delete_user_account(
+    current_user: User = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Permanently delete user account from MongoDB, record audit log, and terminate session.
+    """
+    from bson import ObjectId
+
+    query_clauses = [
+        {"_id": current_user.id},
+        {"id": current_user.id},
+    ]
+    if current_user.clerk_user_id:
+        query_clauses.extend([
+            {"clerk_user_id": current_user.clerk_user_id},
+            {"_id": current_user.clerk_user_id},
+        ])
+    if current_user.email:
+        query_clauses.append({"email": current_user.email})
+    if ObjectId.is_valid(str(current_user.id)):
+        query_clauses.append({"_id": ObjectId(str(current_user.id))})
+
+    target_user_doc = await db.users.find_one({"$or": query_clauses})
+    if target_user_doc:
+        target_mongo_id = target_user_doc["_id"]
+        await db.users.delete_one({"_id": target_mongo_id})
+
+        await record_audit_log(
+            db=db,
+            operator=current_user.username,
+            role=current_user.role,
+            action="DELETE_ACCOUNT",
+            target=f"User {current_user.id} ({current_user.email})",
+            details="User permanently deleted their own account.",
+        )
+
+    return {"status": "success", "message": "Account successfully deleted."}
 

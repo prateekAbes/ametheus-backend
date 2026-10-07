@@ -20,9 +20,12 @@ from app.api.v1.endpoints import (
     reviews,
     organizer_communications,
     webhooks,
+    crests,
 )
 
 api_router = APIRouter()
+api_router.include_router(crests.router, prefix="/crests", tags=["Player Crests"])
+api_router.include_router(crests.admin_router, prefix="/admin/crests", tags=["Admin Player Crests"])
 api_router.include_router(organizer_communications.organizer_comm_router, prefix="/organizer", tags=["Organizer Communications"])
 api_router.include_router(organizer_communications.admin_comm_router, prefix="/admin", tags=["Admin Organizer Communications"])
 api_router.include_router(auth.router, prefix="/auth", tags=["Authentication & Users"])

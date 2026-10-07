@@ -171,3 +171,123 @@ async def test_registration_guard_and_reopen(client, mock_db):
     updated_tour = await mock_db.tournaments.find_one({"_id": "t_open"})
     assert updated_tour["registration_status"] == "OPEN"
     assert updated_tour["status"] == "REGISTRATION_OPEN"
+
+@pytest.mark.asyncio
+async def test_crests_crud_and_public_list(client, mock_db):
+    """Test player crests: seeding, admin creation, listing, updating, toggle, and delete."""
+    # Public get triggers initial seed if empty
+    res = await client.get("/api/v1/crests")
+    assert res.status_code == 200
+    initial_crests = res.json()
+    assert len(initial_crests) >= 8
+
+    # Admin create custom crest
+    new_crest = {
+        "name": "Test Cyber Crest",
+        "description": "Exclusive crest for testing",
+        "image_url": "https://img.ametheus.gg/test-crest.svg",
+        "category": "OPERATOR",
+        "is_active": True,
+    }
+    create_res = await client.post("/api/v1/admin/crests", json=new_crest)
+    assert create_res.status_code == 201
+    created = create_res.json()
+    assert created["name"] == "Test Cyber Crest"
+    crest_id = created["id"]
+
+    # Admin update crest
+    update_res = await client.put(f"/api/v1/admin/crests/{crest_id}", json={"is_active": False})
+    assert update_res.status_code == 200
+    assert update_res.json()["is_active"] is False
+
+    # Inactive crest does not show in public list
+    public_res = await client.get("/api/v1/crests")
+    assert not any(c["id"] == crest_id for c in public_res.json())
+
+    # Admin list includes inactive crests
+    admin_list_res = await client.get("/api/v1/admin/crests")
+    assert any(c["id"] == crest_id for c in admin_list_res.json())
+
+    # Admin delete crest
+    del_res = await client.delete(f"/api/v1/admin/crests/{crest_id}")
+    assert del_res.status_code == 200
+
+@pytest.mark.asyncio
+async def test_user_preferences_and_account_deletion(client, mock_db):
+    """Test user profile update with preferences/privacy_settings and account deletion."""
+    # Insert user
+    await mock_db.users.insert_one({
+        "_id": "admin_123",
+        "clerk_user_id": "user_admin_123",
+        "email": "admin@ametheus.gg",
+        "username": "superadmin",
+        "role": "SUPER_ADMIN",
+        "avatar_url": "/avatars/avatar1.png",
+    })
+
+    # Update profile with preferences and privacy settings
+    update_payload = {
+        "avatar_url": "https://img.ametheus.gg/new-crest.svg",
+        "preferences": {"theme": "crimson", "accent": "cyan"},
+        "privacy_settings": {"profile_visibility": "PUBLIC", "public_match_history": True},
+    }
+    update_res = await client.patch("/api/v1/auth/profile", json=update_payload)
+    assert update_res.status_code == 200
+    data = update_res.json()
+    assert data["avatar_url"] == "https://img.ametheus.gg/new-crest.svg"
+    assert data["preferences"]["theme"] == "crimson"
+    assert data["privacy_settings"]["profile_visibility"] == "PUBLIC"
+
+    # Delete account
+    del_res = await client.delete("/api/v1/auth/me")
+    assert del_res.status_code == 200
+    assert del_res.json()["status"] == "success"
+
+    # Verify user removed from DB
+    user_in_db = await mock_db.users.find_one({"_id": "admin_123"})
+    assert user_in_db is None
+
+@pytest.mark.asyncio
+async def test_review_author_username_dynamic_resolution(client, mock_db):
+    """Test that review author username reflects current user account username dynamically."""
+    # Insert user
+    await mock_db.users.insert_one({
+        "_id": "u_test_reviewer",
+        "clerk_user_id": "clerk_u_test_reviewer",
+        "email": "reviewer@ametheus.gg",
+        "username": "R3_Original",
+        "role": "PLAYER",
+    })
+
+    # Insert review referencing that user_id
+    await mock_db.reviews.insert_one({
+        "_id": "r_test_1",
+        "user_id": "u_test_reviewer",
+        "user_name": "Contender",  # Old generic fallback stored originally
+        "rating": 5,
+        "review_text": "Great competitive platform",
+        "category": "PLATFORM",
+        "status": "APPROVED",
+        "is_approved": True,
+        "is_featured": False,
+    })
+
+    # Retrieve reviews — should dynamically resolve to "R3_Original"
+    res1 = await client.get("/api/v1/reviews")
+    assert res1.status_code == 200
+    reviews = res1.json()["reviews"]
+    rev = next(r for r in reviews if r["id"] == "r_test_1")
+    assert rev["user_name"] == "R3_Original"
+
+    # User updates their username to "R3_Viper"
+    await mock_db.users.update_one(
+        {"_id": "u_test_reviewer"},
+        {"$set": {"username": "R3_Viper"}}
+    )
+
+    # Retrieve reviews again — must dynamically update to "R3_Viper" without modifying review doc
+    res2 = await client.get("/api/v1/reviews")
+    reviews2 = res2.json()["reviews"]
+    rev2 = next(r for r in reviews2 if r["id"] == "r_test_1")
+    assert rev2["user_name"] == "R3_Viper"
+

@@ -511,7 +511,13 @@ async def get_leaderboard(
 
             cap_id = team.get("captain_id")
             captain = await db.users.find_one({"$or": [{"_id": cap_id}, {"id": cap_id}]}) if cap_id else None
-            captain_user = f"@{captain['username']}" if captain and captain.get("username") else "@captain"
+            captain_user = "@captain"
+            if captain:
+                cap_privacy = captain.get("privacy_settings") or {}
+                if cap_privacy.get("show_stats") is False:
+                    captain_user = "@Anonymous Contender"
+                elif captain.get("username"):
+                    captain_user = f"@{captain['username']}"
 
             # Query completed matches for this team across both team_a and team_b positions
             completed_cursor = db.matches.find({

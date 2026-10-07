@@ -74,7 +74,7 @@ def serialize_review_doc(doc: dict) -> ReviewResponse:
     return ReviewResponse(
         id=rid,
         user_id=str(doc.get("user_id", "")),
-        user_name=doc.get("user_name", "Contender"),
+        user_name=doc.get("user_name", "Player"),
         avatar_url=doc.get("avatar_url"),
         rating=int(doc.get("rating", 5)),
         review_text=doc.get("review_text", ""),
@@ -85,6 +85,52 @@ def serialize_review_doc(doc: dict) -> ReviewResponse:
         admin_notes=doc.get("admin_notes"),
         created_at=created_at_str,
     )
+
+async def populate_review_usernames(db: AsyncIOMotorDatabase, docs: List[dict]) -> List[ReviewResponse]:
+    if not docs:
+        return []
+
+    # Extract all unique user_ids
+    user_ids = list({str(d.get("user_id")) for d in docs if d.get("user_id") and d.get("user_id") != "guest_player"})
+    user_map: Dict[str, dict] = {}
+    if user_ids:
+        query = {
+            "$or": [
+                {"_id": {"$in": user_ids}},
+                {"id": {"$in": user_ids}},
+                {"clerk_user_id": {"$in": user_ids}},
+            ]
+        }
+        cursor = db.users.find(query)
+        matched_users = await cursor.to_list(length=1000)
+        for u in matched_users:
+            uname = u.get("username") or u.get("display_name")
+            if uname:
+                if u.get("_id"):
+                    user_map[str(u["_id"])] = u
+                if u.get("id"):
+                    user_map[str(u["id"])] = u
+                if u.get("clerk_user_id"):
+                    user_map[str(u["clerk_user_id"])] = u
+
+    results: List[ReviewResponse] = []
+    for d in docs:
+        uid = str(d.get("user_id", ""))
+        u = user_map.get(uid)
+        doc_copy = dict(d)
+        if u:
+            actual_name = u.get("username") or u.get("display_name")
+            if actual_name:
+                doc_copy["user_name"] = actual_name
+            if u.get("avatar_url"):
+                doc_copy["avatar_url"] = u.get("avatar_url")
+        else:
+            # Clean up generic legacy role names if present
+            raw_name = str(doc_copy.get("user_name", "")).strip()
+            if raw_name.lower() in ["contender", "contenders", "verified contender", "audit players"]:
+                doc_copy["user_name"] = "Player"
+        results.append(serialize_review_doc(doc_copy))
+    return results
 
 @router.get("", response_model=ReviewSummaryResponse)
 async def list_public_reviews(
@@ -103,7 +149,7 @@ async def list_public_reviews(
     cursor = db.reviews.find(match_filter).sort("created_at", -1)
     review_docs = await cursor.to_list(length=100)
 
-    reviews = [serialize_review_doc(d) for d in review_docs]
+    reviews = await populate_review_usernames(db, review_docs)
     total_reviews = len(reviews)
 
     rating_dist = {str(i): 0 for i in range(1, 6)}
@@ -145,7 +191,14 @@ async def submit_review(
         raise HTTPException(status_code=400, detail="Review text must be at least 10 characters long.")
 
     user_id = current_user.id if current_user else "guest_player"
-    user_name = payload.user_name or (current_user.display_name or current_user.username if current_user else "Verified Contender")
+    user_name = payload.user_name
+    if current_user:
+        # Prioritize authenticated user's actual username
+        if not user_name or user_name.strip().lower() in ["contender", "verified contender", "player", "contenders", "audit players"]:
+            user_name = current_user.username or current_user.display_name or "Player"
+    else:
+        user_name = user_name or "Player"
+
     user_email = current_user.email if current_user else "contender@ametheus.gg"
     avatar_url = payload.avatar_url or (current_user.avatar_url if current_user else None)
 
@@ -227,7 +280,7 @@ async def list_admin_reviews(
 
     cursor = db.reviews.find(query).sort("created_at", -1)
     docs = await cursor.to_list(length=200)
-    return [serialize_review_doc(d) for d in docs]
+    return await populate_review_usernames(db, docs)
 
 @admin_router.patch("/{id}/status", response_model=ReviewResponse)
 async def update_review_status(
@@ -244,10 +297,11 @@ async def update_review_status(
     if st_upper not in ["APPROVED", "FEATURED", "HIDDEN", "PENDING"]:
         raise HTTPException(status_code=400, detail="Invalid review status.")
 
+    from app.models.base import get_utc_now
     update_doc: Dict[str, any] = {
         "status": st_upper,
         "is_featured": (st_upper == "FEATURED"),
-        "updated_at": datetime.utcnow(),
+        "updated_at": get_utc_now(),
     }
     if payload.admin_notes is not None:
         update_doc["admin_notes"] = payload.admin_notes
@@ -264,7 +318,8 @@ async def update_review_status(
     )
 
     refreshed = await db.reviews.find_one({"_id": doc["_id"]})
-    return serialize_review_doc(refreshed)
+    res_list = await populate_review_usernames(db, [refreshed])
+    return res_list[0]
 
 @admin_router.delete("/{id}")
 async def delete_review(

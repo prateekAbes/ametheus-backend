@@ -931,6 +931,122 @@ https://ametheus.gg
     return await send_noreply_email(to_email_clean, subject, text_body, html_body)
 
 
+async def send_security_alert_email(
+    to_email: str,
+    user_name: str,
+    client_ip: str,
+    device_info: str,
+    timestamp_str: str,
+    db: Optional[AsyncIOMotorDatabase] = None,
+) -> Tuple[bool, Optional[str]]:
+    """
+    Dispatches a high-priority security notification email when a sign-in is detected from a new/unrecognized IP.
+    Routes via the NO-REPLY identity (noreply@ametheus.games) with Reply-To pointing to support@ametheus.games.
+    """
+    to_email_clean = (to_email or "").strip().lower()
+    if not to_email_clean or "@" not in to_email_clean:
+        return False, "Recipient email is invalid or missing"
+
+    display_name = user_name or "Contender"
+    subject = f"AMETHEUS Security Alert: New sign-in detected from {client_ip}"
+    settings_url = "https://ametheus.gg/settings#Security"
+
+    text_body = f"""SECURITY ALERT: NEW SIGN-IN DETECTED
+======================================
+
+Hello {display_name},
+
+A new sign-in to your AMETHEUS account was detected from an unrecognized IP address.
+
+Sign-In Details:
+----------------
+• Account: {display_name} ({to_email_clean})
+• IP Address: {client_ip}
+• Device / Client: {device_info}
+• Date & Time: {timestamp_str}
+
+Did you perform this login?
+• IF THIS WAS YOU: You can safely ignore this notification. This IP has now been added to your recognized devices.
+• IF YOU DO NOT RECOGNIZE THIS ACTIVITY:
+  1. Change your account password immediately at: {settings_url}
+  2. Terminate all other active sessions under Settings > Security.
+  3. Contact AMETHEUS Security Support at support@ametheus.games.
+
+Protecting your competitive account integrity,
+AMETHEUS Security Operations
+https://ametheus.gg
+"""
+
+    html_body = f"""
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>{subject}</title>
+</head>
+<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background-color: #07090E; margin: 0; padding: 24px; color: #F8FAFC;">
+  <table width="100%" border="0" cellspacing="0" cellpadding="0" style="max-width: 600px; margin: 0 auto; background-color: #0E121B; border-radius: 12px; border: 1px solid #1F2839; overflow: hidden; box-shadow: 0 8px 24px rgba(0,0,0,0.7);">
+    <tr>
+      <td style="background-color: #171E2E; padding: 22px 24px; border-bottom: 3px solid #EF4444;">
+        <h1 style="color: #FFFFFF; margin: 0; font-size: 20px; font-weight: 800; letter-spacing: 1px;">AMETHEUS <span style="color: #EF4444;">SECURITY ALERT</span></h1>
+        <p style="color: #94A3B8; margin: 6px 0 0 0; font-size: 11px; text-transform: uppercase; letter-spacing: 2px;">Unrecognized Login Detected</p>
+      </td>
+    </tr>
+    <tr>
+      <td style="padding: 28px 24px;">
+        <div style="background-color: rgba(239,68,68,0.1); border: 1px solid rgba(239,68,68,0.3); border-radius: 8px; padding: 14px 16px; margin-bottom: 22px; color: #FCA5A5; font-size: 13px; line-height: 1.5;">
+          <strong>Security Notice:</strong> A new sign-in was detected from an IP address not previously associated with your account.
+        </div>
+
+        <p style="margin: 0 0 16px 0; font-size: 14px; color: #CBD5E1;">
+          Hello <strong style="color: #FFFFFF;">{display_name}</strong>,
+        </p>
+
+        <table width="100%" border="0" cellspacing="0" cellpadding="10" style="font-size: 12px; font-family: monospace; background-color: #07090E; border-radius: 8px; border: 1px solid #1F2839; margin-bottom: 24px;">
+          <tr style="border-bottom: 1px solid #1F2839;">
+            <td style="color: #94A3B8; width: 130px;">Account:</td>
+            <td style="color: #FFFFFF; font-weight: bold;">{display_name} &lt;{to_email_clean}&gt;</td>
+          </tr>
+          <tr style="border-bottom: 1px solid #1F2839;">
+            <td style="color: #94A3B8;">IP Address:</td>
+            <td style="color: #EF4444; font-weight: bold;">{client_ip}</td>
+          </tr>
+          <tr style="border-bottom: 1px solid #1F2839;">
+            <td style="color: #94A3B8;">Device / Browser:</td>
+            <td style="color: #38BDF8;">{device_info}</td>
+          </tr>
+          <tr>
+            <td style="color: #94A3B8;">Date &amp; Time:</td>
+            <td style="color: #E2E8F0;">{timestamp_str}</td>
+          </tr>
+        </table>
+
+        <div style="background-color: #121824; border-left: 3px solid #38BDF8; padding: 14px 16px; border-radius: 4px; margin-bottom: 24px; font-size: 13px; line-height: 1.6; color: #CBD5E1;">
+          <p style="margin: 0 0 8px 0;"><strong style="color: #FFFFFF;">Was this you?</strong></p>
+          <p style="margin: 0 0 8px 0;">If you recognized this sign-in, you can safely disregard this email. This IP address has been added to your authorized network list.</p>
+          <p style="margin: 0; color: #F87171;"><strong style="color: #EF4444;">If you did not sign in:</strong> Someone else may have your credentials. We strongly advise updating your password and terminating active sessions immediately.</p>
+        </div>
+
+        <div style="text-align: center; margin: 28px 0 16px 0;">
+          <a href="{settings_url}" style="display: inline-block; background-color: #EF4444; color: #FFFFFF; padding: 12px 28px; font-family: monospace; font-size: 12px; font-weight: bold; text-transform: uppercase; text-decoration: none; border-radius: 6px; letter-spacing: 0.5px; box-shadow: 0 4px 12px rgba(239,68,68,0.3);">
+            Review Account Security &rarr;
+          </a>
+        </div>
+      </td>
+    </tr>
+    <tr>
+      <td style="background-color: #07090E; padding: 16px 24px; text-align: center; border-top: 1px solid #1F2839; font-size: 11px; color: #64748B;">
+        &copy; 2026 AMETHEUS Esports Platform. All competitive integrity rights reserved.
+      </td>
+    </tr>
+  </table>
+</body>
+</html>
+"""
+
+    return await send_noreply_email(to_email_clean, subject, text_body, html_body)
+
+
 def render_official_announcement_email(
     subject: str,
     message: str,

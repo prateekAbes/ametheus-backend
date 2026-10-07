@@ -96,6 +96,34 @@ async def create_notification(
     """
     canonical_cat = resolve_canonical_category(category or notification_type, title)
 
+    # Check user notification preferences before persisting or dispatching
+    user = await db.users.find_one({"$or": [{"_id": user_id}, {"id": user_id}]})
+    if user:
+        user_prefs = user.get("preferences") or {}
+        notif_prefs = user_prefs.get("notifications") or {}
+
+        # Category suppression checks (critical SYSTEM/security notifications are always delivered)
+        if canonical_cat in ("TOURNAMENT", "REGISTRATION", "BATCHES"):
+            if notif_prefs.get("Tournament updates") is False:
+                logger.info(f"[Notification Suppressed] User {user_id} disabled 'Tournament updates'")
+                return None
+        elif canonical_cat == "MATCH":
+            if notif_prefs.get("Match reminders") is False:
+                logger.info(f"[Notification Suppressed] User {user_id} disabled 'Match reminders'")
+                return None
+        elif canonical_cat == "TEAM":
+            if notif_prefs.get("Team invites") is False:
+                logger.info(f"[Notification Suppressed] User {user_id} disabled 'Team invites'")
+                return None
+        elif canonical_cat in ("WALLET", "PAYMENT"):
+            if notif_prefs.get("Wallet & payments") is False:
+                logger.info(f"[Notification Suppressed] User {user_id} disabled 'Wallet & payments'")
+                return None
+
+        # Email copy suppression check
+        if notif_prefs.get("Email notifications") is False or notif_prefs.get("Email Notifications") is False:
+            send_email_copy = False
+
     # Normalize notification_type if it was generic PAYMENT
     normalized_type = notification_type
     if normalized_type.upper() == "PAYMENT":
@@ -139,7 +167,8 @@ async def create_notification(
             event_hash = hashlib.sha256(f"{user_id}:{final_title}:{message}".encode("utf-8")).hexdigest()
             already_sent = await db.sent_email_notifications.find_one({"event_hash": event_hash})
             if not already_sent:
-                user = await db.users.find_one({"$or": [{"_id": user_id}, {"id": user_id}]})
+                if not user:
+                    user = await db.users.find_one({"$or": [{"_id": user_id}, {"id": user_id}]})
                 if user and user.get("email"):
                     u_email = str(user["email"]).strip().lower()
                     u_name = user.get("display_name") or user.get("username") or "Contender"

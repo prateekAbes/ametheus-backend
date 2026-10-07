@@ -1,4 +1,5 @@
 from typing import Optional, List, Dict, Any
+from datetime import datetime
 from pydantic import BaseModel, Field, ConfigDict, model_validator
 
 # User
@@ -11,6 +12,11 @@ class UserBase(BaseModel):
     avatar_url: Optional[str] = None
     riot_id: Optional[str] = None
     steam_id: Optional[str] = None
+    preferences: Optional[Dict[str, Any]] = None
+    privacy_settings: Optional[Dict[str, Any]] = None
+    known_ips: Optional[List[str]] = None
+    last_login_ip: Optional[str] = None
+    last_login_at: Optional[datetime] = None
 
 class UserCreate(UserBase):
     id: str
@@ -20,6 +26,30 @@ class UserResponse(UserBase):
     inr_balance: str = "0"
     inr_balance_paise: int = 0
     inr_reserved_paise: int = 0
+    model_config = ConfigDict(from_attributes=True)
+
+# Crest
+class CrestBase(BaseModel):
+    name: str
+    description: Optional[str] = None
+    image_url: str
+    is_active: bool = True
+    category: Optional[str] = "OPERATOR"
+
+class CrestCreate(CrestBase):
+    pass
+
+class CrestUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    image_url: Optional[str] = None
+    is_active: Optional[bool] = None
+    category: Optional[str] = None
+
+class CrestResponse(CrestBase):
+    id: str
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
     model_config = ConfigDict(from_attributes=True)
 
 # Game

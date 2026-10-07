@@ -18,6 +18,11 @@ class User(BaseModel):
     inr_reserved_paise: int = 0
     inr_balance: str = "0"  # keep for backwards compatibility
     is_dummy: bool = False
+    preferences: Optional[dict] = None
+    privacy_settings: Optional[dict] = None
+    known_ips: Optional[list] = None
+    last_login_ip: Optional[str] = None
+    last_login_at: Optional[datetime] = None
     created_at: datetime = Field(default_factory=get_utc_now)
     updated_at: datetime = Field(default_factory=get_utc_now)
 
