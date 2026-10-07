@@ -252,3 +252,45 @@ async def test_leaderboard_show_stats_privacy_enforcement(mock_db):
         assert ghost_team["captain"] == "@Anonymous Contender"
 
     app.dependency_overrides.clear()
+
+@pytest.mark.asyncio
+async def test_check_username_availability_flow(mock_db):
+    """
+    Test real-time username availability validation rules:
+    - Short username (<3 chars) -> unavailable
+    - Reserved username (admin) -> unavailable
+    - Taken username in DB -> unavailable
+    - Valid available username -> available
+    """
+    app.dependency_overrides[get_db] = lambda: mock_db
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        await mock_db.users.insert_one({
+            "_id": "user_taken",
+            "username": "ShadowFox",
+            "username_lower": "shadowfox",
+            "role": "PLAYER",
+        })
+
+        # 1. Short
+        r1 = await ac.get("/api/v1/auth/check-username?username=ab")
+        assert r1.status_code == 200
+        assert r1.json()["available"] is False
+
+        # 2. Reserved
+        r2 = await ac.get("/api/v1/auth/check-username?username=admin")
+        assert r2.status_code == 200
+        assert r2.json()["available"] is False
+
+        # 3. Taken (case-insensitive)
+        r3 = await ac.get("/api/v1/auth/check-username?username=SHADOWFOX")
+        assert r3.status_code == 200
+        assert r3.json()["available"] is False
+
+        # 4. Available
+        r4 = await ac.get("/api/v1/auth/check-username?username=ShadowFox99")
+        assert r4.status_code == 200
+        assert r4.json()["available"] is True
+
+    app.dependency_overrides.clear()
+

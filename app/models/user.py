@@ -18,6 +18,8 @@ class User(BaseModel):
     inr_reserved_paise: int = 0
     inr_balance: str = "0"  # keep for backwards compatibility
     is_dummy: bool = False
+    has_chosen_username: bool = True
+    needs_username: bool = False
     preferences: Optional[dict] = None
     privacy_settings: Optional[dict] = None
     known_ips: Optional[list] = None

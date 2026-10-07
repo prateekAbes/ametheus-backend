@@ -29,6 +29,32 @@ class UserSyncRequest(BaseModel):
     username: str
     display_name: Optional[str] = None
     avatar_url: Optional[str] = None
+    has_chosen_username: Optional[bool] = None
+
+@router.get("/check-username")
+async def check_username_availability(
+    username: str,
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Validate real-time username availability, format rules, and reserved status.
+    """
+    clean = username.strip()
+    if len(clean) < 3:
+        return {"available": False, "username": clean, "message": "Username must be at least 3 characters."}
+    if len(clean) > 30:
+        return {"available": False, "username": clean, "message": "Username must be 30 characters or fewer."}
+    import re
+    if not re.match(r'^[a-zA-Z0-9_\-\.]+$', clean):
+        return {"available": False, "username": clean, "message": "Letters, numbers, underscores, hyphens, and dots only."}
+    if _is_reserved_username(clean):
+        return {"available": False, "username": clean, "message": "This username is reserved."}
+
+    existing = await db.users.find_one({"username_lower": clean.lower()})
+    if existing:
+        return {"available": False, "username": clean, "message": "Username is already taken."}
+
+    return {"available": True, "username": clean, "message": "Username available"}
 
 @router.post("/sync", response_model=UserResponse)
 async def sync_clerk_user(
@@ -144,10 +170,13 @@ async def sync_clerk_user(
     initial_role = "SUPER_ADMIN" if is_super_admin else ("ORGANIZER" if token_role in ["ORGANIZER", "TOURNAMENT_ADMIN"] else "PLAYER")
 
     # Application fields set ONLY upon initial insertion
+    has_chosen = payload.has_chosen_username if payload.has_chosen_username is not None else True
     set_on_insert_fields = {
         "role": initial_role,
         "username": clean_username,
         "username_lower": clean_username.lower(),
+        "has_chosen_username": has_chosen,
+        "needs_username": not has_chosen,
         "display_name": payload.display_name or clean_username,
         "avatar_url": payload.avatar_url,
         "riot_id": None,
@@ -326,7 +355,11 @@ async def update_user_profile(
 
         update_data["username"] = new_username
         update_data["username_lower"] = new_username_lower
+        update_data["has_chosen_username"] = True
+        update_data["needs_username"] = False
         current_user.username = new_username
+        current_user.has_chosen_username = True
+        current_user.needs_username = False
 
     if payload.display_name is not None:
         update_data["display_name"] = payload.display_name.strip()

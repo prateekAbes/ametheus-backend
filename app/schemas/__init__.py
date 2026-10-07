@@ -14,6 +14,8 @@ class UserBase(BaseModel):
     steam_id: Optional[str] = None
     preferences: Optional[Dict[str, Any]] = None
     privacy_settings: Optional[Dict[str, Any]] = None
+    has_chosen_username: bool = True
+    needs_username: bool = False
     known_ips: Optional[List[str]] = None
     last_login_ip: Optional[str] = None
     last_login_at: Optional[datetime] = None
