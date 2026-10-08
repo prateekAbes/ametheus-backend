@@ -754,7 +754,6 @@ async def reply_support_ticket(
     references_header = " ".join(all_msg_ids) if all_msg_ids else None
 
     user_email = (doc.get("email") or "").strip().lower()
-    user_email = (doc.get("email") or "").strip().lower()
     admin_msg_id = None
 
     if user_email:
@@ -776,6 +775,7 @@ async def reply_support_ticket(
                 html_content=email_html,
                 in_reply_to=in_reply_to,
                 references=references_header,
+                ticket_id=clean_tid,
             )
         except Exception:
             pass

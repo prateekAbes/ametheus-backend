@@ -149,7 +149,7 @@ async def test_migration_outbound_headers_and_centralized_abstractions(monkeypat
     assert len(captured_smtp) == 1
     call = captured_smtp[0]
     assert call["identity_key"] == "support"
-    assert call["reply_to"] == settings.SUPPORT_EMAIL.strip()
+    assert call["reply_to"] == settings.SUPPORT_REPLY_TO.strip()
     assert call["in_reply_to"] == "<ORIGINAL-MSGID@ametheus.games>"
     assert call["references"] == "<ORIGINAL-MSGID@ametheus.games>"
 

@@ -50,26 +50,22 @@ class Settings(BaseSettings):
     SMTP_PASSWORD: Optional[str] = None
     SMTP_USE_TLS: bool = True
 
-    # Sender Identities
-    OFFICIAL_EMAIL: str = "official@ametheus.games"
-    OFFICIAL_EMAIL_NAME: str = "Ametheus"
-
+    # Sender Identities & Reply-To Routing
     SUPPORT_EMAIL: str = "support@ametheus.games"
     SUPPORT_EMAIL_NAME: str = "Ametheus Support"
+    SUPPORT_REPLY_TO: str = "support@inbound.ametheus.games"
 
     NOREPLY_EMAIL: str = "noreply@ametheus.games"
     NOREPLY_EMAIL_NAME: str = "Ametheus"
+    NOREPLY_REPLY_TO: str = "support@ametheus.games"
 
-    # Default reply-to address
+    OFFICIAL_EMAIL: str = "official@ametheus.games"
+    OFFICIAL_EMAIL_NAME: str = "Ametheus"
+    OFFICIAL_REPLY_TO: str = "official@ametheus.games"
+
+    # Technical inbound reply-to & compatibility aliases
+    SUPPORT_INBOUND_EMAIL: str = "support@inbound.ametheus.games"
     EMAIL_REPLY_TO: str = "support@ametheus.games"
-
-    # Technical inbound reply-to address for routing user email replies
-    SUPPORT_INBOUND_EMAIL: str = "support@ametheus.games"
-
-    # Official email reply-to: set to official inbound Resend address if configured
-    OFFICIAL_REPLY_TO: Optional[str] = None
-
-    # Compatibility alias
     AUTOMATED_EMAIL: str = "noreply@ametheus.games"
 
     # =========================================================

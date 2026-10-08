@@ -1,11 +1,13 @@
 import asyncio
 import logging
+import re
 import smtplib
 import socket
 import uuid
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from typing import Optional, Tuple, Dict, Any
+from enum import Enum
+from typing import Optional, Tuple, Dict, Any, Union
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from app.core.config import settings
@@ -17,6 +19,171 @@ from app.schemas.email_settings import (
 )
 
 logger = logging.getLogger("ametheus.email")
+
+
+class EmailType(str, Enum):
+    SUPPORT_TICKET_CONFIRMATION = "SUPPORT_TICKET_CONFIRMATION"
+    SUPPORT_ADMIN_REPLY = "SUPPORT_ADMIN_REPLY"
+    ADMIN_TICKET_ALERT = "ADMIN_TICKET_ALERT"
+    USER_PLATFORM_NOTIFICATION = "USER_PLATFORM_NOTIFICATION"
+    SECURITY_LOGIN_ALERT = "SECURITY_LOGIN_ALERT"
+    MATCH_ROSTER_SCHEDULE = "MATCH_ROSTER_SCHEDULE"
+    OFFICIAL_PLATFORM_ANNOUNCEMENT = "OFFICIAL_PLATFORM_ANNOUNCEMENT"
+    ORGANIZER_COMMUNICATION = "ORGANIZER_COMMUNICATION"
+    SMTP_DIAGNOSTIC = "SMTP_DIAGNOSTIC"
+
+
+def resolve_email_identity(
+    email_type: Union[EmailType, str],
+    diagnostic_identity: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Strict server-side resolver mapping explicit EmailType to sender identity,
+    display name, and Reply-To header.
+    Never falls back to noreply for Support Admin Reply.
+    """
+    type_str = str(email_type.value if isinstance(email_type, EmailType) else email_type).strip().upper()
+
+    host = settings.SMTP_HOST.strip() if settings.SMTP_HOST else "smtp-relay.brevo.com"
+    port = int(settings.SMTP_PORT or 587)
+    username = settings.SMTP_USERNAME.strip() if settings.SMTP_USERNAME else None
+    password = settings.SMTP_PASSWORD.strip() if settings.SMTP_PASSWORD else None
+    use_tls = bool(settings.SMTP_USE_TLS)
+
+    # 1. PRIMARY DEFENSIVE GUARD: SUPPORT_ADMIN_REPLY
+    # A Support Admin Reply MUST always be sent from support@ametheus.games
+    # with Reply-To: support@inbound.ametheus.games.
+    # It must NEVER fall back to noreply@ametheus.games.
+    if type_str == EmailType.SUPPORT_ADMIN_REPLY.value:
+        return {
+            "email_type": EmailType.SUPPORT_ADMIN_REPLY.value,
+            "identity_key": "support",
+            "from_email": settings.SUPPORT_EMAIL.strip(),
+            "from_name": settings.SUPPORT_EMAIL_NAME.strip(),
+            "reply_to": settings.SUPPORT_REPLY_TO.strip(),
+            "host": host,
+            "port": port,
+            "username": username,
+            "password": password,
+            "use_tls": use_tls,
+        }
+
+    # 2. Support Ticket Confirmation (automated confirmation to user)
+    # From: noreply@ametheus.games, Reply-To: support@ametheus.games
+    elif type_str == EmailType.SUPPORT_TICKET_CONFIRMATION.value:
+        return {
+            "email_type": EmailType.SUPPORT_TICKET_CONFIRMATION.value,
+            "identity_key": "noreply",
+            "from_email": settings.NOREPLY_EMAIL.strip(),
+            "from_name": settings.NOREPLY_EMAIL_NAME.strip(),
+            "reply_to": settings.NOREPLY_REPLY_TO.strip(),
+            "host": host,
+            "port": port,
+            "username": username,
+            "password": password,
+            "use_tls": use_tls,
+        }
+
+    # 3. Admin Ticket Alert (internal notification of new support ticket)
+    # From: official@ametheus.games, Reply-To: support@inbound.ametheus.games
+    elif type_str == EmailType.ADMIN_TICKET_ALERT.value:
+        return {
+            "email_type": EmailType.ADMIN_TICKET_ALERT.value,
+            "identity_key": "official",
+            "from_email": settings.OFFICIAL_EMAIL.strip(),
+            "from_name": settings.OFFICIAL_EMAIL_NAME.strip(),
+            "reply_to": settings.SUPPORT_REPLY_TO.strip(),
+            "host": host,
+            "port": port,
+            "username": username,
+            "password": password,
+            "use_tls": use_tls,
+        }
+
+    # 4. User Platform Notifications & System alerts
+    # From: noreply@ametheus.games, Reply-To: support@ametheus.games
+    elif type_str in (
+        EmailType.USER_PLATFORM_NOTIFICATION.value,
+        EmailType.SECURITY_LOGIN_ALERT.value,
+        EmailType.MATCH_ROSTER_SCHEDULE.value,
+    ):
+        return {
+            "email_type": type_str,
+            "identity_key": "noreply",
+            "from_email": settings.NOREPLY_EMAIL.strip(),
+            "from_name": settings.NOREPLY_EMAIL_NAME.strip(),
+            "reply_to": settings.NOREPLY_REPLY_TO.strip(),
+            "host": host,
+            "port": port,
+            "username": username,
+            "password": password,
+            "use_tls": use_tls,
+        }
+
+    # 5. Official Platform Announcements & Organizer Communications
+    # From: official@ametheus.games, Reply-To: official@ametheus.games
+    elif type_str in (
+        EmailType.OFFICIAL_PLATFORM_ANNOUNCEMENT.value,
+        EmailType.ORGANIZER_COMMUNICATION.value,
+    ):
+        return {
+            "email_type": type_str,
+            "identity_key": "official",
+            "from_email": settings.OFFICIAL_EMAIL.strip(),
+            "from_name": settings.OFFICIAL_EMAIL_NAME.strip(),
+            "reply_to": (settings.OFFICIAL_REPLY_TO or settings.OFFICIAL_EMAIL).strip(),
+            "host": host,
+            "port": port,
+            "username": username,
+            "password": password,
+            "use_tls": use_tls,
+        }
+
+    # 6. SMTP Diagnostic Tester (independent test per identity without altering production routing)
+    elif type_str == EmailType.SMTP_DIAGNOSTIC.value:
+        norm_diag = (diagnostic_identity or "support").strip().lower()
+        if norm_diag in ("noreply", "automated"):
+            return {
+                "email_type": EmailType.SMTP_DIAGNOSTIC.value,
+                "identity_key": "noreply",
+                "from_email": settings.NOREPLY_EMAIL.strip(),
+                "from_name": settings.NOREPLY_EMAIL_NAME.strip(),
+                "reply_to": settings.NOREPLY_REPLY_TO.strip(),
+                "host": host,
+                "port": port,
+                "username": username,
+                "password": password,
+                "use_tls": use_tls,
+            }
+        elif norm_diag in ("official", "business"):
+            return {
+                "email_type": EmailType.SMTP_DIAGNOSTIC.value,
+                "identity_key": "official",
+                "from_email": settings.OFFICIAL_EMAIL.strip(),
+                "from_name": settings.OFFICIAL_EMAIL_NAME.strip(),
+                "reply_to": (settings.OFFICIAL_REPLY_TO or settings.OFFICIAL_EMAIL).strip(),
+                "host": host,
+                "port": port,
+                "username": username,
+                "password": password,
+                "use_tls": use_tls,
+            }
+        else:
+            return {
+                "email_type": EmailType.SMTP_DIAGNOSTIC.value,
+                "identity_key": "support",
+                "from_email": settings.SUPPORT_EMAIL.strip(),
+                "from_name": settings.SUPPORT_EMAIL_NAME.strip(),
+                "reply_to": settings.SUPPORT_REPLY_TO.strip(),
+                "host": host,
+                "port": port,
+                "username": username,
+                "password": password,
+                "use_tls": use_tls,
+            }
+
+    else:
+        raise ValueError(f"Unknown email type: '{email_type}'")
 
 
 def get_identity_config(identity: str) -> Dict[str, Any]:
@@ -84,19 +251,86 @@ def _send_identity_smtp_sync(
     reply_to: Optional[str] = None,
     in_reply_to: Optional[str] = None,
     references: Optional[str] = None,
+    *args: Any,
+    **kwargs: Any,
 ) -> Tuple[bool, Optional[str], Optional[str], Optional[str], str]:
     """
     Synchronous SMTP delivery through Brevo SMTP using the selected sender identity.
+    Enforces strict server-side EmailType identity rules and defensive override guards.
     Returns:
         (success: bool, error_code: Optional[str], error_details: Optional[str], message_id: Optional[str], sender_used: str)
     """
+    email_type = kwargs.get("email_type") or (args[0] if len(args) > 0 else None)
+    ticket_id = kwargs.get("ticket_id") or (args[1] if len(args) > 1 else None)
+    diagnostic_identity = kwargs.get("diagnostic_identity") or (args[2] if len(args) > 2 else None)
+
     to_email_clean = (to_email or "").strip().lower()
     if not to_email_clean or "@" not in to_email_clean:
         logger.warning(f"[Ametheus Email] Invalid recipient email address: '{to_email}'")
         return False, "RECIPIENT_REJECTED", f"Invalid recipient email address: '{to_email}'", None, ""
 
-    cfg = get_identity_config(identity_key)
-    sender_used = cfg["email"]
+    # Identity Resolution: If explicit email_type is provided, resolve via resolve_email_identity
+    if email_type:
+        cfg = resolve_email_identity(email_type, diagnostic_identity=diagnostic_identity or identity_key)
+        resolved_type = str(getattr(email_type, "value", email_type))
+    else:
+        norm_key = (identity_key or "").strip().lower()
+        if (norm_key in ("support", "help") and (in_reply_to or references)) or (reply_to and reply_to.strip().lower() == settings.SUPPORT_REPLY_TO.strip().lower() and norm_key in ("support", "help")):
+            resolved_type = EmailType.SUPPORT_ADMIN_REPLY.value
+        elif norm_key in ("support", "help"):
+            resolved_type = EmailType.SUPPORT_TICKET_CONFIRMATION.value
+        elif norm_key in ("official", "business"):
+            if reply_to and reply_to.strip().lower() == settings.SUPPORT_REPLY_TO.strip().lower():
+                resolved_type = EmailType.ADMIN_TICKET_ALERT.value
+            else:
+                resolved_type = EmailType.OFFICIAL_PLATFORM_ANNOUNCEMENT.value
+        elif norm_key in ("noreply", "automated"):
+            if reply_to and reply_to.strip().lower() == settings.NOREPLY_REPLY_TO.strip().lower():
+                resolved_type = EmailType.SUPPORT_TICKET_CONFIRMATION.value
+            else:
+                resolved_type = EmailType.USER_PLATFORM_NOTIFICATION.value
+        else:
+            resolved_type = identity_key.upper()
+        cfg = get_identity_config(identity_key)
+
+    if not ticket_id and subject:
+        m = re.search(r"\[(?:Ticket\s+)?([A-Za-z0-9_\-]+)\]", subject, re.IGNORECASE)
+        if m:
+            ticket_id = m.group(1)
+
+    # DEFENSIVE SENDER GUARD (Section 9):
+    # If this is a Support Admin Reply, hard-enforce From: support@ametheus.games and Reply-To: support@inbound.ametheus.games
+    # Even if someone passed identity_key="noreply" or custom from/reply_to
+    is_support_admin_reply = (
+        (email_type and str(getattr(email_type, "value", email_type)).upper() == EmailType.SUPPORT_ADMIN_REPLY.value)
+        or (identity_key.strip().lower() in ("support", "help") and (in_reply_to or references))
+        or (reply_to and reply_to.strip().lower() == settings.SUPPORT_REPLY_TO.strip().lower() and identity_key.strip().lower() in ("support", "help"))
+    )
+    if is_support_admin_reply:
+        if identity_key.strip().lower() != "support" or (reply_to and reply_to.strip().lower() != settings.SUPPORT_REPLY_TO.strip().lower()):
+            logger.warning(
+                f"[Ametheus Email] Defensive override applied: attempted to send SUPPORT_ADMIN_REPLY with invalid sender/reply-to "
+                f"(identity={identity_key}, reply_to={reply_to}). Overriding to From: {settings.SUPPORT_EMAIL}, Reply-To: {settings.SUPPORT_REPLY_TO}"
+            )
+        resolved_type = EmailType.SUPPORT_ADMIN_REPLY.value
+        cfg["email"] = settings.SUPPORT_EMAIL.strip()
+        cfg["name"] = settings.SUPPORT_EMAIL_NAME.strip()
+        cfg["reply_to"] = settings.SUPPORT_REPLY_TO.strip()
+        identity_key = "support"
+
+    from_email = cfg.get("from_email") or cfg.get("email")
+    from_name = cfg.get("from_name") or cfg.get("name")
+    effective_reply_to = cfg.get("reply_to")
+    if not effective_reply_to and reply_to:
+        effective_reply_to = reply_to.strip()
+
+    sender_used = from_email
+
+    # Section 11: Structured Server-Side Diagnostic Logging (without passwords, keys, or secrets)
+    logger.info(
+        f"[EMAIL] type={resolved_type} ticketId={ticket_id or 'N/A'} recipient={to_email_clean} "
+        f"from={from_email} replyTo={effective_reply_to or 'None'} provider=brevo"
+    )
 
     if not settings.EMAIL_ENABLED:
         logger.info(f"[Ametheus Email] Email delivery disabled (EMAIL_ENABLED=False). Mocking delivery to <{to_email_clean}> | Subject: '{subject}'")
@@ -112,12 +346,11 @@ def _send_identity_smtp_sync(
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
-    msg["From"] = f"{cfg['name']} <{cfg['email']}>"
+    msg["From"] = f"{from_name} <{from_email}>"
     msg["To"] = to_email_clean
     msg["Message-ID"] = f"<{msg_id}>"
 
     # Only set Reply-To when a meaningful address exists
-    effective_reply_to = reply_to or cfg["reply_to"]
     if effective_reply_to and effective_reply_to.strip():
         msg["Reply-To"] = effective_reply_to.strip()
 
@@ -153,9 +386,9 @@ def _send_identity_smtp_sync(
         server.login(cfg["username"], cfg["password"])
 
         # Envelope sender matches sender email for Brevo relay
-        envelope_sender = cfg["email"]
+        envelope_sender = from_email
         server.sendmail(envelope_sender, [to_email_clean], msg.as_string())
-        logger.info(f"[Ametheus Email] Successfully delivered email via {identity_key.upper()} to <{to_email_clean}> from <{cfg['email']}> | Subject: '{subject}'")
+        logger.info(f"[Ametheus Email] Successfully delivered email via {resolved_type} to <{to_email_clean}> from <{from_email}> | Subject: '{subject}'")
         return True, None, None, msg_id, sender_used
 
     except smtplib.SMTPAuthenticationError as e:
@@ -176,11 +409,11 @@ def _send_identity_smtp_sync(
     except smtplib.SMTPSenderRefused as e:
         err_msg = f"Sender rejected: {e}"
         logger.error(f"[Ametheus Email] Sender rejected: {err_msg}")
-        return False, "INVALID_SENDER", f"Sender address rejected: {cfg['email']}", None, sender_used
+        return False, "INVALID_SENDER", f"Sender address rejected: {from_email}", None, sender_used
 
     except Exception as e:
         err_msg = str(e)
-        logger.error(f"[Ametheus Email] Failed to deliver email via {identity_key} to <{to_email_clean}>: {err_msg}", exc_info=True)
+        logger.error(f"[Ametheus Email] Failed to deliver email via {resolved_type} to <{to_email_clean}>: {err_msg}", exc_info=True)
         return False, "MESSAGE_SEND_FAILED", f"Failed to deliver email: {err_msg}", None, sender_used
 
     finally:
@@ -266,6 +499,37 @@ async def send_support_email(
     )
 
 
+async def send_email_by_type(
+    email_type: Union[EmailType, str],
+    recipient: str,
+    subject: str,
+    text_content: str,
+    html_content: str,
+    ticket_id: Optional[str] = None,
+    in_reply_to: Optional[str] = None,
+    references: Optional[str] = None,
+    diagnostic_identity: Optional[str] = None,
+) -> Tuple[bool, Optional[str], Optional[str]]:
+    """
+    Centralized email dispatcher utilizing explicit server-side EmailType.
+    Resolves sender and Reply-To strictly server-side according to platform identity rules.
+    Returns: (success: bool, error_details: Optional[str], message_id: Optional[str])
+    """
+    cfg = resolve_email_identity(email_type, diagnostic_identity=diagnostic_identity)
+    ok, err_code, err_det, msg_id, _ = await asyncio.to_thread(
+        _send_identity_smtp_sync,
+        cfg["identity_key"],
+        recipient,
+        subject,
+        text_content,
+        html_content,
+        cfg["reply_to"],
+        in_reply_to,
+        references,
+    )
+    return ok, err_det, msg_id
+
+
 async def send_support_email_threaded(
     to_email: str,
     subject: str,
@@ -274,10 +538,14 @@ async def send_support_email_threaded(
     reply_to: Optional[str] = None,
     in_reply_to: Optional[str] = None,
     references: Optional[str] = None,
+    ticket_id: Optional[str] = None,
 ) -> Tuple[bool, Optional[str], Optional[str]]:
     """
     Sends an email using the SUPPORT identity (support@ametheus.games) with email threading headers (In-Reply-To, References).
-    Routes strictly via Brevo SMTP with Reply-To set to support@ametheus.games.
+    Strictly classified as EmailType.SUPPORT_ADMIN_REPLY:
+    - From: support@ametheus.games
+    - Reply-To: support@inbound.ametheus.games
+    - Sender can NEVER fall back to noreply@ametheus.games.
     Returns: (success: bool, error_details: Optional[str], message_id: Optional[str])
     """
     ok, err_code, err_det, msg_id, _ = await asyncio.to_thread(
@@ -287,7 +555,7 @@ async def send_support_email_threaded(
         subject,
         text_content,
         html_content,
-        reply_to or settings.SUPPORT_EMAIL.strip(),
+        settings.SUPPORT_REPLY_TO.strip(),
         in_reply_to,
         references,
     )
@@ -626,18 +894,18 @@ async def send_test_email(
 ) -> SendTestEmailResponse:
     """
     Sends a test verification email via Brevo SMTP using the chosen identity ('support', 'noreply', or 'official').
-    Utilizes the unified Ametheus email template system.
+    Utilizes EmailType.SMTP_DIAGNOSTIC without altering production email routing.
     """
     norm_service = (service or "support").strip().lower()
     if norm_service not in ("support", "noreply", "official"):
         norm_service = "support"
 
-    cfg = get_identity_config(norm_service)
+    cfg = resolve_email_identity(EmailType.SMTP_DIAGNOSTIC, diagnostic_identity=norm_service)
     from app.services.email_template_system import build_smtp_diagnostic_email
     subject, text_body, html_body = build_smtp_diagnostic_email(
         service_name=norm_service,
-        sender_name=cfg["name"],
-        sender_email=cfg["email"],
+        sender_name=cfg["from_name"],
+        sender_email=cfg["from_email"],
         recipient_email=to_email,
         host=cfg["host"],
         port=cfg["port"],
@@ -650,6 +918,9 @@ async def send_test_email(
         subject,
         text_body,
         html_body,
+        cfg["reply_to"],
+        None,
+        None,
     )
 
     return SendTestEmailResponse(
@@ -687,26 +958,27 @@ def format_friendly_ticket_status(status_raw: Optional[str]) -> str:
 
 async def send_ticket_confirmation_email(ticket: dict, db: Optional[AsyncIOMotorDatabase] = None) -> Tuple[bool, Optional[str], Optional[str]]:
     """
-    Sends automated confirmation receipt email to the user using the SUPPORT identity (support@ametheus.games).
-    Reply-To points strictly to support@ametheus.games.
+    Sends automated confirmation receipt email to the user using EmailType.SUPPORT_TICKET_CONFIRMATION:
+    - From: noreply@ametheus.games
+    - Reply-To: support@ametheus.games
     Uses the unified Ametheus email template system.
     """
     recipient = (ticket.get("email") or "").strip().lower()
     if not recipient:
         return False, "Recipient email is missing", None
 
+    tid = ticket.get("ticket_id") or ticket.get("id") or "N/A"
     from app.services.email_template_system import build_support_ticket_confirmation_email
     subject, text_body, html_body = build_support_ticket_confirmation_email(ticket)
 
-    # Strictly sent from support@ametheus.games with Reply-To: support@ametheus.games
     ok, err_code, err_det, msg_id, _ = await asyncio.to_thread(
         _send_identity_smtp_sync,
-        "support",
+        "noreply",
         recipient,
         subject,
         text_body,
         html_body,
-        settings.SUPPORT_EMAIL.strip(),
+        settings.NOREPLY_REPLY_TO.strip(),
         None,
         None,
     )
@@ -720,14 +992,29 @@ async def send_admin_ticket_notification_email(
 ) -> Tuple[bool, Optional[str]]:
     """
     Sends notification to the configured support desk email with complete ticket information.
-    Routes via the SUPPORT email identity using the unified Ametheus template system.
+    EmailType: ADMIN_TICKET_ALERT
+    - From: official@ametheus.games
+    - Reply-To: support@inbound.ametheus.games
+    Uses the unified Ametheus template system.
     """
     target_recipient = admin_recipient or getattr(settings, "SUPPORT_ADMIN_EMAIL", None) or "support@tenetadmissions.com"
+    tid = ticket.get("ticket_id") or ticket.get("id") or "N/A"
 
     from app.services.email_template_system import build_admin_ticket_notification_email
     subject, text_body, html_body = build_admin_ticket_notification_email(ticket)
 
-    return await send_support_email(target_recipient, subject, text_body, html_body)
+    ok, err_code, err_det, msg_id, _ = await asyncio.to_thread(
+        _send_identity_smtp_sync,
+        "official",
+        target_recipient,
+        subject,
+        text_body,
+        html_body,
+        settings.SUPPORT_REPLY_TO.strip(),
+        None,
+        None,
+    )
+    return ok, err_det
 
 
 async def send_notification_email(
@@ -741,7 +1028,9 @@ async def send_notification_email(
 ) -> Tuple[bool, Optional[str]]:
     """
     Sends an automated tournament/match/wallet/platform notification email to the user.
-    Routes via the NO-REPLY identity (noreply@ametheus.games) using the unified Ametheus template system.
+    EmailType: USER_PLATFORM_NOTIFICATION
+    - From: noreply@ametheus.games
+    - Reply-To: support@ametheus.games
     """
     to_email_clean = (recipient or "").strip().lower()
     if not to_email_clean or "@" not in to_email_clean:
@@ -756,7 +1045,18 @@ async def send_notification_email(
         notification_type=notification_type,
     )
 
-    return await send_noreply_email(to_email_clean, subject, text_body, html_body)
+    ok, err_code, err_det, msg_id, _ = await asyncio.to_thread(
+        _send_identity_smtp_sync,
+        "noreply",
+        to_email_clean,
+        subject,
+        text_body,
+        html_body,
+        settings.NOREPLY_REPLY_TO.strip(),
+        None,
+        None,
+    )
+    return ok, err_det
 
 
 async def send_security_alert_email(
@@ -769,7 +1069,9 @@ async def send_security_alert_email(
 ) -> Tuple[bool, Optional[str]]:
     """
     Dispatches a high-priority security notification email when a sign-in is detected from a new/unrecognized IP.
-    Routes via the NO-REPLY identity (noreply@ametheus.games) with the unified Ametheus template system.
+    EmailType: SECURITY_LOGIN_ALERT
+    - From: noreply@ametheus.games
+    - Reply-To: support@ametheus.games
     """
     to_email_clean = (to_email or "").strip().lower()
     if not to_email_clean or "@" not in to_email_clean:
@@ -784,7 +1086,18 @@ async def send_security_alert_email(
         timestamp_str=timestamp_str,
     )
 
-    return await send_noreply_email(to_email_clean, subject, text_body, html_body)
+    ok, err_code, err_det, msg_id, _ = await asyncio.to_thread(
+        _send_identity_smtp_sync,
+        "noreply",
+        to_email_clean,
+        subject,
+        text_body,
+        html_body,
+        settings.NOREPLY_REPLY_TO.strip(),
+        None,
+        None,
+    )
+    return ok, err_det
 
 
 def render_official_announcement_email(
@@ -808,10 +1121,23 @@ async def send_official_announcement_to_recipient(
     recipient_name: Optional[str] = None,
 ) -> tuple[bool, Optional[str]]:
     """
-    Sends an official announcement using official@ametheus.games.
+    Sends an official announcement using EmailType.OFFICIAL_PLATFORM_ANNOUNCEMENT:
+    - From: official@ametheus.games
+    - Reply-To: official@ametheus.games
     """
     text_body, html_body = render_official_announcement_email(subject, message, recipient_name)
-    return await send_official_email(to_email, subject, text_body, html_body)
+    ok, err_code, err_det, msg_id, _ = await asyncio.to_thread(
+        _send_identity_smtp_sync,
+        "official",
+        to_email,
+        subject,
+        text_body,
+        html_body,
+        (settings.OFFICIAL_REPLY_TO or settings.OFFICIAL_EMAIL).strip(),
+        None,
+        None,
+    )
+    return ok, err_det
 
 
 async def send_match_roster_notification_email(
@@ -833,8 +1159,9 @@ async def send_match_roster_notification_email(
 ) -> Tuple[bool, Optional[str]]:
     """
     Sends a branded, mobile-responsive match roster notification email to a Team Leader.
-    Handles both initial assignment ('MATCH SCHEDULED') and updates ('MATCH UPDATED').
-    Utilizes the unified Ametheus template system.
+    EmailType: MATCH_ROSTER_SCHEDULE
+    - From: noreply@ametheus.games
+    - Reply-To: support@ametheus.games
     """
     to_email_clean = (to_email or "").strip().lower()
     if not to_email_clean or "@" not in to_email_clean:
@@ -858,6 +1185,17 @@ async def send_match_roster_notification_email(
         previous_details=previous_details,
     )
 
-    return await send_noreply_email(to_email_clean, subject, text_body, html_body)
+    ok, err_code, err_det, msg_id, _ = await asyncio.to_thread(
+        _send_identity_smtp_sync,
+        "noreply",
+        to_email_clean,
+        subject,
+        text_body,
+        html_body,
+        settings.NOREPLY_REPLY_TO.strip(),
+        None,
+        None,
+    )
+    return ok, err_det
 
 

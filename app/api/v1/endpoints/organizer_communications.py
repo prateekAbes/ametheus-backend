@@ -416,12 +416,14 @@ async def admin_reply_organizer_email_thread(
             status=new_st,
         )
         try:
-            await send_email(
-                sender_type="official",
+            from app.services.email_service import send_email_by_type, EmailType
+            await send_email_by_type(
+                email_type=EmailType.ORGANIZER_COMMUNICATION,
                 recipient=org_email,
                 subject=email_subj,
                 text_content=email_text,
                 html_content=email_html,
+                ticket_id=thread_id,
             )
         except Exception:
             pass

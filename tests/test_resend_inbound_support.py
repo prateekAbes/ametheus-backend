@@ -535,11 +535,11 @@ async def test_outbound_support_emails_have_correct_from_and_reply_to_headers(mo
     ok, err, msg_id = await send_ticket_confirmation_email(ticket)
     assert len(captured_calls) == 1
     conf_call = captured_calls[0]
-    # Automated ticket confirmation uses support identity (From: support@ametheus.games)
-    assert conf_call["identity_key"] == "support"
+    # Automated ticket confirmation uses noreply identity (From: noreply@ametheus.games)
+    assert conf_call["identity_key"] == "noreply"
     assert conf_call["to_email"] == "alex@example.com"
     # Reply-To must be support@ametheus.games
-    assert conf_call["reply_to"] == settings.SUPPORT_EMAIL.strip()
+    assert conf_call["reply_to"] == settings.NOREPLY_REPLY_TO.strip()
 
     # 3. Test admin support reply email with threading
     captured_calls.clear()
@@ -556,8 +556,8 @@ async def test_outbound_support_emails_have_correct_from_and_reply_to_headers(mo
     reply_call = captured_calls[0]
     assert reply_call["identity_key"] == "support"
     assert reply_call["to_email"] == "alex@example.com"
-    # Reply-To must be support@ametheus.games
-    assert reply_call["reply_to"] == settings.SUPPORT_EMAIL.strip()
+    # Reply-To must be support@inbound.ametheus.games
+    assert reply_call["reply_to"] == settings.SUPPORT_REPLY_TO.strip()
     # Threading headers preserved
     assert reply_call["in_reply_to"] == "<AMT-CONF01-USER@mail.com>"
     assert reply_call["references"] == "<AMT-CONF01-USER@mail.com>"
