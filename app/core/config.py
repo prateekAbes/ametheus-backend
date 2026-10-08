@@ -51,19 +51,22 @@ class Settings(BaseSettings):
 
     # Sender Identities
     OFFICIAL_EMAIL: str = "official@ametheus.games"
-    OFFICIAL_EMAIL_NAME: str = "Ametheus Official"
+    OFFICIAL_EMAIL_NAME: str = "Ametheus"
 
     SUPPORT_EMAIL: str = "support@ametheus.games"
     SUPPORT_EMAIL_NAME: str = "Ametheus Support"
 
-    NOREPLY_EMAIL: str = "no-reply@ametheus.games"
-    NOREPLY_EMAIL_NAME: str = "Ametheus Support"
+    NOREPLY_EMAIL: str = "noreply@ametheus.games"
+    NOREPLY_EMAIL_NAME: str = "Ametheus"
 
     # Default reply-to address
     EMAIL_REPLY_TO: str = "support@ametheus.games"
 
     # Technical inbound reply-to address for routing user email replies through Resend
     SUPPORT_INBOUND_EMAIL: str = "support@inbound.ametheus.games"
+
+    # Official email reply-to: set to official inbound Resend address if configured
+    OFFICIAL_REPLY_TO: Optional[str] = None
 
     # Compatibility alias
     AUTOMATED_EMAIL: str = "noreply@ametheus.games"

@@ -149,22 +149,23 @@ def sanitize_html(html_str: Optional[str]) -> str:
 def extract_ticket_candidates_from_subject(subject: Optional[str]) -> List[str]:
     """
     Extracts potential ticket identifier candidates from subject line.
-    E.g. 'Re: [Ticket AMT-B3F921]', 'Re: Payment [#1024]', 'AMT-B3F921'.
+    E.g. 'Re: [Ticket AMT-B3F921]', 'Re: Support Ticket #AM-1042', 'Re: Payment [#1024]', 'AMT-B3F921', 'AM-1042'.
     """
     if not subject:
         return []
     candidates = []
-    # Pattern 1: AMT-XXXXXX
-    amt_matches = re.findall(r"\bAMT-[A-Z0-9]{4,10}\b", subject, re.IGNORECASE)
+    # Pattern 1: AMT-XXXXXX or AM-XXXXXX (e.g. AM-1042, AMT-000102)
+    amt_matches = re.findall(r"\b(?:AMT|AM)-[A-Z0-9]{3,10}\b", subject, re.IGNORECASE)
     for m in amt_matches:
         candidates.append(m.upper())
-    # Pattern 2: [#1234] or [Ticket 1234]
-    bracket_matches = re.findall(r"\[(?:Ticket\s*)?#?([A-Za-z0-9_-]{4,20})\]", subject, re.IGNORECASE)
+        candidates.append(f"#{m.upper()}")
+    # Pattern 2: [#1234] or [Ticket 1234] or [Ticket #AM-1042]
+    bracket_matches = re.findall(r"\[(?:Ticket\s*)?#?([A-Za-z0-9_-]{3,20})\]", subject, re.IGNORECASE)
     for m in bracket_matches:
         candidates.append(m)
         if not m.startswith("#"):
             candidates.append(f"#{m}")
-    # Pattern 3: #1234
+    # Pattern 3: #1234 or #AM-1042
     hash_matches = re.findall(r"#([A-Za-z0-9_-]{3,20})", subject)
     for m in hash_matches:
         candidates.append(m)
@@ -179,17 +180,30 @@ async def find_matching_ticket(
     references: List[str],
     subject: Optional[str],
     sender_email: str,
+    thread_id: Optional[str] = None,
 ) -> Optional[dict]:
     """
-    Identifies the existing support ticket according to strict matching priority:
-    1. In-Reply-To matching a stored Message-ID.
-    2. References matching a stored Message-ID.
-    3. Ticket identifier in Subject (validated against sender email/user).
-    4. Existing open support ticket for sender email.
+    Identifies the existing support ticket according to strict matching priority (Section 14):
+    1. Existing thread/message identifier.
+    2. In-Reply-To matching a stored Message-ID.
+    3. References matching a stored Message-ID.
+    4. Stored message ID.
+    5. Ticket ID in subject (validated against sender email/user).
+    6. Sender + appropriate open ticket fallback.
     """
     sender_clean = sender_email.strip().lower()
 
-    # Priority 1: In-Reply-To
+    # Priority 1: Existing thread/message identifier
+    if thread_id:
+        clean_th = str(thread_id).strip()
+        ticket_by_thread = await db.support_tickets.find_one(
+            {"$or": [{"_id": clean_th}, {"ticket_id": clean_th}, {"id": clean_th}, {"thread_id": clean_th}]}
+        )
+        if ticket_by_thread:
+            logger.info(f"[RESEND INBOUND] Priority 1 Match: Matched ticket '{ticket_by_thread.get('ticket_id')}' via thread identifier '{clean_th}'")
+            return ticket_by_thread
+
+    # Priority 2: In-Reply-To
     if in_reply_to:
         clean_in_reply = in_reply_to.strip().strip("<>")
         query = {
@@ -204,10 +218,10 @@ async def find_matching_ticket(
             tid = msg_doc["ticket_id"]
             ticket = await db.support_tickets.find_one({"$or": [{"_id": tid}, {"ticket_id": tid}, {"id": tid}]})
             if ticket:
-                logger.info(f"[RESEND INBOUND] Priority 1 Match: Matched ticket '{ticket.get('ticket_id')}' via In-Reply-To '{in_reply_to}'")
+                logger.info(f"[RESEND INBOUND] Priority 2 Match: Matched ticket '{ticket.get('ticket_id')}' via In-Reply-To '{in_reply_to}'")
                 return ticket
 
-    # Priority 2: References
+    # Priority 3: References
     if references:
         clean_refs = []
         for r in references:
@@ -219,10 +233,28 @@ async def find_matching_ticket(
                 tid = msg_doc["ticket_id"]
                 ticket = await db.support_tickets.find_one({"$or": [{"_id": tid}, {"ticket_id": tid}, {"id": tid}]})
                 if ticket:
-                    logger.info(f"[RESEND INBOUND] Priority 2 Match: Matched ticket '{ticket.get('ticket_id')}' via References list")
+                    logger.info(f"[RESEND INBOUND] Priority 3 Match: Matched ticket '{ticket.get('ticket_id')}' via References list")
                     return ticket
 
-    # Priority 3: Ticket identifier in subject (with strict sender ownership validation)
+    # Priority 4: Stored message ID
+    if message_id:
+        clean_msg_id = message_id.strip().strip("<>")
+        query = {
+            "$or": [
+                {"message_id": clean_msg_id},
+                {"message_id": f"<{clean_msg_id}>"},
+                {"message_id": message_id.strip()},
+            ]
+        }
+        msg_doc = await db.support_messages.find_one(query)
+        if msg_doc and msg_doc.get("ticket_id"):
+            tid = msg_doc["ticket_id"]
+            ticket = await db.support_tickets.find_one({"$or": [{"_id": tid}, {"ticket_id": tid}, {"id": tid}]})
+            if ticket:
+                logger.info(f"[RESEND INBOUND] Priority 4 Match: Matched ticket '{ticket.get('ticket_id')}' via Stored message ID")
+                return ticket
+
+    # Priority 5: Ticket identifier in subject (with strict sender ownership validation)
     candidates = extract_ticket_candidates_from_subject(subject)
     for cand in candidates:
         ticket = await db.support_tickets.find_one(
@@ -232,14 +264,14 @@ async def find_matching_ticket(
             ticket_owner_email = (ticket.get("email") or "").strip().lower()
             # Validate sender relationship: sender email must match ticket email
             if ticket_owner_email == sender_clean:
-                logger.info(f"[RESEND INBOUND] Priority 3 Match: Matched ticket '{ticket.get('ticket_id')}' via subject identifier '{cand}' and validated sender '{sender_clean}'")
+                logger.info(f"[RESEND INBOUND] Priority 5 Match: Matched ticket '{ticket.get('ticket_id')}' via subject identifier '{cand}' and validated sender '{sender_clean}'")
                 return ticket
             else:
                 logger.warning(
-                    f"[RESEND INBOUND] Priority 3 Rejection: Candidate ticket '{cand}' found but sender '{sender_clean}' does not match ticket owner '{ticket_owner_email}'. Rejecting relationship."
+                    f"[RESEND INBOUND] Priority 5 Rejection: Candidate ticket '{cand}' found but sender '{sender_clean}' does not match ticket owner '{ticket_owner_email}'. Rejecting relationship."
                 )
 
-    # Priority 4: Existing open ticket for sender email
+    # Priority 6: Existing open ticket for sender email fallback
     if sender_clean:
         open_ticket = await db.support_tickets.find_one(
             {
@@ -250,7 +282,7 @@ async def find_matching_ticket(
             sort=[("updated_at", -1)],
         )
         if open_ticket:
-            logger.info(f"[RESEND INBOUND] Priority 4 Fallback: Matched latest open ticket '{open_ticket.get('ticket_id')}' for sender '{sender_clean}'")
+            logger.info(f"[RESEND INBOUND] Priority 6 Fallback: Matched latest open ticket '{open_ticket.get('ticket_id')}' for sender '{sender_clean}'")
             return open_ticket
 
     return None
@@ -339,8 +371,9 @@ async def process_resend_inbound_email(db: AsyncIOMotorDatabase, data: Dict[str,
     now_iso = datetime.now(timezone.utc).isoformat()
     clean_body = extract_reply_body(text_content) or (text_content.strip() if text_content else "No message text.")
     sanitized_html_content = sanitize_html(html_content) if html_content else None
+    thread_id = data.get("thread_id") or lower_headers.get("x-thread-id") or lower_headers.get("x-ticket-id") or data.get("ticket_id")
 
-    # 2. Find matching ticket
+    # 2. Find matching ticket using 6-tier matching sequence
     ticket = await find_matching_ticket(
         db=db,
         message_id=message_id,
@@ -348,6 +381,7 @@ async def process_resend_inbound_email(db: AsyncIOMotorDatabase, data: Dict[str,
         references=references,
         subject=subject,
         sender_email=sender_email,
+        thread_id=str(thread_id).strip() if thread_id else None,
     )
 
     if ticket:

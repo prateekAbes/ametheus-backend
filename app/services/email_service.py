@@ -56,9 +56,10 @@ def get_identity_config(identity: str) -> Dict[str, Any]:
             "username": username,
             "password": password,
             "use_tls": use_tls,
-            "reply_to": settings.EMAIL_REPLY_TO.strip(),
+            "reply_to": "",  # noreply identity: no reply-to header
         }
     elif norm in ("official", "business", "general"):
+        official_reply_to = getattr(settings, "OFFICIAL_REPLY_TO", None) or ""
         return {
             "key": "official",
             "email": settings.OFFICIAL_EMAIL.strip(),
@@ -68,7 +69,7 @@ def get_identity_config(identity: str) -> Dict[str, Any]:
             "username": username,
             "password": password,
             "use_tls": use_tls,
-            "reply_to": settings.SUPPORT_EMAIL.strip(),
+            "reply_to": official_reply_to.strip() if official_reply_to else "",
         }
     else:
         raise ValueError(f"Unknown email identity: '{identity}'. Must be 'official', 'support', or 'noreply'.")
@@ -114,7 +115,11 @@ def _send_identity_smtp_sync(
     msg["From"] = f"{cfg['name']} <{cfg['email']}>"
     msg["To"] = to_email_clean
     msg["Message-ID"] = f"<{msg_id}>"
-    msg["Reply-To"] = reply_to or cfg["reply_to"]
+
+    # Only set Reply-To when a meaningful address exists
+    effective_reply_to = reply_to or cfg["reply_to"]
+    if effective_reply_to and effective_reply_to.strip():
+        msg["Reply-To"] = effective_reply_to.strip()
 
     if in_reply_to:
         clean_in_reply_to = in_reply_to.strip()
@@ -216,23 +221,47 @@ async def send_email(
 
 
 async def send_support_email(
-    to_email: str,
-    subject: str,
-    text_content: str,
-    html_content: str,
+    to_email: Any = None,
+    subject: Optional[str] = None,
+    text_content: Optional[str] = None,
+    html_content: Optional[str] = None,
     reply_to: Optional[str] = None,
+    **kwargs: Any,
 ) -> Tuple[bool, Optional[str]]:
     """
     Sends an email using the SUPPORT identity (support@ametheus.games).
-    Used for contact/support messages, user support requests, help inquiries, and support ticket communication.
+    Reply-To automatically defaults to support@inbound.ametheus.games.
+    Supports either standard positional arguments or a dict / kwargs payload.
     """
+    if isinstance(to_email, dict):
+        d = to_email
+        target = d.get("to") or d.get("recipient") or d.get("to_email")
+        sub = d.get("subject") or subject or ""
+        html = d.get("html") or d.get("html_content") or html_content or ""
+        text = d.get("text") or d.get("text_content") or text_content or ""
+        rep = d.get("reply_to") or reply_to
+        return await send_email(
+            sender_type="support",
+            recipient=target,
+            subject=sub,
+            text_content=text or html,
+            html_content=html or text,
+            reply_to=rep or getattr(settings, "SUPPORT_INBOUND_EMAIL", "support@inbound.ametheus.games"),
+        )
+
+    to_addr = to_email or kwargs.get("to") or kwargs.get("recipient")
+    sub = subject or kwargs.get("subject", "")
+    html = html_content or kwargs.get("html", "")
+    text = text_content or kwargs.get("text", "")
+    rep = reply_to or kwargs.get("reply_to")
+
     return await send_email(
         sender_type="support",
-        recipient=to_email,
-        subject=subject,
-        text_content=text_content,
-        html_content=html_content,
-        reply_to=reply_to or settings.SUPPORT_EMAIL,
+        recipient=to_addr,
+        subject=sub,
+        text_content=text or html,
+        html_content=html or text,
+        reply_to=rep or getattr(settings, "SUPPORT_INBOUND_EMAIL", "support@inbound.ametheus.games"),
     )
 
 
@@ -247,7 +276,7 @@ async def send_support_email_threaded(
 ) -> Tuple[bool, Optional[str], Optional[str]]:
     """
     Sends an email using the SUPPORT identity (support@ametheus.games) with email threading headers (In-Reply-To, References).
-    Routes strictly via existing Brevo SMTP.
+    Routes strictly via Brevo SMTP with Reply-To set to support@inbound.ametheus.games.
     Returns: (success: bool, error_details: Optional[str], message_id: Optional[str])
     """
     ok, err_code, err_det, msg_id, _ = await asyncio.to_thread(
@@ -265,46 +294,124 @@ async def send_support_email_threaded(
 
 
 async def send_noreply_email(
-    to_email: str,
-    subject: str,
-    text_content: str,
-    html_content: str,
+    to_email: Any = None,
+    subject: Optional[str] = None,
+    text_content: Optional[str] = None,
+    html_content: Optional[str] = None,
     reply_to: Optional[str] = None,
+    **kwargs: Any,
 ) -> Tuple[bool, Optional[str]]:
     """
-    Sends an email using the NO-REPLY / AUTOMATED identity (noreply@ametheus.games).
+    Sends an email using the NO-REPLY / SYSTEM identity (noreply@ametheus.games).
     Used for registration confirmations, account verification, password resets,
     automated notifications, tournament/game notifications, match reminders, and system alerts.
+    Does NOT include a Reply-To header unless explicitly provided.
     """
+    if isinstance(to_email, dict):
+        d = to_email
+        target = d.get("to") or d.get("recipient") or d.get("to_email")
+        sub = d.get("subject") or subject or ""
+        html = d.get("html") or d.get("html_content") or html_content or ""
+        text = d.get("text") or d.get("text_content") or text_content or ""
+        rep = d.get("reply_to") or reply_to
+        return await send_email(
+            sender_type="noreply",
+            recipient=target,
+            subject=sub,
+            text_content=text or html,
+            html_content=html or text,
+            reply_to=rep,
+        )
+
+    to_addr = to_email or kwargs.get("to") or kwargs.get("recipient")
+    sub = subject or kwargs.get("subject", "")
+    html = html_content or kwargs.get("html", "")
+    text = text_content or kwargs.get("text", "")
+    rep = reply_to or kwargs.get("reply_to")
+
     return await send_email(
         sender_type="noreply",
-        recipient=to_email,
+        recipient=to_addr,
+        subject=sub,
+        text_content=text or html,
+        html_content=html or text,
+        reply_to=rep,
+    )
+
+
+async def send_system_email(
+    to_email: Any = None,
+    subject: Optional[str] = None,
+    text_content: Optional[str] = None,
+    html_content: Optional[str] = None,
+    reply_to: Optional[str] = None,
+    **kwargs: Any,
+) -> Tuple[bool, Optional[str]]:
+    """
+    Alias for send_noreply_email.
+    Sends automated system transactional messages from noreply@ametheus.games.
+    """
+    return await send_noreply_email(
+        to_email=to_email,
         subject=subject,
         text_content=text_content,
         html_content=html_content,
-        reply_to=reply_to or settings.EMAIL_REPLY_TO,
+        reply_to=reply_to,
+        **kwargs,
     )
 
 
 async def send_official_email(
-    to_email: str,
-    subject: str,
-    text_content: str,
-    html_content: str,
+    to_email: Any = None,
+    subject: Optional[str] = None,
+    text_content: Optional[str] = None,
+    html_content: Optional[str] = None,
     reply_to: Optional[str] = None,
+    **kwargs: Any,
 ) -> Tuple[bool, Optional[str]]:
     """
     Sends an email using the OFFICIAL identity (official@ametheus.games).
     Used for official announcements, organizational correspondence, and administrative communications.
+    Reply-To defaults to OFFICIAL_REPLY_TO if configured.
     """
+    official_rep = getattr(settings, "OFFICIAL_REPLY_TO", None) or ""
+
+    if isinstance(to_email, dict):
+        d = to_email
+        target = d.get("to") or d.get("recipient") or d.get("to_email")
+        sub = d.get("subject") or subject or ""
+        html = d.get("html") or d.get("html_content") or html_content or ""
+        text = d.get("text") or d.get("text_content") or text_content or ""
+        rep = d.get("reply_to") or reply_to or official_rep
+        return await send_email(
+            sender_type="official",
+            recipient=target,
+            subject=sub,
+            text_content=text or html,
+            html_content=html or text,
+            reply_to=rep,
+        )
+
+    to_addr = to_email or kwargs.get("to") or kwargs.get("recipient")
+    sub = subject or kwargs.get("subject", "")
+    html = html_content or kwargs.get("html", "")
+    text = text_content or kwargs.get("text", "")
+    rep = reply_to or kwargs.get("reply_to") or official_rep
+
     return await send_email(
         sender_type="official",
-        recipient=to_email,
-        subject=subject,
-        text_content=text_content,
-        html_content=html_content,
-        reply_to=reply_to or settings.SUPPORT_EMAIL,
+        recipient=to_addr,
+        subject=sub,
+        text_content=text or html,
+        html_content=html or text,
+        reply_to=rep,
     )
+
+
+# Compatibility aliases matching naming requirements
+sendSystemEmail = send_system_email
+sendSupportEmail = send_support_email
+sendOfficialEmail = send_official_email
 
 
 async def send_personal_email_with_details(
@@ -732,7 +839,7 @@ Ametheus Support
 </body>
 </html>"""
 
-    # Send using NOREPLY identity (From: no-reply@ametheus.games) with technical Reply-To: support@inbound.ametheus.games
+    # Send using NOREPLY identity (From: noreply@ametheus.games) with technical Reply-To: support@inbound.ametheus.games
     ok, err_code, err_det, msg_id, _ = await asyncio.to_thread(
         _send_identity_smtp_sync,
         "noreply",
