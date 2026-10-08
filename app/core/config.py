@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     )
 
     PROJECT_NAME: str = "AMETHEUS Esports Engine"
+    FRONTEND_URL: str = "https://www.ametheus.games"
     API_V1_STR: str = "/api/v1"
     MONGODB_URI: str = "mongodb://localhost:27017"
     MONGODB_DB_NAME: str = "ametheus"
@@ -62,8 +63,8 @@ class Settings(BaseSettings):
     # Default reply-to address
     EMAIL_REPLY_TO: str = "support@ametheus.games"
 
-    # Technical inbound reply-to address for routing user email replies through Resend
-    SUPPORT_INBOUND_EMAIL: str = "support@inbound.ametheus.games"
+    # Technical inbound reply-to address for routing user email replies
+    SUPPORT_INBOUND_EMAIL: str = "support@ametheus.games"
 
     # Official email reply-to: set to official inbound Resend address if configured
     OFFICIAL_REPLY_TO: Optional[str] = None

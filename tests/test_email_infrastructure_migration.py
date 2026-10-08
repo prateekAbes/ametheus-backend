@@ -44,7 +44,7 @@ async def test_migration_identity_configurations():
     support_cfg = get_identity_config("support")
     assert support_cfg["email"] == "support@ametheus.games"
     assert support_cfg["name"] == "Ametheus Support"
-    assert support_cfg["reply_to"] == "support@inbound.ametheus.games"
+    assert support_cfg["reply_to"] == "support@ametheus.games"
     assert support_cfg["host"] == "smtp-relay.brevo.com"
     assert support_cfg["port"] == 587
 
@@ -122,7 +122,7 @@ async def test_migration_outbound_headers_and_centralized_abstractions(monkeypat
     call = captured_smtp[0]
     assert call["identity_key"] == "support"
     assert call["to_email"] == "contender@example.com"
-    assert call["reply_to"] == "support@inbound.ametheus.games"
+    assert call["reply_to"] == settings.SUPPORT_EMAIL.strip()
 
     # Test dict-based invocation: sendSupportEmail({"to": ..., "subject": ..., "html": ...})
     captured_smtp.clear()
@@ -133,7 +133,7 @@ async def test_migration_outbound_headers_and_centralized_abstractions(monkeypat
     })
     assert ok is True
     assert captured_smtp[0]["identity_key"] == "support"
-    assert captured_smtp[0]["reply_to"] == "support@inbound.ametheus.games"
+    assert captured_smtp[0]["reply_to"] == settings.SUPPORT_EMAIL.strip()
 
     # 3. Support threaded reply
     captured_smtp.clear()
@@ -149,7 +149,7 @@ async def test_migration_outbound_headers_and_centralized_abstractions(monkeypat
     assert len(captured_smtp) == 1
     call = captured_smtp[0]
     assert call["identity_key"] == "support"
-    assert call["reply_to"] == "support@inbound.ametheus.games"
+    assert call["reply_to"] == settings.SUPPORT_EMAIL.strip()
     assert call["in_reply_to"] == "<ORIGINAL-MSGID@ametheus.games>"
     assert call["references"] == "<ORIGINAL-MSGID@ametheus.games>"
 

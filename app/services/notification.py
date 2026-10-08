@@ -31,6 +31,7 @@ async def _safe_send_notification_email(
     title: str,
     message: str,
     link: Optional[str] = None,
+    notification_type: Optional[str] = None,
 ):
     """Dispatches email notification with duplicate protection and error isolation."""
     try:
@@ -57,6 +58,7 @@ async def _safe_send_notification_email(
             title=title,
             message=message,
             link=link,
+            notification_type=notification_type,
         )
 
         await db.sent_email_notifications.update_one(
@@ -182,6 +184,7 @@ async def create_notification(
                             title=final_title,
                             message=message,
                             link=link,
+                            notification_type=c_type or n_type,
                         )
                     )
         except Exception as e:

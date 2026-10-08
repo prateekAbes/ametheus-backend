@@ -12,51 +12,12 @@ from app.services.audit import record_audit_log
 router = APIRouter()
 admin_router = APIRouter()
 
-DEFAULT_SEED_REVIEWS = [
-    {
-        "user_id": "seed_rev_01",
-        "user_name": "Aman 'Shadow' Sharma",
-        "user_email": "aman.shadow@ametheus.gg",
-        "avatar_url": "https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150&auto=format&fit=crop",
-        "rating": 5,
-        "review_text": "The automated bracket progression and instant lobby credential delivery make Ametheus by far the cleanest tournament platform in Indian esports. Payouts via UPI took less than 10 minutes after grand finals.",
-        "category": "TOURNAMENTS",
-        "status": "FEATURED",
-        "is_verified": True,
-        "is_featured": True,
-    },
-    {
-        "user_id": "seed_rev_02",
-        "user_name": "Rohan 'Viper' Verma",
-        "user_email": "rohan.viper@ametheus.gg",
-        "avatar_url": "https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=150&auto=format&fit=crop",
-        "rating": 5,
-        "review_text": "Our squad competed in the Free Fire Max championship. Zero server lag, instant referee responses, and the WhatsApp group community links kept our teammates synced before every round.",
-        "category": "MATCHMAKING",
-        "status": "APPROVED",
-        "is_verified": True,
-        "is_featured": False,
-    },
-    {
-        "user_id": "seed_rev_03",
-        "user_name": "Priya 'Valkyrie' Patel",
-        "user_email": "priya.valkyrie@ametheus.gg",
-        "avatar_url": "https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=150&auto=format&fit=crop",
-        "rating": 5,
-        "review_text": "The anti-cheat discipline and automated score verifications are top-tier. As a team captain, getting real-time Brevo email alerts for schedule adjustments made match management effortless.",
-        "category": "PLATFORM",
-        "status": "APPROVED",
-        "is_verified": True,
-        "is_featured": False,
-    },
-]
-
-async def seed_reviews_if_needed(db: AsyncIOMotorDatabase):
-    count = await db.reviews.count_documents({})
-    if count == 0:
-        for sr in DEFAULT_SEED_REVIEWS:
-            r = Review(**sr)
-            await db.reviews.insert_one(r.to_mongo())
+async def cleanup_legacy_seed_reviews(db: AsyncIOMotorDatabase):
+    """Purges any legacy placeholder/dummy seed reviews from the database."""
+    try:
+        await db.reviews.delete_many({"user_id": {"$regex": r"^seed_rev_"}})
+    except Exception:
+        pass
 
 def sanitize_review_text(text: str) -> str:
     cleaned = re.sub(r'<[^>]*?>', '', text)
@@ -140,7 +101,7 @@ async def list_public_reviews(
     """
     Public listing of approved/featured reviews, with rating statistics and featured spotlight.
     """
-    await seed_reviews_if_needed(db)
+    await cleanup_legacy_seed_reviews(db)
 
     match_filter: Dict[str, any] = {"status": {"$in": ["APPROVED", "FEATURED"]}}
     if category and category.upper() != "ALL":
@@ -166,7 +127,7 @@ async def list_public_reviews(
     if not featured_review and reviews:
         featured_review = reviews[0]
 
-    avg_rating = round(total_score / total_reviews, 1) if total_reviews > 0 else 5.0
+    avg_rating = round(total_score / total_reviews, 1) if total_reviews > 0 else 0.0
 
     return ReviewSummaryResponse(
         average_rating=avg_rating,

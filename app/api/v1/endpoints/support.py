@@ -754,75 +754,20 @@ async def reply_support_ticket(
     references_header = " ".join(all_msg_ids) if all_msg_ids else None
 
     user_email = (doc.get("email") or "").strip().lower()
-    email_subject = f"Re: [Ticket {clean_tid}] {doc.get('category')} — Ametheus Support"
+    user_email = (doc.get("email") or "").strip().lower()
     admin_msg_id = None
 
     if user_email:
         friendly_status = format_friendly_ticket_status(new_status)
-        email_text = f"""Hello {doc.get('name', 'Contender')},
-
-Our support team has responded to your ticket [#{clean_tid}]:
-
-{payload.message.strip()}
-
-Status: {friendly_status}
-
-For replies to this ticket, simply reply to this email.
-
-—
-Ametheus Support
-"""
-
-        email_html = f"""<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <title>{email_subject}</title>
-</head>
-<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: #05060A; color: #F4F6FA; padding: 24px; margin: 0;">
-  <table width="100%" border="0" cellspacing="0" cellpadding="0" style="max-width: 600px; margin: 0 auto; background-color: #0B0E16; border: 1px solid #242C3D; border-radius: 4px; overflow: hidden;">
-    <tr>
-      <td style="padding: 20px 24px; border-bottom: 1px solid #242C3D; background-color: #0E121E;">
-        <h2 style="color: #FFFFFF; margin: 0; font-size: 16px; font-weight: 800; letter-spacing: 1px; text-transform: uppercase;">
-          AMETHEUS <span style="color: #3EF2FF;">SUPPORT</span> — TICKET UPDATE
-        </h2>
-      </td>
-    </tr>
-    <tr>
-      <td style="padding: 28px 24px;">
-        <p style="margin: 0 0 12px 0; font-size: 15px; font-weight: 600; color: #FFFFFF;">
-          Hello {doc.get('name', 'Contender')},
-        </p>
-        <p style="margin: 0 0 20px 0; font-size: 13px; color: #CBD5E1; line-height: 1.6;">
-          Our support team has responded to your ticket <strong>[#{clean_tid}]</strong>:
-        </p>
-
-        <div style="background-color: #121624; border: 1px solid #242C3D; border-left: 4px solid #3EF2FF; padding: 18px 20px; margin: 20px 0;">
-          <p style="margin: 0; white-space: pre-wrap; font-size: 14px; line-height: 1.6; color: #F8FAFC;">{payload.message.strip()}</p>
-        </div>
-
-        <div style="background-color: #0E121E; border: 1px solid #1E2536; padding: 12px 16px; margin-bottom: 20px;">
-          <table width="100%" border="0" cellspacing="0" cellpadding="2" style="font-size: 12px;">
-            <tr>
-              <td style="color: #8C94A8; width: 80px; text-transform: uppercase; font-size: 11px;">Status:</td>
-              <td style="color: #3EF2FF; font-weight: bold;">{friendly_status}</td>
-            </tr>
-          </table>
-        </div>
-
-        <p style="margin: 0; font-size: 13px; color: #CBD5E1; line-height: 1.6;">
-          For replies to this ticket, simply reply to this email.
-        </p>
-      </td>
-    </tr>
-    <tr>
-      <td style="background-color: #07090F; padding: 14px 24px; text-align: center; border-top: 1px solid #1E2536; font-size: 11px; color: #64748B;">
-        &copy; 2026 AMETHEUS Esports Platform. All rights reserved.
-      </td>
-    </tr>
-  </table>
-</body>
-</html>"""
+        category_name = (doc.get("category") or "General Inquiry").replace("_", " ").title()
+        from app.services.email_template_system import build_support_admin_reply_email
+        email_subject, email_text, email_html = build_support_admin_reply_email(
+            user_name=doc.get("name", "Contender"),
+            ticket_id=clean_tid,
+            category=category_name,
+            admin_message=payload.message,
+            friendly_status=friendly_status,
+        )
         try:
             _, _, admin_msg_id = await send_support_email_threaded(
                 to_email=user_email,
@@ -834,6 +779,8 @@ Ametheus Support
             )
         except Exception:
             pass
+    else:
+        email_subject = f"Re: [Ticket {clean_tid}] {doc.get('category')} — Ametheus Support"
 
     if not admin_msg_id:
         admin_msg_id = f"<AMT-REPLY-{secrets.token_hex(6)}@ametheus.games>"

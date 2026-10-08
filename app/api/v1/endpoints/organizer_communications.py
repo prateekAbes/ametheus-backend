@@ -408,26 +408,19 @@ async def admin_reply_organizer_email_thread(
     # 2. Dispatch Brevo SMTP email
     org_email = doc.get("organizer_email")
     if org_email:
-        email_html = f"""
-        <div style="font-family: sans-serif; background-color: #05060a; color: #f4f6fa; padding: 24px;">
-            <div style="max-width: 600px; margin: 0 auto; background-color: #0b0d17; border: 1px solid #222; border-radius: 8px; padding: 24px;">
-                <h2 style="color: #8b5cff; margin-top: 0;">Ametheus Administration — Organizer Communication</h2>
-                <p>Hello <strong>{doc.get('organizer_name', 'Organizer')}</strong>,</p>
-                <p>Platform leadership has replied to your communication regarding: <strong>{doc.get('subject')}</strong></p>
-                <div style="background-color: #121526; border-left: 4px solid #8b5cff; padding: 16px; margin: 20px 0; border-radius: 4px;">
-                    <p style="margin: 0; white-space: pre-wrap; font-size: 14px;">{payload.message}</p>
-                </div>
-                <p style="font-size: 12px; color: #888;">Status: <strong style="color: #8b5cff;">{new_st}</strong></p>
-                <p style="font-size: 12px; color: #888;">Visit your Organizer Panel to continue this dialogue.</p>
-            </div>
-        </div>
-        """
+        from app.services.email_template_system import build_organizer_reply_email
+        email_subj, email_text, email_html = build_organizer_reply_email(
+            organizer_name=doc.get("organizer_name", "Organizer"),
+            inquiry_subject=doc.get("subject", "Organizer Communication"),
+            admin_message=payload.message,
+            status=new_st,
+        )
         try:
             await send_email(
                 sender_type="official",
                 recipient=org_email,
-                subject=f"Re: [Organizer Inquiry] {doc.get('subject')} — Ametheus Admin",
-                text_content=payload.message,
+                subject=email_subj,
+                text_content=email_text,
                 html_content=email_html,
             )
         except Exception:

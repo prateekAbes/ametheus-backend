@@ -44,7 +44,7 @@ def get_identity_config(identity: str) -> Dict[str, Any]:
             "username": username,
             "password": password,
             "use_tls": use_tls,
-            "reply_to": getattr(settings, "SUPPORT_INBOUND_EMAIL", "support@inbound.ametheus.games").strip(),
+            "reply_to": settings.SUPPORT_EMAIL.strip(),
         }
     elif norm in ("noreply", "no-reply", "automated", "system"):
         return {
@@ -230,9 +230,10 @@ async def send_support_email(
 ) -> Tuple[bool, Optional[str]]:
     """
     Sends an email using the SUPPORT identity (support@ametheus.games).
-    Reply-To automatically defaults to support@inbound.ametheus.games.
+    Reply-To automatically defaults to support@ametheus.games.
     Supports either standard positional arguments or a dict / kwargs payload.
     """
+    support_reply_to = settings.SUPPORT_EMAIL.strip()
     if isinstance(to_email, dict):
         d = to_email
         target = d.get("to") or d.get("recipient") or d.get("to_email")
@@ -246,7 +247,7 @@ async def send_support_email(
             subject=sub,
             text_content=text or html,
             html_content=html or text,
-            reply_to=rep or getattr(settings, "SUPPORT_INBOUND_EMAIL", "support@inbound.ametheus.games"),
+            reply_to=rep or support_reply_to,
         )
 
     to_addr = to_email or kwargs.get("to") or kwargs.get("recipient")
@@ -261,7 +262,7 @@ async def send_support_email(
         subject=sub,
         text_content=text or html,
         html_content=html or text,
-        reply_to=rep or getattr(settings, "SUPPORT_INBOUND_EMAIL", "support@inbound.ametheus.games"),
+        reply_to=rep or support_reply_to,
     )
 
 
@@ -276,7 +277,7 @@ async def send_support_email_threaded(
 ) -> Tuple[bool, Optional[str], Optional[str]]:
     """
     Sends an email using the SUPPORT identity (support@ametheus.games) with email threading headers (In-Reply-To, References).
-    Routes strictly via Brevo SMTP with Reply-To set to support@inbound.ametheus.games.
+    Routes strictly via Brevo SMTP with Reply-To set to support@ametheus.games.
     Returns: (success: bool, error_details: Optional[str], message_id: Optional[str])
     """
     ok, err_code, err_det, msg_id, _ = await asyncio.to_thread(
@@ -286,7 +287,7 @@ async def send_support_email_threaded(
         subject,
         text_content,
         html_content,
-        reply_to or getattr(settings, "SUPPORT_INBOUND_EMAIL", "support@inbound.ametheus.games"),
+        reply_to or settings.SUPPORT_EMAIL.strip(),
         in_reply_to,
         references,
     )
@@ -625,80 +626,22 @@ async def send_test_email(
 ) -> SendTestEmailResponse:
     """
     Sends a test verification email via Brevo SMTP using the chosen identity ('support', 'noreply', or 'official').
+    Utilizes the unified Ametheus email template system.
     """
     norm_service = (service or "support").strip().lower()
     if norm_service not in ("support", "noreply", "official"):
         norm_service = "support"
 
     cfg = get_identity_config(norm_service)
-    subject = f"Ametheus SMTP Test — {cfg['name']} ({cfg['email']})"
-
-    text_body = f"""Ametheus Esports Platform — Brevo SMTP Service Test
-===================================================
-
-This is an administrative test message dispatched from the Ametheus Operations Cockpit.
-If you received this message, Brevo SMTP delivery for {cfg['name']} ({norm_service.upper()}) is functioning properly.
-
-Identity: {cfg['name']}
-Sender Email: {cfg['email']}
-Destination: {to_email}
-Relay Host: {cfg['host']}
-Relay Port: {cfg['port']}
-
-Competitive Integrity:
-https://ametheus.gg
-"""
-
-    html_body = f"""
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <title>{subject}</title>
-</head>
-<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background-color: #0B0E16; margin: 0; padding: 24px; color: #F8FAFC;">
-  <table width="100%" border="0" cellspacing="0" cellpadding="0" style="max-width: 600px; margin: 0 auto; background-color: #111622; border-radius: 12px; border: 1px solid #242C3D; overflow: hidden; box-shadow: 0 4px 12px rgba(0,0,0,0.6);">
-    <tr>
-      <td style="background-color: #1A2234; padding: 20px 24px; border-bottom: 2px solid #E56A10;">
-        <h1 style="color: #FFFFFF; margin: 0; font-size: 20px; font-weight: 800; letter-spacing: 1px;">AMETHEUS <span style="color: #E56A10;">EMAIL TEST</span></h1>
-        <p style="color: #94A3B8; margin: 4px 0 0 0; font-size: 11px; text-transform: uppercase; letter-spacing: 2px;">Identity: {cfg['name']} ({norm_service.upper()})</p>
-      </td>
-    </tr>
-    <tr>
-      <td style="padding: 28px 24px;">
-        <div style="background-color: #064E3B; border: 1px solid #059669; border-radius: 8px; padding: 14px 16px; margin-bottom: 20px; color: #A7F3D0; font-family: monospace; font-size: 12px; font-weight: bold;">
-          &#10004; SUCCESS: Brevo SMTP relay connection and delivery confirmed!
-        </div>
-
-        <p style="margin: 0 0 16px 0; font-size: 13px; color: #CBD5E1; line-height: 1.6;">
-          This verification email was triggered from the Super Admin diagnostic panel via Brevo SMTP relay.
-        </p>
-
-        <table width="100%" border="0" cellspacing="0" cellpadding="8" style="font-size: 12px; font-family: monospace; background-color: #0B0E16; border-radius: 8px; border: 1px solid #242C3D; margin-bottom: 20px;">
-          <tr style="border-bottom: 1px solid #242C3D;">
-            <td style="color: #94A3B8; width: 140px;">Sender Identity:</td>
-            <td style="color: #E56A10; font-weight: bold;">{cfg['name']} &lt;{cfg['email']}&gt;</td>
-          </tr>
-          <tr style="border-bottom: 1px solid #242C3D;">
-            <td style="color: #94A3B8;">Recipient:</td>
-            <td style="color: #FFFFFF;">{to_email}</td>
-          </tr>
-          <tr style="border-bottom: 1px solid #242C3D;">
-            <td style="color: #94A3B8;">Relay Server:</td>
-            <td style="color: #94A3B8;">{cfg['host']}:{cfg['port']}</td>
-          </tr>
-        </table>
-      </td>
-    </tr>
-    <tr>
-      <td style="background-color: #0B0E16; padding: 16px 24px; text-align: center; border-top: 1px solid #242C3D; font-size: 11px; color: #64748B;">
-        &copy; 2026 AMETHEUS Esports Platform. All competitive integrity rights reserved.
-      </td>
-    </tr>
-  </table>
-</body>
-</html>
-"""
+    from app.services.email_template_system import build_smtp_diagnostic_email
+    subject, text_body, html_body = build_smtp_diagnostic_email(
+        service_name=norm_service,
+        sender_name=cfg["name"],
+        sender_email=cfg["email"],
+        recipient_email=to_email,
+        host=cfg["host"],
+        port=cfg["port"],
+    )
 
     ok, err_code, err_det, msg_id, sender_used = await asyncio.to_thread(
         _send_identity_smtp_sync,
@@ -744,110 +687,26 @@ def format_friendly_ticket_status(status_raw: Optional[str]) -> str:
 
 async def send_ticket_confirmation_email(ticket: dict, db: Optional[AsyncIOMotorDatabase] = None) -> Tuple[bool, Optional[str], Optional[str]]:
     """
-    Sends automated confirmation receipt email to the user using the NO-REPLY / SYSTEM identity (no-reply@ametheus.games).
-    Reply-To points strictly to support@inbound.ametheus.games so user replies route via Resend into the support thread.
-    Message threading headers (Message-ID) are generated and returned for threading tracking.
+    Sends automated confirmation receipt email to the user using the SUPPORT identity (support@ametheus.games).
+    Reply-To points strictly to support@ametheus.games.
+    Uses the unified Ametheus email template system.
     """
-    ticket_id = ticket.get("ticket_id") or ticket.get("id") or "AMT-000000"
-    user_name = ticket.get("name", "Contender")
-    category = ticket.get("category", "General Inquiry").replace("_", " ").title()
-    description = (ticket.get("description") or "").strip()
-    status_friendly = format_friendly_ticket_status(ticket.get("status", "WAITING_FOR_ADMIN"))
     recipient = (ticket.get("email") or "").strip().lower()
-
     if not recipient:
         return False, "Recipient email is missing", None
 
-    subject = f"Your support ticket has been created — #{ticket_id}"
+    from app.services.email_template_system import build_support_ticket_confirmation_email
+    subject, text_body, html_body = build_support_ticket_confirmation_email(ticket)
 
-    text_body = f"""Hello {user_name},
-
-Your support ticket has been created.
-
-Ticket ID: #{ticket_id}
-Status: {status_friendly}
-Category: {category}
-
-We've received your request and our support team will review it.
-
-Issue Summary:
-{description}
-
-Simply reply to this email to continue the conversation.
-
-—
-Ametheus Support
-"""
-
-    html_body = f"""<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <title>{subject}</title>
-</head>
-<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: #05060A; margin: 0; padding: 24px; color: #F4F6FA;">
-  <table width="100%" border="0" cellspacing="0" cellpadding="0" style="max-width: 600px; margin: 0 auto; background-color: #0B0E16; border: 1px solid #242C3D; border-radius: 4px; overflow: hidden;">
-    <tr>
-      <td style="padding: 24px; border-bottom: 1px solid #242C3D; background-color: #0E121E;">
-        <h1 style="color: #FFFFFF; margin: 0; font-size: 18px; font-weight: 800; letter-spacing: 1.5px; text-transform: uppercase;">
-          AMETHEUS <span style="color: #3EF2FF;">SUPPORT</span>
-        </h1>
-      </td>
-    </tr>
-    <tr>
-      <td style="padding: 32px 24px;">
-        <p style="margin: 0 0 16px 0; font-size: 16px; font-weight: 600; color: #FFFFFF;">
-          Hello {user_name},
-        </p>
-        <p style="margin: 0 0 24px 0; font-size: 14px; line-height: 1.6; color: #CBD5E1;">
-          Your support ticket has been created. We've received your request and our support team will review it.
-        </p>
-
-        <div style="background-color: #121624; border: 1px solid #242C3D; border-left: 4px solid #3EF2FF; padding: 18px 20px; margin-bottom: 24px;">
-          <table width="100%" border="0" cellspacing="0" cellpadding="4" style="font-size: 13px;">
-            <tr>
-              <td style="color: #8C94A8; width: 100px; text-transform: uppercase; font-size: 11px; letter-spacing: 1px;">Ticket ID:</td>
-              <td style="color: #3EF2FF; font-weight: bold; font-family: monospace; font-size: 15px;">#{ticket_id}</td>
-            </tr>
-            <tr>
-              <td style="color: #8C94A8; text-transform: uppercase; font-size: 11px; letter-spacing: 1px;">Status:</td>
-              <td style="color: #10B981; font-weight: bold;">{status_friendly}</td>
-            </tr>
-            <tr>
-              <td style="color: #8C94A8; text-transform: uppercase; font-size: 11px; letter-spacing: 1px;">Category:</td>
-              <td style="color: #F8FAFC;">{category}</td>
-            </tr>
-          </table>
-        </div>
-
-        <div style="background-color: #0E121E; border: 1px solid #1E2536; padding: 16px; margin-bottom: 24px;">
-          <div style="font-size: 11px; text-transform: uppercase; color: #8C94A8; margin-bottom: 8px; letter-spacing: 1px; font-weight: 600;">Issue Summary:</div>
-          <div style="font-size: 13px; line-height: 1.6; color: #E2E8F0; white-space: pre-wrap;">{description}</div>
-        </div>
-
-        <p style="margin: 0 0 8px 0; font-size: 13px; color: #CBD5E1; line-height: 1.6;">
-          Simply reply to this email to continue the conversation.
-        </p>
-      </td>
-    </tr>
-    <tr>
-      <td style="background-color: #07090F; padding: 16px 24px; text-align: center; border-top: 1px solid #1E2536; font-size: 11px; color: #64748B;">
-        &copy; 2026 AMETHEUS Esports Platform. All rights reserved.
-      </td>
-    </tr>
-  </table>
-</body>
-</html>"""
-
-    # Send using NOREPLY identity (From: noreply@ametheus.games) with technical Reply-To: support@inbound.ametheus.games
+    # Strictly sent from support@ametheus.games with Reply-To: support@ametheus.games
     ok, err_code, err_det, msg_id, _ = await asyncio.to_thread(
         _send_identity_smtp_sync,
-        "noreply",
+        "support",
         recipient,
         subject,
         text_body,
         html_body,
-        getattr(settings, "SUPPORT_INBOUND_EMAIL", "support@inbound.ametheus.games"),
+        settings.SUPPORT_EMAIL.strip(),
         None,
         None,
     )
@@ -861,91 +720,12 @@ async def send_admin_ticket_notification_email(
 ) -> Tuple[bool, Optional[str]]:
     """
     Sends notification to the configured support desk email with complete ticket information.
-    Routes via the SUPPORT email identity.
+    Routes via the SUPPORT email identity using the unified Ametheus template system.
     """
-    ticket_id = ticket.get("ticket_id") or ticket.get("id") or "AMT-000000"
-    user_name = ticket.get("name", "Unknown User")
-    user_email = ticket.get("email", "unknown@email.com")
-    user_id = ticket.get("user_id") or "Guest (Unauthenticated)"
-    category = ticket.get("category", "General Inquiry").replace("_", " ").title()
-    payment_type = ticket.get("payment_type", "N/A")
-    description = ticket.get("description", "")
-    created_at = ticket.get("created_at", "Just now")
-
     target_recipient = admin_recipient or getattr(settings, "SUPPORT_ADMIN_EMAIL", None) or "support@tenetadmissions.com"
 
-    subject = f"New Ametheus Support Ticket — {ticket_id} — {category}"
-
-    text_body = f"""New Support Ticket Logged in Ametheus Cockpit
-
-Ticket ID: {ticket_id}
-User Name: {user_name}
-User Email: {user_email}
-User/Account ID: {user_id}
-Category: {category}
-Payment Type: {payment_type}
-Created At: {created_at}
-
-Description:
-{description}
-
-View and manage this ticket in the Ametheus Admin Cockpit:
-https://ametheus.gg/admin
-"""
-
-    html_body = f"""
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <title>{subject}</title>
-</head>
-<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background-color: #0B0E16; margin: 0; padding: 24px; color: #F8FAFC;">
-  <table width="100%" border="0" cellspacing="0" cellpadding="0" style="max-width: 650px; margin: 0 auto; background-color: #111622; border-radius: 12px; border: 1px solid #242C3D; overflow: hidden;">
-    <tr>
-      <td style="background-color: #1A2234; padding: 20px 24px; border-bottom: 2px solid #E56A10;">
-        <h2 style="margin: 0; color: #FFFFFF; font-size: 18px;">[ADMIN ALERT] New Support Ticket</h2>
-        <span style="font-family: monospace; font-size: 13px; color: #E56A10; font-weight: bold;">{ticket_id}</span>
-      </td>
-    </tr>
-    <tr>
-      <td style="padding: 24px;">
-        <table width="100%" border="0" cellspacing="0" cellpadding="8" style="font-size: 13px; font-family: monospace; margin-bottom: 20px;">
-          <tr style="border-bottom: 1px solid #242C3D;">
-            <td style="color: #94A3B8; width: 140px;">Submitting User:</td>
-            <td style="color: #FFFFFF; font-weight: bold;">{user_name} &lt;{user_email}&gt;</td>
-          </tr>
-          <tr style="border-bottom: 1px solid #242C3D;">
-            <td style="color: #94A3B8;">User Account ID:</td>
-            <td style="color: #94A3B8;">{user_id}</td>
-          </tr>
-          <tr style="border-bottom: 1px solid #242C3D;">
-            <td style="color: #E56A10; font-weight: bold;">{category}</td>
-          </tr>
-          <tr style="border-bottom: 1px solid #242C3D;">
-            <td style="color: #94A3B8;">Payment Type:</td>
-            <td style="color: #FFFFFF;">{payment_type}</td>
-          </tr>
-          <tr style="border-bottom: 1px solid #242C3D;">
-            <td style="color: #94A3B8;">Timestamp:</td>
-            <td style="color: #94A3B8;">{created_at}</td>
-          </tr>
-        </table>
-
-        <div style="background-color: #0B0E16; border: 1px solid #242C3D; border-radius: 8px; padding: 16px; margin-bottom: 24px;">
-          <div style="font-size: 11px; font-family: monospace; text-transform: uppercase; color: #E56A10; margin-bottom: 8px; font-weight: bold;">User Description:</div>
-          <div style="font-size: 13px; line-height: 1.6; color: #E2E8F0; white-space: pre-wrap;">{description}</div>
-        </div>
-
-        <a href="https://ametheus.gg/admin" style="display: inline-block; background-color: #E56A10; color: #FFFFFF; padding: 10px 20px; font-family: monospace; font-size: 12px; font-weight: bold; text-transform: uppercase; text-decoration: none; border-radius: 6px;">
-          Open in Admin Cockpit &rarr;
-        </a>
-      </td>
-    </tr>
-  </table>
-</body>
-</html>
-"""
+    from app.services.email_template_system import build_admin_ticket_notification_email
+    subject, text_body, html_body = build_admin_ticket_notification_email(ticket)
 
     return await send_support_email(target_recipient, subject, text_body, html_body)
 
@@ -956,84 +736,25 @@ async def send_notification_email(
     title: str,
     message: str,
     link: Optional[str] = None,
+    notification_type: Optional[str] = None,
     db: Optional[AsyncIOMotorDatabase] = None,
 ) -> Tuple[bool, Optional[str]]:
     """
-    Sends an automated tournament/match notification email to the user.
-    Routes via the NO-REPLY identity (noreply@ametheus.games).
-    Reply-To points to support@ametheus.games.
+    Sends an automated tournament/match/wallet/platform notification email to the user.
+    Routes via the NO-REPLY identity (noreply@ametheus.games) using the unified Ametheus template system.
     """
     to_email_clean = (recipient or "").strip().lower()
     if not to_email_clean or "@" not in to_email_clean:
         return False, "Recipient email is invalid or missing"
 
-    display_name = user_name or "Contender"
-    subject = f"AMETHEUS Alert: {title}"
-
-    destination_url = "https://ametheus.gg/dashboard"
-    if link:
-        if link.startswith("http"):
-            destination_url = link
-        else:
-            destination_url = f"https://ametheus.gg{link if link.startswith('/') else '/' + link}"
-
-    text_body = f"""Hello {display_name},
-
-{title}
-
-{message}
-
-View details on your dashboard:
-{destination_url}
-
-—
-AMETHEUS Esports Operations
-https://ametheus.gg
-"""
-
-    html_body = f"""
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <title>{subject}</title>
-</head>
-<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background-color: #0B0E16; margin: 0; padding: 24px; color: #F8FAFC;">
-  <table width="100%" border="0" cellspacing="0" cellpadding="0" style="max-width: 600px; margin: 0 auto; background-color: #111622; border-radius: 12px; border: 1px solid #242C3D; overflow: hidden; box-shadow: 0 4px 10px rgba(0,0,0,0.5);">
-    <tr>
-      <td style="background-color: #1A2234; padding: 20px 24px; border-bottom: 2px solid #E56A10;">
-        <h1 style="color: #FFFFFF; margin: 0; font-size: 20px; font-weight: 800; letter-spacing: 1px;">AMETHEUS <span style="color: #E56A10;">ALERT</span></h1>
-        <p style="color: #94A3B8; margin: 4px 0 0 0; font-size: 11px; text-transform: uppercase; letter-spacing: 2px;">Official Competition Notification</p>
-      </td>
-    </tr>
-    <tr>
-      <td style="padding: 28px 24px;">
-        <p style="margin: 0 0 16px 0; font-size: 14px; color: #94A3B8;">
-          Hello <strong style="color: #FFFFFF;">{display_name}</strong>,
-        </p>
-
-        <h2 style="margin: 0 0 16px 0; font-size: 18px; color: #E56A10;">{title}</h2>
-
-        <div style="background-color: #0B0E16; border-left: 3px solid #E56A10; padding: 16px; border-radius: 4px; margin-bottom: 24px;">
-          <p style="margin: 0; font-size: 14px; line-height: 1.6; color: #E2E8F0; white-space: pre-wrap;">{message}</p>
-        </div>
-
-        <div style="text-align: center; margin: 28px 0 12px 0;">
-          <a href="{destination_url}" style="display: inline-block; background-color: #E56A10; color: #FFFFFF; padding: 12px 28px; font-family: monospace; font-size: 13px; font-weight: bold; text-transform: uppercase; text-decoration: none; border-radius: 8px; letter-spacing: 0.5px;">
-            Open in Cockpit &rarr;
-          </a>
-        </div>
-      </td>
-    </tr>
-    <tr>
-      <td style="background-color: #0B0E16; padding: 16px 24px; text-align: center; border-top: 1px solid #242C3D; font-size: 11px; color: #64748B;">
-        &copy; 2026 AMETHEUS Esports Platform. All competitive integrity rights reserved.
-      </td>
-    </tr>
-  </table>
-</body>
-</html>
-"""
+    from app.services.email_template_system import build_user_notification_email
+    subject, text_body, html_body = build_user_notification_email(
+        user_name=user_name,
+        title=title,
+        message=message,
+        link=link,
+        notification_type=notification_type,
+    )
 
     return await send_noreply_email(to_email_clean, subject, text_body, html_body)
 
@@ -1048,108 +769,20 @@ async def send_security_alert_email(
 ) -> Tuple[bool, Optional[str]]:
     """
     Dispatches a high-priority security notification email when a sign-in is detected from a new/unrecognized IP.
-    Routes via the NO-REPLY identity (noreply@ametheus.games) with Reply-To pointing to support@ametheus.games.
+    Routes via the NO-REPLY identity (noreply@ametheus.games) with the unified Ametheus template system.
     """
     to_email_clean = (to_email or "").strip().lower()
     if not to_email_clean or "@" not in to_email_clean:
         return False, "Recipient email is invalid or missing"
 
-    display_name = user_name or "Contender"
-    subject = f"AMETHEUS Security Alert: New sign-in detected from {client_ip}"
-    settings_url = "https://ametheus.gg/settings#Security"
-
-    text_body = f"""SECURITY ALERT: NEW SIGN-IN DETECTED
-======================================
-
-Hello {display_name},
-
-A new sign-in to your AMETHEUS account was detected from an unrecognized IP address.
-
-Sign-In Details:
-----------------
-• Account: {display_name} ({to_email_clean})
-• IP Address: {client_ip}
-• Device / Client: {device_info}
-• Date & Time: {timestamp_str}
-
-Did you perform this login?
-• IF THIS WAS YOU: You can safely ignore this notification. This IP has now been added to your recognized devices.
-• IF YOU DO NOT RECOGNIZE THIS ACTIVITY:
-  1. Change your account password immediately at: {settings_url}
-  2. Terminate all other active sessions under Settings > Security.
-  3. Contact AMETHEUS Security Support at support@ametheus.games.
-
-Protecting your competitive account integrity,
-AMETHEUS Security Operations
-https://ametheus.gg
-"""
-
-    html_body = f"""
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <title>{subject}</title>
-</head>
-<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background-color: #07090E; margin: 0; padding: 24px; color: #F8FAFC;">
-  <table width="100%" border="0" cellspacing="0" cellpadding="0" style="max-width: 600px; margin: 0 auto; background-color: #0E121B; border-radius: 12px; border: 1px solid #1F2839; overflow: hidden; box-shadow: 0 8px 24px rgba(0,0,0,0.7);">
-    <tr>
-      <td style="background-color: #171E2E; padding: 22px 24px; border-bottom: 3px solid #EF4444;">
-        <h1 style="color: #FFFFFF; margin: 0; font-size: 20px; font-weight: 800; letter-spacing: 1px;">AMETHEUS <span style="color: #EF4444;">SECURITY ALERT</span></h1>
-        <p style="color: #94A3B8; margin: 6px 0 0 0; font-size: 11px; text-transform: uppercase; letter-spacing: 2px;">Unrecognized Login Detected</p>
-      </td>
-    </tr>
-    <tr>
-      <td style="padding: 28px 24px;">
-        <div style="background-color: rgba(239,68,68,0.1); border: 1px solid rgba(239,68,68,0.3); border-radius: 8px; padding: 14px 16px; margin-bottom: 22px; color: #FCA5A5; font-size: 13px; line-height: 1.5;">
-          <strong>Security Notice:</strong> A new sign-in was detected from an IP address not previously associated with your account.
-        </div>
-
-        <p style="margin: 0 0 16px 0; font-size: 14px; color: #CBD5E1;">
-          Hello <strong style="color: #FFFFFF;">{display_name}</strong>,
-        </p>
-
-        <table width="100%" border="0" cellspacing="0" cellpadding="10" style="font-size: 12px; font-family: monospace; background-color: #07090E; border-radius: 8px; border: 1px solid #1F2839; margin-bottom: 24px;">
-          <tr style="border-bottom: 1px solid #1F2839;">
-            <td style="color: #94A3B8; width: 130px;">Account:</td>
-            <td style="color: #FFFFFF; font-weight: bold;">{display_name} &lt;{to_email_clean}&gt;</td>
-          </tr>
-          <tr style="border-bottom: 1px solid #1F2839;">
-            <td style="color: #94A3B8;">IP Address:</td>
-            <td style="color: #EF4444; font-weight: bold;">{client_ip}</td>
-          </tr>
-          <tr style="border-bottom: 1px solid #1F2839;">
-            <td style="color: #94A3B8;">Device / Browser:</td>
-            <td style="color: #38BDF8;">{device_info}</td>
-          </tr>
-          <tr>
-            <td style="color: #94A3B8;">Date &amp; Time:</td>
-            <td style="color: #E2E8F0;">{timestamp_str}</td>
-          </tr>
-        </table>
-
-        <div style="background-color: #121824; border-left: 3px solid #38BDF8; padding: 14px 16px; border-radius: 4px; margin-bottom: 24px; font-size: 13px; line-height: 1.6; color: #CBD5E1;">
-          <p style="margin: 0 0 8px 0;"><strong style="color: #FFFFFF;">Was this you?</strong></p>
-          <p style="margin: 0 0 8px 0;">If you recognized this sign-in, you can safely disregard this email. This IP address has been added to your authorized network list.</p>
-          <p style="margin: 0; color: #F87171;"><strong style="color: #EF4444;">If you did not sign in:</strong> Someone else may have your credentials. We strongly advise updating your password and terminating active sessions immediately.</p>
-        </div>
-
-        <div style="text-align: center; margin: 28px 0 16px 0;">
-          <a href="{settings_url}" style="display: inline-block; background-color: #EF4444; color: #FFFFFF; padding: 12px 28px; font-family: monospace; font-size: 12px; font-weight: bold; text-transform: uppercase; text-decoration: none; border-radius: 6px; letter-spacing: 0.5px; box-shadow: 0 4px 12px rgba(239,68,68,0.3);">
-            Review Account Security &rarr;
-          </a>
-        </div>
-      </td>
-    </tr>
-    <tr>
-      <td style="background-color: #07090E; padding: 16px 24px; text-align: center; border-top: 1px solid #1F2839; font-size: 11px; color: #64748B;">
-        &copy; 2026 AMETHEUS Esports Platform. All competitive integrity rights reserved.
-      </td>
-    </tr>
-  </table>
-</body>
-</html>
-"""
+    from app.services.email_template_system import build_security_alert_email
+    subject, text_body, html_body = build_security_alert_email(
+        user_name=user_name,
+        recipient_email=to_email_clean,
+        client_ip=client_ip,
+        device_info=device_info,
+        timestamp_str=timestamp_str,
+    )
 
     return await send_noreply_email(to_email_clean, subject, text_body, html_body)
 
@@ -1160,71 +793,11 @@ def render_official_announcement_email(
     recipient_name: Optional[str] = None,
 ) -> tuple[str, str]:
     """
-    Renders professional plain text and HTML templates for Official Ametheus communications.
+    Renders professional plain text and HTML templates for Official Ametheus communications
+    using the unified Ametheus template system.
     """
-    name = (recipient_name or "Ametheus Member").strip()
-    clean_msg = message.strip()
-
-    text_body = f"""Ametheus Official Communication
-===================================================
-
-Dear {name},
-
-{clean_msg}
-
---
-AMETHEUS Esports Platform
-Official Operations
-https://ametheus.gg
-"""
-
-    html_message = clean_msg.replace("\n\n", "</p><p style='margin: 0 0 16px 0; font-size: 14px; line-height: 1.7; color: #E2E8F0;'>").replace("\n", "<br/>")
-
-    html_body = f"""<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <title>{subject}</title>
-</head>
-<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background-color: #0B0E16; margin: 0; padding: 24px; color: #F8FAFC;">
-  <table width="100%" border="0" cellspacing="0" cellpadding="0" style="max-width: 620px; margin: 0 auto; background-color: #111622; border-radius: 12px; border: 1px solid #242C3D; overflow: hidden; box-shadow: 0 4px 14px rgba(0,0,0,0.6);">
-    <tr>
-      <td style="background-color: #1A2234; padding: 24px 28px; border-bottom: 2px solid #E56A10;">
-        <h1 style="color: #FFFFFF; margin: 0; font-size: 20px; font-weight: 800; letter-spacing: 1px;">AMETHEUS <span style="color: #E56A10;">OFFICIAL</span></h1>
-        <p style="color: #94A3B8; margin: 4px 0 0 0; font-size: 11px; text-transform: uppercase; letter-spacing: 2px;">Official Platform Announcement</p>
-      </td>
-    </tr>
-    <tr>
-      <td style="padding: 32px 28px;">
-        <p style="margin: 0 0 18px 0; font-size: 14px; color: #94A3B8;">
-          Dear <strong style="color: #FFFFFF;">{name}</strong>,
-        </p>
-
-        <h2 style="margin: 0 0 20px 0; font-size: 18px; color: #E56A10; font-weight: 700;">{subject}</h2>
-
-        <div style="background-color: #0B0E16; border-left: 3px solid #E56A10; padding: 20px; border-radius: 6px; margin-bottom: 28px;">
-          <p style="margin: 0 0 16px 0; font-size: 14px; line-height: 1.7; color: #E2E8F0;">
-            {html_message}
-          </p>
-        </div>
-
-        <div style="text-align: center; margin: 28px 0 12px 0;">
-          <a href="https://ametheus.gg" style="display: inline-block; background-color: #E56A10; color: #FFFFFF; padding: 12px 28px; font-family: monospace; font-size: 13px; font-weight: bold; text-transform: uppercase; text-decoration: none; border-radius: 8px; letter-spacing: 0.5px;">
-            Visit Ametheus Platform &rarr;
-          </a>
-        </div>
-      </td>
-    </tr>
-    <tr>
-      <td style="background-color: #0B0E16; padding: 18px 28px; text-align: center; border-top: 1px solid #242C3D; font-size: 11px; color: #64748B;">
-        Sent by Ametheus Official Communications &bull; official@ametheus.games<br/>
-        &copy; 2026 AMETHEUS Esports Platform. All competitive integrity rights reserved.
-      </td>
-    </tr>
-  </table>
-</body>
-</html>
-"""
+    from app.services.email_template_system import build_official_announcement_email
+    _, text_body, html_body = build_official_announcement_email(subject, message, recipient_name)
     return text_body, html_body
 
 
@@ -1261,185 +834,30 @@ async def send_match_roster_notification_email(
     """
     Sends a branded, mobile-responsive match roster notification email to a Team Leader.
     Handles both initial assignment ('MATCH SCHEDULED') and updates ('MATCH UPDATED').
-    Complies with Sections 34, 35, 36, and 37 of the Match Engine specification.
+    Utilizes the unified Ametheus template system.
     """
     to_email_clean = (to_email or "").strip().lower()
     if not to_email_clean or "@" not in to_email_clean:
         return False, "Recipient email is invalid or missing"
 
-    display_leader = leader_name or "Team Leader"
-    action_title = "MATCH UPDATED" if is_update else "MATCH SCHEDULED"
-    subject = f"AMETHEUS: {action_title} — {tournament_title} ({round_name})"
-
-    destination_url = f"https://ametheus.gg/matches/{match_id}"
-
-    # Build plain text body
-    text_body = f"""Ametheus
-----------------------------------------
-{action_title}
-
-Your team has been assigned a match in {tournament_title}.
-
-Tournament: {tournament_title}
-Game:       {game_name}
-Round:      {round_name}
-Match:      Match {match_number}
-Your Team:  {team_name}
-Opponent:   {opponent_name}
-Date:       {scheduled_date}
-Time:       {scheduled_time}
-"""
-
-    if is_update and previous_details:
-        text_body += f"""
---- UPDATE DETAILS ---
-Previous: {previous_details.get('opponent', 'TBD')} @ {previous_details.get('time', 'TBD')}
-Updated:  {opponent_name} @ {scheduled_time}
-"""
-
-    text_body += f"""
-View Match Details:
-{destination_url}
-"""
-
-    if community_link:
-        text_body += f"""
-Tournament {community_platform or 'Community'} Link:
-{community_link}
-"""
-
-    text_body += """
-----------------------------------------
-AMETHEUS Esports Operations
-Competitive Integrity & Fair Play
-https://ametheus.gg
-"""
-
-    # Build HTML body
-    community_btn_html = ""
-    if community_link:
-        plat_label = (community_platform or "WhatsApp").upper()
-        community_btn_html = f"""
-        <div style="margin-top: 14px; text-align: center;">
-          <a href="{community_link}" target="_blank" style="display: inline-block; background-color: #10B981; color: #FFFFFF; padding: 10px 22px; font-family: monospace; font-size: 12px; font-weight: bold; text-transform: uppercase; text-decoration: none; border-radius: 6px; letter-spacing: 0.5px;">
-            💬 Join Tournament {plat_label} &rarr;
-          </a>
-        </div>
-        """
-
-    update_box_html = ""
-    if is_update and previous_details:
-        prev_opp = previous_details.get('opponent', 'TBD')
-        prev_time = previous_details.get('time', 'TBD')
-        update_box_html = f"""
-        <div style="background-color: #1A1A24; border: 1px solid #F59E0B; border-radius: 6px; padding: 14px 18px; margin-bottom: 20px;">
-          <p style="margin: 0 0 6px 0; font-size: 11px; text-transform: uppercase; font-weight: bold; color: #F59E0B; letter-spacing: 1px;">
-            ⚠️ What Changed:
-          </p>
-          <p style="margin: 0; font-size: 13px; line-height: 1.5; color: #E2E8F0;">
-            <strong style="color: #94A3B8;">Previous:</strong> {prev_opp} &bull; {prev_time}<br/>
-            <strong style="color: #10B981;">Updated:</strong> {opponent_name} &bull; {scheduled_time}
-          </p>
-        </div>
-        """
-
-    badge_color = "#F59E0B" if is_update else "#E56A10"
-
-    html_body = f"""<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>{subject}</title>
-</head>
-<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: #07090E; margin: 0; padding: 24px 12px; color: #F8FAFC;">
-  <table width="100%" border="0" cellspacing="0" cellpadding="0" style="max-width: 600px; margin: 0 auto; background-color: #111622; border-radius: 12px; border: 1px solid #242C3D; overflow: hidden; box-shadow: 0 8px 24px rgba(0,0,0,0.6);">
-    <!-- Header -->
-    <tr>
-      <td style="background-color: #161D2C; padding: 22px 28px; border-bottom: 2px solid {badge_color};">
-        <table width="100%" border="0" cellspacing="0" cellpadding="0">
-          <tr>
-            <td>
-              <h1 style="color: #FFFFFF; margin: 0; font-size: 20px; font-weight: 900; letter-spacing: 1.5px; text-transform: uppercase;">
-                AMETHEUS <span style="color: {badge_color};">MATCH ENGINE</span>
-              </h1>
-              <p style="color: #94A3B8; margin: 4px 0 0 0; font-size: 11px; text-transform: uppercase; letter-spacing: 2px;">
-                Official Roster Notification
-              </p>
-            </td>
-            <td align="right">
-              <span style="display: inline-block; background-color: {badge_color}; color: #07090E; padding: 4px 10px; font-family: monospace; font-size: 11px; font-weight: 900; text-transform: uppercase; border-radius: 4px; letter-spacing: 1px;">
-                {action_title}
-              </span>
-            </td>
-          </tr>
-        </table>
-      </td>
-    </tr>
-
-    <!-- Body -->
-    <tr>
-      <td style="padding: 28px 28px 20px 28px;">
-        <p style="margin: 0 0 16px 0; font-size: 14px; color: #94A3B8;">
-          Hello <strong style="color: #FFFFFF;">{display_leader}</strong>,
-        </p>
-
-        <p style="margin: 0 0 20px 0; font-size: 15px; color: #E2E8F0; line-height: 1.5;">
-          Your team <strong style="color: #FFFFFF;">{team_name}</strong> has a match confirmed in <strong style="color: {badge_color};">{tournament_title}</strong>.
-        </p>
-
-        {update_box_html}
-
-        <!-- Match Specs Table -->
-        <table width="100%" border="0" cellspacing="0" cellpadding="0" style="background-color: #0B0E16; border: 1px solid #1E2738; border-radius: 8px; margin-bottom: 24px; overflow: hidden;">
-          <tr>
-            <td style="padding: 12px 16px; border-bottom: 1px solid #1E2738; color: #64748B; font-size: 12px; font-family: monospace; text-transform: uppercase; width: 35%;">Tournament</td>
-            <td style="padding: 12px 16px; border-bottom: 1px solid #1E2738; color: #F8FAFC; font-size: 13px; font-weight: 700;">{tournament_title}</td>
-          </tr>
-          <tr>
-            <td style="padding: 12px 16px; border-bottom: 1px solid #1E2738; color: #64748B; font-size: 12px; font-family: monospace; text-transform: uppercase;">Game</td>
-            <td style="padding: 12px 16px; border-bottom: 1px solid #1E2738; color: #06B6D4; font-size: 13px; font-weight: 700; text-transform: uppercase;">{game_name}</td>
-          </tr>
-          <tr>
-            <td style="padding: 12px 16px; border-bottom: 1px solid #1E2738; color: #64748B; font-size: 12px; font-family: monospace; text-transform: uppercase;">Round &amp; Match</td>
-            <td style="padding: 12px 16px; border-bottom: 1px solid #1E2738; color: #F8FAFC; font-size: 13px; font-weight: 700;">{round_name} &bull; Match {match_number}</td>
-          </tr>
-          <tr>
-            <td style="padding: 12px 16px; border-bottom: 1px solid #1E2738; color: #64748B; font-size: 12px; font-family: monospace; text-transform: uppercase;">Your Team</td>
-            <td style="padding: 12px 16px; border-bottom: 1px solid #1E2738; color: #10B981; font-size: 13px; font-weight: 800;">{team_name}</td>
-          </tr>
-          <tr>
-            <td style="padding: 12px 16px; border-bottom: 1px solid #1E2738; color: #64748B; font-size: 12px; font-family: monospace; text-transform: uppercase;">Opponent</td>
-            <td style="padding: 12px 16px; border-bottom: 1px solid #1E2738; color: #EF4444; font-size: 13px; font-weight: 800;">{opponent_name}</td>
-          </tr>
-          <tr>
-            <td style="padding: 12px 16px; color: #64748B; font-size: 12px; font-family: monospace; text-transform: uppercase;">Date &amp; Time</td>
-            <td style="padding: 12px 16px; color: #F59E0B; font-size: 13px; font-weight: 700;">{scheduled_date} &bull; {scheduled_time}</td>
-          </tr>
-        </table>
-
-        <!-- Primary CTA Button -->
-        <div style="text-align: center; margin: 24px 0 8px 0;">
-          <a href="{destination_url}" style="display: inline-block; background-color: {badge_color}; color: #07090E; padding: 13px 32px; font-family: monospace; font-size: 13px; font-weight: 900; text-transform: uppercase; text-decoration: none; border-radius: 6px; letter-spacing: 1px; box-shadow: 0 4px 12px rgba(229,106,16,0.3);">
-            [ VIEW MATCH DETAILS &rarr; ]
-          </a>
-        </div>
-
-        {community_btn_html}
-      </td>
-    </tr>
-
-    <!-- Footer -->
-    <tr>
-      <td style="background-color: #0B0E16; padding: 20px 28px; text-align: center; border-top: 1px solid #1E2738; font-size: 11px; color: #64748B; line-height: 1.6;">
-        Competitive integrity &bull; Real-time tournament telemetry<br/>
-        &copy; 2026 AMETHEUS Esports Platform. All rights reserved.
-      </td>
-    </tr>
-  </table>
-</body>
-</html>
-"""
+    from app.services.email_template_system import build_match_roster_email
+    subject, text_body, html_body = build_match_roster_email(
+        leader_name=leader_name,
+        tournament_title=tournament_title,
+        game_name=game_name,
+        round_name=round_name,
+        match_number=match_number,
+        team_name=team_name,
+        opponent_name=opponent_name,
+        scheduled_date=scheduled_date,
+        scheduled_time=scheduled_time,
+        match_id=match_id,
+        community_platform=community_platform,
+        community_link=community_link,
+        is_update=is_update,
+        previous_details=previous_details,
+    )
 
     return await send_noreply_email(to_email_clean, subject, text_body, html_body)
+
 
