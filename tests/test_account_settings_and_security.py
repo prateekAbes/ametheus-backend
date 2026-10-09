@@ -294,3 +294,155 @@ async def test_check_username_availability_flow(mock_db):
 
     app.dependency_overrides.clear()
 
+
+@pytest.mark.asyncio
+async def test_delete_account_complete_cleanup_orchestration(mock_db):
+    """
+    Test comprehensive account deletion orchestration:
+    - User document permanently deleted
+    - Pending payouts cancelled
+    - Positive wallet balance settled in ledger
+    - Solo team disbanded and deleted
+    - Multi-member team captaincy transferred to next member
+    - Member removed from rosters of other teams
+    - Upcoming tournament registrations deleted
+    - Past tournament registrations de-identified
+    - User notifications deleted
+    - Support tickets and reviews anonymized
+    """
+    user_del_doc = {
+        "_id": "user_del_1",
+        "id": "user_del_1",
+        "clerk_user_id": "clerk_del_1",
+        "email": "delete_me@ametheus.gg",
+        "username": "DoomedGamer",
+        "role": "PLAYER",
+        "inr_balance_paise": 50000,
+        "inr_reserved_paise": 10000,
+    }
+    await mock_db.users.insert_one(user_del_doc)
+
+    user_obj = User.from_mongo(user_del_doc)
+
+    # 1. Pending payout
+    await mock_db.payouts.insert_one({
+        "_id": "payout_pending_1",
+        "user_id": "user_del_1",
+        "status": "PENDING",
+        "amount": 100,
+    })
+
+    # 2. Solo team
+    await mock_db.teams.insert_one({
+        "_id": "team_solo_1",
+        "name": "Solo Squad",
+        "captain_id": "user_del_1",
+        "members": ["user_del_1"],
+    })
+
+    # 3. Multi-member team owned by user
+    await mock_db.teams.insert_one({
+        "_id": "team_multi_1",
+        "name": "Duo Squad",
+        "captain_id": "user_del_1",
+        "members": ["user_del_1", "user_survivor_1"],
+    })
+
+    # 4. Other team where user is member and sub
+    await mock_db.teams.insert_one({
+        "_id": "team_other_1",
+        "name": "Other Squad",
+        "captain_id": "user_captain_2",
+        "members": ["user_captain_2", "user_del_1"],
+        "substitutes": ["user_del_1"],
+    })
+
+    # 5. Upcoming registration
+    await mock_db.tournament_registrations.insert_one({
+        "_id": "reg_upcoming_1",
+        "user_id": "user_del_1",
+        "status": "CONFIRMED",
+    })
+
+    # 6. Past registration
+    await mock_db.tournament_registrations.insert_one({
+        "_id": "reg_past_1",
+        "user_id": "user_del_1",
+        "status": "COMPLETED",
+    })
+
+    # 7. Notification
+    await mock_db.notifications.insert_one({
+        "_id": "notif_del_1",
+        "user_id": "user_del_1",
+        "title": "Welcome",
+    })
+
+    # 8. Support ticket
+    await mock_db.support_tickets.insert_one({
+        "_id": "ticket_del_1",
+        "user_id": "user_del_1",
+        "user_email": "delete_me@ametheus.gg",
+        "subject": "Help",
+    })
+
+    app.dependency_overrides[get_db] = lambda: mock_db
+    app.dependency_overrides[get_current_user] = lambda: user_obj
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        res = await ac.delete("/api/v1/auth/account")
+        assert res.status_code == 200
+        data = res.json()
+        assert data["status"] == "success"
+        assert data["deleted"] is True
+
+    app.dependency_overrides.clear()
+
+    # Verify user document is deleted
+    assert await mock_db.users.find_one({"_id": "user_del_1"}) is None
+
+    # Verify pending payout cancelled
+    payout = await mock_db.payouts.find_one({"_id": "payout_pending_1"})
+    assert payout["status"] == "CANCELLED"
+
+    # Verify ledger settlement entry created and user id de-identified
+    settlement = await mock_db.wallet_ledger.find_one({
+        "txn_type": "ACCOUNT_DELETION_SETTLEMENT",
+    })
+    assert settlement is not None
+    assert settlement["amount_paise"] == -50000
+    assert settlement["user_id"] == "deleted_user_del"
+
+    # Verify solo team deleted
+    assert await mock_db.teams.find_one({"_id": "team_solo_1"}) is None
+
+    # Verify multi-member team captaincy transferred
+    duo_team = await mock_db.teams.find_one({"_id": "team_multi_1"})
+    assert duo_team is not None
+    assert duo_team["captain_id"] == "user_survivor_1"
+    assert "user_del_1" not in duo_team["members"]
+
+    # Verify user removed from other team
+    other_team = await mock_db.teams.find_one({"_id": "team_other_1"})
+    assert "user_del_1" not in other_team["members"]
+    assert "user_del_1" not in other_team.get("substitutes", [])
+
+    # Verify upcoming registration deleted
+    assert await mock_db.tournament_registrations.find_one({"_id": "reg_upcoming_1"}) is None
+
+    # Verify past registration de-identified
+    past_reg = await mock_db.tournament_registrations.find_one({"_id": "reg_past_1"})
+    assert past_reg is not None
+    assert past_reg.get("user_id") is None
+    assert past_reg.get("display_name") == "Deleted User"
+
+    # Verify notification deleted
+    assert await mock_db.notifications.find_one({"_id": "notif_del_1"}) is None
+
+    # Verify ticket anonymized
+    ticket = await mock_db.support_tickets.find_one({"_id": "ticket_del_1"})
+    assert ticket is not None
+    assert ticket.get("user_id") is None
+    assert ticket.get("user_email") == "deleted@ametheus.games"
+
