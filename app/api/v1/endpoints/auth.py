@@ -145,9 +145,42 @@ async def sync_clerk_user(
             update_fields["role"] = "SUPER_ADMIN"
         elif token_role in ["ORGANIZER", "TOURNAMENT_ADMIN"] and user_doc.get("role") != "SUPER_ADMIN":
             update_fields["role"] = "ORGANIZER"
-        # Keep username_lower in sync
+
+        # Synchronize canonical username from Clerk authentication context
         existing_username = user_doc.get("username", "")
-        if existing_username:
+        clean_incoming_username = payload.username.strip() if payload.username else ""
+        
+        if clean_incoming_username:
+            import re
+            is_valid_format = bool(re.match(r"^[a-zA-Z0-9_\-\.]+$", clean_incoming_username)) and 3 <= len(clean_incoming_username) <= 30
+            is_not_reserved = not _is_reserved_username(clean_incoming_username) or is_super_admin
+            
+            if is_valid_format and is_not_reserved:
+                # Check if incoming username is claimed by a different user
+                collision = await db.users.find_one({
+                    "username_lower": clean_incoming_username.lower(),
+                    "_id": {"$ne": target_id},
+                    "clerk_user_id": {"$ne": payload.clerk_user_id},
+                })
+                is_placeholder = (
+                    not existing_username
+                    or existing_username.lower().startswith("player_")
+                    or user_doc.get("has_chosen_username") is False
+                    or user_doc.get("needs_username") is True
+                )
+                if not collision and (is_placeholder or clean_incoming_username.lower() != existing_username.lower() or clean_incoming_username != existing_username):
+                    update_fields["username"] = clean_incoming_username
+                    update_fields["username_lower"] = clean_incoming_username.lower()
+                    update_fields["has_chosen_username"] = True
+                    update_fields["needs_username"] = False
+                elif not collision and clean_incoming_username != existing_username:
+                    update_fields["username"] = clean_incoming_username
+                    update_fields["username_lower"] = clean_incoming_username.lower()
+                elif existing_username:
+                    update_fields["username_lower"] = existing_username.lower()
+            elif existing_username:
+                update_fields["username_lower"] = existing_username.lower()
+        elif existing_username:
             update_fields["username_lower"] = existing_username.lower()
 
         await db.users.update_one({"_id": target_id}, {"$set": update_fields})
@@ -155,17 +188,20 @@ async def sync_clerk_user(
         return User.from_mongo(updated_doc)
 
     # 2. New user flow — Validate username and prepare atomic upsert
-    clean_username = payload.username.strip().lower().replace(" ", "_")
-    if _is_reserved_username(clean_username) and not is_super_admin:
+    clean_username = payload.username.strip().replace(" ", "_")
+    clean_username_lower = clean_username.lower()
+    if _is_reserved_username(clean_username_lower) and not is_super_admin:
         clean_username = f"player_{payload.clerk_user_id[-6:].lower()}"
+        clean_username_lower = clean_username.lower()
 
     # Check for username collisions with other existing users
     username_taken = await db.users.find_one({
-        "username_lower": clean_username.lower(),
+        "username_lower": clean_username_lower,
         "_id": {"$ne": payload.clerk_user_id},
     })
     if username_taken:
         clean_username = f"{clean_username[:18]}_{payload.clerk_user_id[-6:].lower()}"
+        clean_username_lower = clean_username.lower()
 
     initial_role = "SUPER_ADMIN" if is_super_admin else ("ORGANIZER" if token_role in ["ORGANIZER", "TOURNAMENT_ADMIN"] else "PLAYER")
 
@@ -174,7 +210,7 @@ async def sync_clerk_user(
     set_on_insert_fields = {
         "role": initial_role,
         "username": clean_username,
-        "username_lower": clean_username.lower(),
+        "username_lower": clean_username_lower,
         "has_chosen_username": has_chosen,
         "needs_username": not has_chosen,
         "display_name": payload.display_name or clean_username,

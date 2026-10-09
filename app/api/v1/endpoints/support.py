@@ -499,6 +499,21 @@ async def list_support_tickets(
     return SupportTicketListResponse(tickets=tickets, total=total)
 
 
+@router.get("/tickets/counts")
+async def get_support_ticket_counts(
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Returns real-time totals of active (non-archived) vs archived support tickets."""
+    active_count = await db.support_tickets.count_documents({"is_archived": {"$ne": True}, "is_dummy": {"$ne": True}})
+    archived_count = await db.support_tickets.count_documents({"is_archived": True, "is_dummy": {"$ne": True}})
+    return {
+        "active": active_count,
+        "archived": archived_count,
+        "total": active_count + archived_count,
+    }
+
+
 @router.post("/tickets/archive/preview", response_model=ArchivePreviewResponse)
 async def preview_support_archive_endpoint(
     payload: ArchiveFilterRequest,
@@ -528,24 +543,31 @@ async def execute_support_archive_endpoint(
     )
 
 
-@router.post("/tickets/{ticket_id}/archive")
+@router.post("/tickets/{ticket_id}/archive", response_model=SupportTicketResponse)
 async def archive_single_support_ticket(
     ticket_id: str,
     admin_user: User = Depends(require_organizer),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
-    ok = await archive_single_record(db, "support_tickets", ticket_id, admin_user)
-    return {"status": "success", "message": "Support ticket archived", "ticket_id": ticket_id}
+    await archive_single_record(db, "support_tickets", ticket_id, admin_user)
+    doc = await db.support_tickets.find_one({"$or": [{"_id": ticket_id}, {"ticket_id": ticket_id}, {"id": ticket_id}]})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Ticket not found")
+    return SupportTicketResponse(**_clean_ticket_doc(doc))
 
 
-@router.post("/tickets/{ticket_id}/unarchive")
+@router.post("/tickets/{ticket_id}/unarchive", response_model=SupportTicketResponse)
+@router.post("/tickets/{ticket_id}/restore", response_model=SupportTicketResponse)
 async def unarchive_single_support_ticket(
     ticket_id: str,
     admin_user: User = Depends(require_organizer),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
-    ok = await unarchive_record(db, "support_tickets", ticket_id, admin_user)
-    return {"status": "success", "message": "Support ticket restored", "ticket_id": ticket_id}
+    await unarchive_record(db, "support_tickets", ticket_id, admin_user)
+    doc = await db.support_tickets.find_one({"$or": [{"_id": ticket_id}, {"ticket_id": ticket_id}, {"id": ticket_id}]})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Ticket not found")
+    return SupportTicketResponse(**_clean_ticket_doc(doc))
 
 
 @router.get("/tickets/{ticket_id}", response_model=SupportTicketResponse)
@@ -708,6 +730,19 @@ async def get_users_with_support_tickets(
     results = await db.support_tickets.aggregate(pipeline).to_list(100)
     for r in results:
         r["tickets"] = [_clean_ticket_doc(t) for t in r.get("tickets", [])]
+        user_id = r.get("user_id")
+        email = r.get("email")
+        u_doc = None
+        if user_id:
+            u_doc = await db.users.find_one({"$or": [{"_id": user_id}, {"id": user_id}, {"clerk_user_id": user_id}]})
+        if not u_doc and email:
+            u_doc = await db.users.find_one({"email": email.lower()})
+        if u_doc:
+            r["username"] = u_doc.get("username") or r.get("user_name")
+            r["display_name"] = u_doc.get("display_name") or u_doc.get("username")
+        else:
+            r["username"] = r.get("user_name")
+            r["display_name"] = r.get("user_name")
     return results
 
 
@@ -988,27 +1023,3 @@ async def get_my_support_tickets(
     docs = await cursor.to_list(length=50)
     return [SupportTicketResponse(**_clean_ticket_doc(d)) for d in docs]
 
-
-@router.post("/tickets/{ticket_id}/archive", response_model=SupportTicketResponse)
-async def toggle_archive_support_ticket(
-    ticket_id: str,
-    admin_user: User = Depends(require_organizer),
-    db: AsyncIOMotorDatabase = Depends(get_db),
-):
-    doc = await db.support_tickets.find_one({"$or": [{"_id": ticket_id}, {"ticket_id": ticket_id}, {"id": ticket_id}]})
-    if not doc:
-        raise HTTPException(status_code=404, detail="Ticket not found")
-    new_arch = not doc.get("is_archived", False)
-    now_iso = datetime.now(timezone.utc).isoformat()
-    update_data = {"is_archived": new_arch, "updated_at": now_iso}
-    if new_arch:
-        update_data["status"] = "ARCHIVED"
-    elif doc.get("status") == "ARCHIVED":
-        update_data["status"] = "OPEN"
-
-    await db.support_tickets.update_one(
-        {"_id": doc["_id"]},
-        {"$set": update_data}
-    )
-    updated = await db.support_tickets.find_one({"_id": doc["_id"]})
-    return SupportTicketResponse(**_clean_ticket_doc(updated))

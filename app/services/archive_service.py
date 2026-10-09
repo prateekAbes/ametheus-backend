@@ -346,14 +346,23 @@ async def unarchive_record(
             detail=f"{cfg['display_name']} record '{record_id}' not found",
         )
 
+    update_set = {
+        "is_archived": False,
+        "unarchived_at": now_iso,
+        "unarchived_by": admin_username,
+    }
+    if section == "support_tickets" and existing.get("status") == "ARCHIVED":
+        update_set["status"] = "RESOLVED" if existing.get("resolved_at") else "OPEN"
+
     res = await db[cfg["collection"]].update_one(
         {"_id": existing["_id"]},
         {
-            "$set": {
-                "is_archived": False,
-                "unarchived_at": now_iso,
-                "unarchived_by": admin_username,
-            }
+            "$set": update_set,
+            "$unset": {
+                "archived_at": "",
+                "archived_by": "",
+                "archive_reason": "",
+            },
         },
     )
 

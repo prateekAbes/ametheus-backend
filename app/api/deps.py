@@ -69,14 +69,18 @@ async def get_current_user(
 
         from app.models.base import get_utc_now
         now = get_utc_now()
-        raw_username = payload.get("username") or payload.get("preferred_username") or target_id[:12]
-        clean_user = raw_username.strip().lower().replace(" ", "_")
+        raw_username = payload.get("username") or payload.get("preferred_username")
+        clean_user = raw_username.strip().replace(" ", "_") if raw_username else f"player_{target_id[-6:].lower()}"
+        clean_user_lower = clean_user.lower()
+        has_chosen = bool(raw_username)
 
         set_on_insert_fields = {
             "role": initial_role,
             "username": clean_user,
-            "username_lower": clean_user.lower(),
-            "display_name": payload.get("name") or payload.get("username") or "Contender",
+            "username_lower": clean_user_lower,
+            "has_chosen_username": has_chosen,
+            "needs_username": not has_chosen,
+            "display_name": payload.get("name") or clean_user or "Contender",
             "avatar_url": payload.get("picture"),
             "riot_id": None,
             "steam_id": None,
