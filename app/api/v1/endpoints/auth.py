@@ -1,12 +1,18 @@
+import logging
+from datetime import datetime, timezone
+from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Header, status, Request
+import httpx
 from motor.motor_asyncio import AsyncIOMotorDatabase
+from pydantic import BaseModel
 from app.api.deps import get_db, get_current_user
+from app.core.config import settings
 from app.core.security import decode_token
 from app.models.user import User
 from app.services.audit import record_audit_log
 from app.schemas import UserResponse
-from pydantic import BaseModel
-from typing import Optional
+
+logger = logging.getLogger("ametheus.auth")
 
 router = APIRouter()
 
@@ -458,6 +464,45 @@ async def update_user_profile(
 
     return current_user
 
+
+async def delete_clerk_user(clerk_user_id: str) -> bool:
+    """
+    Deletes the user identity from Clerk using Clerk's Backend API and CLERK_SECRET_KEY.
+    Returns True on success or if user is already deleted (404).
+    Raises HTTPException if Clerk returns an unexpected error.
+    """
+    if not settings.CLERK_SECRET_KEY or not settings.CLERK_SECRET_KEY.strip():
+        logger.warning("[AUTH] CLERK_SECRET_KEY not configured, skipping remote Clerk user deletion.")
+        return True
+
+    clerk_api_url = f"https://api.clerk.com/v1/users/{clerk_user_id}"
+    headers = {
+        "Authorization": f"Bearer {settings.CLERK_SECRET_KEY.strip()}",
+        "Content-Type": "application/json",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.delete(clerk_api_url, headers=headers)
+            if resp.status_code in (200, 204):
+                logger.info(f"[AUTH] Successfully deleted Clerk user {clerk_user_id}")
+                return True
+            elif resp.status_code == 404:
+                logger.info(f"[AUTH] Clerk user {clerk_user_id} already deleted from Clerk (404)")
+                return True
+            else:
+                logger.error(f"[AUTH] Clerk API returned HTTP {resp.status_code} during user deletion: {resp.text}")
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail="Authentication identity provider failed to delete user account. Please try again.",
+                )
+    except httpx.RequestError as exc:
+        logger.error(f"[AUTH] Network error communicating with Clerk during user deletion: {exc}")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Authentication identity provider network error. Please try again.",
+        )
+
+
 @router.delete("/me")
 @router.delete("/account")
 async def delete_user_account(
@@ -465,10 +510,12 @@ async def delete_user_account(
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """
-    Permanently delete user account from MongoDB, record audit log, and terminate session.
+    Permanently delete user account from MongoDB, synchronize with Clerk server-side,
+    safely clean up dependent relationships and wallet balances, and record audit log.
     """
     from bson import ObjectId
 
+    # 1. Authoritative lookup of target user document
     query_clauses = [
         {"_id": current_user.id},
         {"id": current_user.id},
@@ -484,18 +531,139 @@ async def delete_user_account(
         query_clauses.append({"_id": ObjectId(str(current_user.id))})
 
     target_user_doc = await db.users.find_one({"$or": query_clauses})
-    if target_user_doc:
-        target_mongo_id = target_user_doc["_id"]
-        await db.users.delete_one({"_id": target_mongo_id})
+    if not target_user_doc:
+        # Idempotent response if account was already removed
+        return {"status": "success", "message": "Account already deleted."}
 
-        await record_audit_log(
-            db=db,
-            operator=current_user.username,
-            role=current_user.role,
-            action="DELETE_ACCOUNT",
-            target=f"User {current_user.id} ({current_user.email})",
-            details="User permanently deleted their own account.",
+    target_mongo_id = target_user_doc["_id"]
+
+    # 2. Financial & Wallet Safety Invariants
+    # Check if user has an unwithdrawn wallet balance
+    avail_paise = int(target_user_doc.get("inr_balance_paise", 0))
+    reserved_paise = int(target_user_doc.get("inr_reserved_paise", 0))
+    if avail_paise == 0 and target_user_doc.get("inr_balance"):
+        try:
+            avail_paise = int(float(target_user_doc["inr_balance"]) * 100)
+        except Exception:
+            avail_paise = 0
+
+    total_paise = avail_paise + reserved_paise
+    if total_paise > 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot delete account with an active wallet balance (₹{total_paise / 100:.2f}). Please withdraw or settle all remaining funds before deleting your account.",
         )
+
+    # Check for pending payments/transactions
+    user_ids_to_clean = list(set([
+        str(current_user.id),
+        str(target_mongo_id),
+        str(target_user_doc.get("id", "")),
+    ] + ([str(current_user.clerk_user_id)] if current_user.clerk_user_id else [])))
+    user_ids_to_clean = [uid for uid in user_ids_to_clean if uid]
+
+    pending_payment = await db.payments.find_one({
+        "user_id": {"$in": user_ids_to_clean},
+        "status": {"$in": ["INITIATED", "PENDING", "SUBMITTED"]},
+    })
+    if pending_payment:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot delete account with pending payment transactions. Please wait for pending transactions to complete or contact support.",
+        )
+
+    # 3. Clean up or de-identify dependent application records
+    # 3a. Remove user from team memberships and substitutes
+    await db.teams.update_many(
+        {"members.user_id": {"$in": user_ids_to_clean}},
+        {"$pull": {"members": {"user_id": {"$in": user_ids_to_clean}}}},
+    )
+    await db.teams.update_many(
+        {"substitutes.user_id": {"$in": user_ids_to_clean}},
+        {"$pull": {"substitutes": {"user_id": {"$in": user_ids_to_clean}}}},
+    )
+
+    # 3b. Handle team captaincies
+    captain_teams = db.teams.find({
+        "captain_id": {"$in": user_ids_to_clean},
+        "is_disbanded": {"$ne": True},
+    })
+    async for team in captain_teams:
+        team_id = team["_id"]
+        remaining_members = [
+            m for m in team.get("members", [])
+            if (m.get("user_id") if isinstance(m, dict) else getattr(m, "user_id", None)) not in user_ids_to_clean
+        ]
+        if remaining_members:
+            new_captain_id = remaining_members[0].get("user_id") if isinstance(remaining_members[0], dict) else remaining_members[0].user_id
+            for m in remaining_members:
+                if (m.get("user_id") if isinstance(m, dict) else getattr(m, "user_id", None)) == new_captain_id:
+                    if isinstance(m, dict):
+                        m["role"] = "CAPTAIN"
+                    else:
+                        m.role = "CAPTAIN"
+            await db.teams.update_one(
+                {"_id": team_id},
+                {
+                    "$set": {
+                        "captain_id": new_captain_id,
+                        "members": remaining_members,
+                    }
+                },
+            )
+        else:
+            await db.teams.update_one(
+                {"_id": team_id},
+                {
+                    "$set": {
+                        "status": "DISBANDED",
+                        "is_disbanded": True,
+                        "disbanded_at": datetime.now(timezone.utc),
+                        "disbanded_by": current_user.username or "deleted_user",
+                    }
+                },
+            )
+
+    # 3c. Delete user notifications
+    await db.notifications.delete_many({"user_id": {"$in": user_ids_to_clean}})
+
+    # 3d. Invalidate user sessions
+    await db.user_sessions.delete_many({
+        "$or": [
+            {"user_id": {"$in": user_ids_to_clean}},
+            {"clerk_user_id": current_user.clerk_user_id},
+        ]
+    })
+
+    # 3e. De-identify support tickets
+    await db.support_tickets.update_many(
+        {"user_id": {"$in": user_ids_to_clean}},
+        {
+            "$set": {
+                "user_email": "deleted_user@ametheus.gg",
+                "user_name": "Deleted Contender",
+                "is_user_deleted": True,
+            }
+        },
+    )
+
+    # 4. Clerk Server-side Identity Deletion
+    clerk_id = current_user.clerk_user_id or target_user_doc.get("clerk_user_id")
+    if clerk_id:
+        await delete_clerk_user(clerk_id)
+
+    # 5. Record Audit Log before final purge
+    await record_audit_log(
+        db=db,
+        operator=current_user.username or "deleted_user",
+        role=current_user.role,
+        action="DELETE_ACCOUNT",
+        target=f"User {current_user.id} ({current_user.email})",
+        details="User permanently deleted their own account.",
+    )
+
+    # 6. Final MongoDB user purge
+    await db.users.delete_one({"_id": target_mongo_id})
 
     return {"status": "success", "message": "Account successfully deleted."}
 
