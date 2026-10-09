@@ -510,7 +510,13 @@ async def get_leaderboard(
             game_cat = game_obj.get("category", "pc") if game_obj else "pc"
 
             cap_id = team.get("captain_id")
-            captain = await db.users.find_one({"$or": [{"_id": cap_id}, {"id": cap_id}]}) if cap_id else None
+            captain = await db.users.find_one({
+                "$or": [
+                    {"_id": cap_id},
+                    {"id": cap_id},
+                    {"clerk_user_id": str(cap_id)},
+                ]
+            }) if cap_id else None
             captain_user = "@captain"
             if captain:
                 cap_privacy = captain.get("privacy_settings") or {}
@@ -518,6 +524,16 @@ async def get_leaderboard(
                     captain_user = "@Anonymous Contender"
                 elif captain.get("username"):
                     captain_user = f"@{captain['username']}"
+
+            team_name = team.get("name", "Team")
+            if captain and captain.get("username"):
+                if (
+                    team_name.lower().startswith("player_")
+                    or team_name.lower().startswith("user_")
+                    or team.get("is_solo")
+                    or team_name == captain.get("email")
+                ):
+                    team_name = captain["username"]
 
             # Query completed matches for this team across both team_a and team_b positions
             completed_cursor = db.matches.find({
@@ -559,7 +575,7 @@ async def get_leaderboard(
             entries.append({
                 "rank": idx + 1,
                 "id": team_id,
-                "name": team.get("name", "Team"),
+                "name": team_name,
                 "tag": team.get("tag", "TM"),
                 "type": "team",
                 "game_slug": game_slug,
@@ -584,15 +600,29 @@ async def get_leaderboard(
         custom_docs = await custom_cursor.to_list(length=100)
         for c in custom_docs:
             c_id = str(c.get("_id", c.get("id")))
+            cap_id = c.get("captain_id") or c.get("user_id")
+            captain = await db.users.find_one({
+                "$or": [
+                    {"_id": cap_id},
+                    {"id": cap_id},
+                    {"clerk_user_id": str(cap_id)},
+                ]
+            }) if cap_id else None
+            c_name = c.get("name", "Team")
+            captain_user = c.get("captain", "@captain")
+            if captain and captain.get("username"):
+                captain_user = f"@{captain['username']}"
+                if c_name.lower().startswith("player_") or c_name.lower().startswith("user_"):
+                    c_name = captain["username"]
             entries.append({
                 "rank": 1,
                 "id": c_id,
-                "name": c.get("name", "Team"),
+                "name": c_name,
                 "tag": c.get("tag", "TM"),
                 "type": c.get("type", "team"),
                 "game_slug": c.get("game_slug"),
                 "game_name": c.get("game_name"),
-                "captain": c.get("captain", "@captain"),
+                "captain": captain_user,
                 "logo_url": c.get("logo_url"),
                 "win_rate": float(c.get("win_rate", 0.0)),
                 "matches_played": int(c.get("matches_played", 0)),
