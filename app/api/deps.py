@@ -70,9 +70,26 @@ async def get_current_user(
         from app.models.base import get_utc_now
         now = get_utc_now()
         raw_username = payload.get("username") or payload.get("preferred_username")
-        clean_user = raw_username.strip().replace(" ", "_") if raw_username else f"player_{target_id[-6:].lower()}"
-        clean_user_lower = clean_user.lower()
-        has_chosen = bool(raw_username)
+        raw_clean = (raw_username or "").strip().replace(" ", "_")
+        
+        import re, secrets
+        is_valid = bool(re.match(r"^[a-zA-Z0-9_\-\.]+$", raw_clean)) and 3 <= len(raw_clean) <= 30
+        if is_valid:
+            collision = await db.users.find_one({"username_lower": raw_clean.lower(), "_id": {"$ne": target_id}})
+            if collision:
+                clean_user = f"{raw_clean[:18]}_{secrets.token_hex(2)}"
+            else:
+                clean_user = raw_clean
+            clean_user_lower = clean_user.lower()
+            has_chosen = True
+        else:
+            clean_id = re.sub(r'[^a-zA-Z0-9]', '', str(target_id)).lower()[-8:] or "contender"
+            candidate = f"player_{clean_id}"
+            while await db.users.find_one({"username_lower": candidate.lower(), "_id": {"$ne": target_id}}):
+                candidate = f"player_{clean_id[:4]}_{secrets.token_hex(2)}"
+            clean_user = candidate
+            clean_user_lower = candidate.lower()
+            has_chosen = False
 
         set_on_insert_fields = {
             "role": initial_role,
@@ -108,8 +125,21 @@ async def get_current_user(
                 upsert=True,
             )
         except Exception:
-            # Another request won the concurrent provisioning race
-            pass
+            # Another request won the concurrent provisioning race, or retry with unique random suffix
+            candidate = f"player_{secrets.token_hex(4)}"
+            set_on_insert_fields["username"] = candidate
+            set_on_insert_fields["username_lower"] = candidate.lower()
+            try:
+                await db.users.update_one(
+                    {"_id": target_id},
+                    {
+                        "$set": set_fields,
+                        "$setOnInsert": set_on_insert_fields,
+                    },
+                    upsert=True,
+                )
+            except Exception:
+                pass
 
         user_doc = await db.users.find_one({"$or": user_or})
 

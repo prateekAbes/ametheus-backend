@@ -29,6 +29,25 @@ def _is_reserved_username(username: str) -> bool:
         return True
     return False
 
+async def _generate_unique_placeholder(db: AsyncIOMotorDatabase, clerk_user_id: str) -> str:
+    """Generate a collision-free temporary username handle like player_a1b2c3d4."""
+    import re, secrets
+    clean_id = re.sub(r'[^a-zA-Z0-9]', '', str(clerk_user_id)).lower()[-8:] or "contender"
+    candidate = f"player_{clean_id}"
+
+    # Check if candidate is already taken
+    existing = await db.users.find_one({"username_lower": candidate.lower(), "_id": {"$ne": clerk_user_id}})
+    if not existing:
+        return candidate
+
+    for _ in range(10):
+        candidate = f"player_{clean_id[:4]}_{secrets.token_hex(2)}"
+        existing = await db.users.find_one({"username_lower": candidate.lower(), "_id": {"$ne": clerk_user_id}})
+        if not existing:
+            return candidate
+
+    return f"player_{secrets.token_hex(4)}"
+
 class UserSyncRequest(BaseModel):
     clerk_user_id: str
     email: str
@@ -153,9 +172,18 @@ async def sync_clerk_user(
             update_fields["role"] = "ORGANIZER"
 
         # Synchronize canonical username from Clerk authentication context
-        existing_username = user_doc.get("username", "")
-        clean_incoming_username = payload.username.strip() if payload.username else ""
-        
+        existing_username = (user_doc.get("username") or "").strip()
+        clean_incoming_username = (payload.username or "").strip()
+
+        # If existing record has an empty or missing username, heal it with a guaranteed placeholder
+        if not existing_username:
+            placeholder = await _generate_unique_placeholder(db, target_id)
+            update_fields["username"] = placeholder
+            update_fields["username_lower"] = placeholder.lower()
+            update_fields["has_chosen_username"] = False
+            update_fields["needs_username"] = True
+            existing_username = placeholder
+
         if clean_incoming_username:
             import re
             is_valid_format = bool(re.match(r"^[a-zA-Z0-9_\-\.]+$", clean_incoming_username)) and 3 <= len(clean_incoming_username) <= 30
@@ -169,8 +197,7 @@ async def sync_clerk_user(
                     "clerk_user_id": {"$ne": payload.clerk_user_id},
                 })
                 is_placeholder = (
-                    not existing_username
-                    or existing_username.lower().startswith("player_")
+                    existing_username.lower().startswith("player_")
                     or user_doc.get("has_chosen_username") is False
                     or user_doc.get("needs_username") is True
                 )
@@ -194,32 +221,46 @@ async def sync_clerk_user(
         return User.from_mongo(updated_doc)
 
     # 2. New user flow — Validate username and prepare atomic upsert
-    clean_username = payload.username.strip().replace(" ", "_")
-    clean_username_lower = clean_username.lower()
-    if _is_reserved_username(clean_username_lower) and not is_super_admin:
-        clean_username = f"player_{payload.clerk_user_id[-6:].lower()}"
-        clean_username_lower = clean_username.lower()
+    raw_username = (payload.username or "").strip().replace(" ", "_")
+    is_explicitly_unassigned = (payload.has_chosen_username is False) or (not raw_username) or (len(raw_username) < 3)
 
-    # Check for username collisions with other existing users
-    username_taken = await db.users.find_one({
-        "username_lower": clean_username_lower,
-        "_id": {"$ne": payload.clerk_user_id},
-    })
-    if username_taken:
-        clean_username = f"{clean_username[:18]}_{payload.clerk_user_id[-6:].lower()}"
+    import re
+    is_valid_format = bool(re.match(r"^[a-zA-Z0-9_\-\.]+$", raw_username)) and 3 <= len(raw_username) <= 30
+    is_not_reserved = not _is_reserved_username(raw_username.lower()) or is_super_admin
+
+    if not is_explicitly_unassigned and is_valid_format and is_not_reserved:
+        clean_username = raw_username
         clean_username_lower = clean_username.lower()
+        # Check collision with other users
+        username_taken = await db.users.find_one({
+            "username_lower": clean_username_lower,
+            "_id": {"$ne": payload.clerk_user_id},
+        })
+        if username_taken:
+            clean_username = f"{clean_username[:18]}_{payload.clerk_user_id[-6:].lower()}"
+            clean_username_lower = clean_username.lower()
+            # Double check if still taken
+            if await db.users.find_one({"username_lower": clean_username_lower, "_id": {"$ne": payload.clerk_user_id}}):
+                import secrets
+                clean_username = f"{clean_username[:14]}_{secrets.token_hex(2)}"
+                clean_username_lower = clean_username.lower()
+        has_chosen = True
+    else:
+        # Username was empty, invalid, reserved, or has_chosen_username is False (e.g., fresh Google OAuth signup)
+        clean_username = await _generate_unique_placeholder(db, payload.clerk_user_id)
+        clean_username_lower = clean_username.lower()
+        has_chosen = False
 
     initial_role = "SUPER_ADMIN" if is_super_admin else ("ORGANIZER" if token_role in ["ORGANIZER", "TOURNAMENT_ADMIN"] else "PLAYER")
 
     # Application fields set ONLY upon initial insertion
-    has_chosen = payload.has_chosen_username if payload.has_chosen_username is not None else True
     set_on_insert_fields = {
         "role": initial_role,
         "username": clean_username,
         "username_lower": clean_username_lower,
         "has_chosen_username": has_chosen,
         "needs_username": not has_chosen,
-        "display_name": payload.display_name or clean_username,
+        "display_name": (payload.display_name or "").strip() or clean_username,
         "avatar_url": payload.avatar_url,
         "riot_id": None,
         "steam_id": None,
@@ -251,9 +292,25 @@ async def sync_clerk_user(
             upsert=True,
         )
         is_newly_created = (upsert_res.upserted_id is not None)
-    except Exception:
-        # In case a concurrent request completed the insert/upsert simultaneously
-        is_newly_created = False
+    except Exception as exc:
+        import logging
+        logging.getLogger("ametheus.auth").warning(f"Upsert collision retry triggered for {payload.clerk_user_id}: {exc}")
+        clean_username = await _generate_unique_placeholder(db, payload.clerk_user_id)
+        clean_username_lower = clean_username.lower()
+        set_on_insert_fields["username"] = clean_username
+        set_on_insert_fields["username_lower"] = clean_username_lower
+        try:
+            upsert_res = await db.users.update_one(
+                {"_id": payload.clerk_user_id},
+                {
+                    "$set": set_fields,
+                    "$setOnInsert": set_on_insert_fields,
+                },
+                upsert=True,
+            )
+            is_newly_created = (upsert_res.upserted_id is not None)
+        except Exception:
+            is_newly_created = False
 
     # Fetch the authoritative document
     final_doc = await db.users.find_one({
