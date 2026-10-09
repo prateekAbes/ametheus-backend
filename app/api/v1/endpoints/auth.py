@@ -465,24 +465,9 @@ async def delete_user_account(
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """
-    Permanently delete user account and orchestrate complete, reliable data cleanup:
-    1. Verify server-side authenticated user context.
-    2. Prevent concurrent / duplicate deletion calls.
-    3. Reconcile wallet ledger: zero out balance, cancel pending withdrawals, de-identify transaction records.
-    4. Handle team memberships:
-       - Disband solo teams.
-       - Promote next member to captain for multi-member teams.
-       - Remove user from other teams' members and substitutes rosters.
-    5. Cancel upcoming tournament registrations and de-identify historical ones.
-    6. Clean up custom leaderboard entries.
-    7. Remove user notifications and anonymize reviews / support tickets.
-    8. Delete user document from MongoDB.
-    9. Call Clerk Backend API to delete user if CLERK_SECRET_KEY is configured.
-    10. Log audit trail.
+    Permanently delete user account from MongoDB, record audit log, and terminate session.
     """
     from bson import ObjectId
-    from app.core.config import settings
-    from app.models.base import get_utc_now
 
     query_clauses = [
         {"_id": current_user.id},
@@ -499,247 +484,18 @@ async def delete_user_account(
         query_clauses.append({"_id": ObjectId(str(current_user.id))})
 
     target_user_doc = await db.users.find_one({"$or": query_clauses})
-    if not target_user_doc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="User account record not found in database",
+    if target_user_doc:
+        target_mongo_id = target_user_doc["_id"]
+        await db.users.delete_one({"_id": target_mongo_id})
+
+        await record_audit_log(
+            db=db,
+            operator=current_user.username,
+            role=current_user.role,
+            action="DELETE_ACCOUNT",
+            target=f"User {current_user.id} ({current_user.email})",
+            details="User permanently deleted their own account.",
         )
 
-    target_mongo_id = target_user_doc["_id"]
-
-    # Collect all possible identifier strings for this user to ensure complete relational cleanup
-    user_identifiers = {str(target_mongo_id), str(current_user.id)}
-    if current_user.clerk_user_id:
-        user_identifiers.add(str(current_user.clerk_user_id))
-    if target_user_doc.get("clerk_user_id"):
-        user_identifiers.add(str(target_user_doc["clerk_user_id"]))
-    if target_user_doc.get("id"):
-        user_identifiers.add(str(target_user_doc["id"]))
-
-    user_ids_list = list(user_identifiers)
-    now = get_utc_now()
-
-    # 1. FINANCIAL RECONCILIATION & WALLET SETTLEMENT
-    try:
-        # A. Cancel any in-flight pending withdrawal requests
-        await db.payouts.update_many(
-            {"user_id": {"$in": user_ids_list}, "status": "PENDING"},
-            {"$set": {
-                "status": "CANCELLED",
-                "rejection_reason": "Account deleted by user",
-                "updated_at": now,
-            }}
-        )
-
-        # B. Retain financial transaction records for audit/accounting, but de-identify personal info
-        await db.payouts.update_many(
-            {"user_id": {"$in": user_ids_list}},
-            {"$set": {
-                "user_name": "Deleted Contender",
-                "upi_id": "REDACTED",
-            }}
-        )
-        await db.game_payments.update_many(
-            {"user_id": {"$in": user_ids_list}},
-            {"$set": {
-                "user_name": "Deleted Contender",
-            }}
-        )
-
-        # C. Wallet ledger: record final closing entry if non-zero balance existed
-        current_avail_paise = int(target_user_doc.get("inr_balance_paise", 0))
-        if current_avail_paise > 0:
-            from app.models.payment import WalletLedger
-            closing_ledger = WalletLedger(
-                user_id=str(target_mongo_id),
-                txn_type="ACCOUNT_DELETION_SETTLEMENT",
-                amount_paise=-current_avail_paise,
-                balance_before_paise=current_avail_paise,
-                balance_after_paise=0,
-                description="Wallet balance zeroed and account closed upon user account deletion",
-            )
-            await db.wallet_ledger.insert_one(closing_ledger.to_mongo())
-
-        # Anonymize ledger user reference while preserving financial numbers
-        await db.wallet_ledger.update_many(
-            {"user_id": {"$in": user_ids_list}},
-            {"$set": {"user_id": f"deleted_{str(target_mongo_id)[:8]}"}}
-        )
-    except Exception as fin_err:
-        import logging
-        logging.getLogger("ametheus.auth").warning(f"Wallet settlement cleanup note: {fin_err}")
-
-    # 2. TEAM MEMBERSHIPS & CAPTAINCIES
-    try:
-        def _extract_id(item):
-            if isinstance(item, str):
-                return item
-            if isinstance(item, dict):
-                return item.get("user_id") or item.get("id") or item.get("_id")
-            return getattr(item, "user_id", getattr(item, "id", None))
-
-        # Teams where user is captain
-        cap_teams_cursor = db.teams.find({
-            "captain_id": {"$in": user_ids_list},
-            "status": {"$ne": "DISBANDED"}
-        })
-        async for team in cap_teams_cursor:
-            raw_members = team.get("members", [])
-            raw_subs = team.get("substitutes", [])
-
-            # Filter out deleted user
-            remaining_members = [
-                m for m in raw_members
-                if _extract_id(m) not in user_ids_list
-            ]
-            remaining_subs = [
-                s for s in raw_subs
-                if _extract_id(s) not in user_ids_list
-            ]
-
-            if remaining_members:
-                # Promote the next senior member to captain
-                first_m = remaining_members[0]
-                new_cap_id = _extract_id(first_m)
-                if isinstance(first_m, dict):
-                    first_m["role"] = "CAPTAIN"
-                elif hasattr(first_m, "role"):
-                    first_m.role = "CAPTAIN"
-
-                await db.teams.update_one(
-                    {"_id": team["_id"]},
-                    {"$set": {
-                        "captain_id": new_cap_id,
-                        "members": remaining_members,
-                        "substitutes": remaining_subs,
-                        "updated_at": now,
-                    }}
-                )
-            else:
-                # Disband and delete solo team
-                await db.teams.delete_one({"_id": team["_id"]})
-
-        # Remove user from any other teams where they are regular member or substitute
-        await db.teams.update_many(
-            {"members.user_id": {"$in": user_ids_list}},
-            {"$pull": {"members": {"user_id": {"$in": user_ids_list}}}}
-        )
-        await db.teams.update_many(
-            {"members": {"$in": user_ids_list}},
-            {"$pull": {"members": {"$in": user_ids_list}}}
-        )
-        await db.teams.update_many(
-            {"substitutes.user_id": {"$in": user_ids_list}},
-            {"$pull": {"substitutes": {"user_id": {"$in": user_ids_list}}}}
-        )
-        await db.teams.update_many(
-            {"substitutes": {"$in": user_ids_list}},
-            {"$pull": {"substitutes": {"$in": user_ids_list}}}
-        )
-    except Exception as team_err:
-        import logging
-        logging.getLogger("ametheus.auth").warning(f"Team cleanup note: {team_err}")
-
-    # 3. TOURNAMENT REGISTRATIONS
-    try:
-        # Cancel upcoming active registrations to prevent ghost brackets
-        await db.tournament_registrations.delete_many({
-            "$or": [
-                {"player_id": {"$in": user_ids_list}},
-                {"user_id": {"$in": user_ids_list}},
-            ],
-            "status": {"$in": ["PENDING", "CONFIRMED"]}
-        })
-        # De-identify historical registrations
-        await db.tournament_registrations.update_many(
-            {
-                "$or": [
-                    {"player_id": {"$in": user_ids_list}},
-                    {"user_id": {"$in": user_ids_list}},
-                ]
-            },
-            {
-                "$set": {
-                    "player_name": "Former Contender",
-                    "display_name": "Deleted User",
-                    "player_id": None,
-                    "user_id": None,
-                }
-            }
-        )
-    except Exception as tourn_err:
-        import logging
-        logging.getLogger("ametheus.auth").warning(f"Tournament registration cleanup note: {tourn_err}")
-
-    # 4. CUSTOM LEADERBOARDS & RANKINGS
-    try:
-        await db.custom_leaderboard_entries.delete_many({
-            "$or": [
-                {"user_id": {"$in": user_ids_list}},
-                {"entity_id": {"$in": user_ids_list}},
-                {"id": {"$in": user_ids_list}},
-            ]
-        })
-        await db.leaderboard_disqualifications.delete_many({
-            "$or": [
-                {"user_id": {"$in": user_ids_list}},
-                {"entity_id": {"$in": user_ids_list}},
-            ]
-        })
-    except Exception as lb_err:
-        import logging
-        logging.getLogger("ametheus.auth").warning(f"Leaderboard cleanup note: {lb_err}")
-
-    # 5. NOTIFICATIONS, REVIEWS & SUPPORT TICKETS
-    try:
-        await db.notifications.delete_many({"user_id": {"$in": user_ids_list}})
-        await db.reviews.update_many(
-            {"user_id": {"$in": user_ids_list}},
-            {"$set": {"user_name": "Former Contender"}}
-        )
-        await db.support_tickets.update_many(
-            {"user_id": {"$in": user_ids_list}},
-            {"$set": {
-                "user_id": None,
-                "user_name": "Deleted Contender",
-                "user_email": "deleted@ametheus.games",
-            }}
-        )
-    except Exception as comm_err:
-        import logging
-        logging.getLogger("ametheus.auth").warning(f"Support/reviews cleanup note: {comm_err}")
-
-    # 6. CLERK SERVER-SIDE USER DELETION
-    clerk_id = current_user.clerk_user_id or target_user_doc.get("clerk_user_id")
-    if settings.CLERK_SECRET_KEY and clerk_id:
-        try:
-            import httpx
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                clerk_res = await client.delete(
-                    f"https://api.clerk.com/v1/users/{clerk_id}",
-                    headers={"Authorization": f"Bearer {settings.CLERK_SECRET_KEY}"}
-                )
-                if clerk_res.status_code not in (200, 204, 404):
-                    import logging
-                    logging.getLogger("ametheus.auth").warning(
-                        f"Clerk deleteUser API status {clerk_res.status_code}: {clerk_res.text}"
-                    )
-        except Exception as clerk_err:
-            import logging
-            logging.getLogger("ametheus.auth").error(f"Clerk server deletion error: {clerk_err}")
-
-    # 7. PERMANENTLY REMOVE MONGODB USER DOCUMENT
-    await db.users.delete_one({"_id": target_mongo_id})
-
-    # 8. AUDIT LOGGING
-    await record_audit_log(
-        db=db,
-        operator=current_user.username,
-        role=current_user.role,
-        action="DELETE_ACCOUNT",
-        target=f"User {current_user.id} ({current_user.email})",
-        details="User permanently deleted their own account and all associated platform data was cleansed.",
-    )
-
-    return {"status": "success", "deleted": True, "message": "Account and associated data successfully deleted."}
+    return {"status": "success", "message": "Account successfully deleted."}
 
