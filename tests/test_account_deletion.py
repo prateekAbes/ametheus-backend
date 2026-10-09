@@ -174,6 +174,42 @@ async def test_account_deletion_with_pending_payment_rejected(mock_db, sample_us
 
 
 @pytest.mark.asyncio
+async def test_account_deletion_with_pending_game_payment_rejected(mock_db, sample_user):
+    """
+    Pending payment transactions in game_payments also halt deletion until settled.
+    """
+    await mock_db.game_payments.insert_one({
+        "_id": "gpay_pending_1",
+        "user_id": "user_del_123",
+        "amount_paise": 15000,
+        "status": "INITIATED",
+        "created_at": datetime.now(timezone.utc),
+    })
+
+    auth_user = User(
+        id=sample_user["_id"],
+        clerk_user_id=sample_user["clerk_user_id"],
+        email=sample_user["email"],
+        username=sample_user["username"],
+        role="PLAYER",
+    )
+    app.dependency_overrides[get_db] = lambda: mock_db
+    app.dependency_overrides[get_current_user] = lambda: auth_user
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        res = await ac.delete("/api/v1/auth/me")
+        assert res.status_code == 400
+        assert "pending payment transactions" in res.json().get("detail", "").lower()
+
+        # Verify account was NOT deleted
+        db_user = await mock_db.users.find_one({"_id": "user_del_123"})
+        assert db_user is not None
+
+    app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
 async def test_account_deletion_success_and_relationship_cleanup(mock_db, sample_user):
     """
     Criterion 1, 5, 6, 7, 9:

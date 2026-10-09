@@ -623,6 +623,11 @@ async def delete_user_account(
         "user_id": {"$in": user_ids_to_clean},
         "status": {"$in": ["INITIATED", "PENDING", "SUBMITTED"]},
     })
+    if not pending_payment:
+        pending_payment = await db.game_payments.find_one({
+            "user_id": {"$in": user_ids_to_clean},
+            "status": {"$in": ["INITIATED", "PENDING", "SUBMITTED"]},
+        })
     if pending_payment:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -720,7 +725,7 @@ async def delete_user_account(
     )
 
     # 6. Final MongoDB user purge
-    await db.users.delete_one({"_id": target_mongo_id})
+    await db.users.delete_many({"$or": query_clauses})
 
     return {"status": "success", "message": "Account successfully deleted."}
 
