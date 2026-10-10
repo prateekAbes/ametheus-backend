@@ -39,6 +39,7 @@ class Base64UploadPayload(BaseModel):
     filename: Optional[str] = "upload.png"
 
 async def _save_media(content: bytes, filename: str, content_type: str, db: AsyncIOMotorDatabase):
+    content_type = (content_type or "image/png").lower().split(";")[0].strip()
     if len(content) > MAX_FILE_SIZE:
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
