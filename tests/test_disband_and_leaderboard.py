@@ -145,3 +145,56 @@ async def test_team_disband_soft_delete_and_leaderboard_preservation(client, moc
     assert alpha_entry["wins"] == 2
     assert alpha_entry["earnings"] == 5000
     assert alpha_entry["rating"] > 1500
+
+@pytest.mark.asyncio
+async def test_leaderboard_spending_and_default_categories(client, mock_db):
+    # Setup team and payments
+    await mock_db.games.insert_one({
+        "_id": "game_val",
+        "id": "game_val",
+        "slug": "valorant",
+        "name": "Valorant",
+        "category": "pc",
+        "is_team_game": True,
+        "max_team_size": 5,
+        "min_team_size": 5,
+        "status": "ACTIVE",
+    })
+    await mock_db.teams.insert_one({
+        "_id": "team_beta",
+        "id": "team_beta",
+        "name": "Team Beta",
+        "tag": "BETA",
+        "game_id": "game_val",
+        "captain_id": "cap_beta",
+        "status": "ACTIVE",
+        "is_disbanded": False,
+        "payment_status": "PAID",
+    })
+    # Approved payment
+    await mock_db.game_payments.insert_one({
+        "_id": "pay_beta_1",
+        "team_id": "team_beta",
+        "user_id": "cap_beta",
+        "amount_inr": 450,
+        "amount_paise": 45000,
+        "status": "APPROVED",
+        "is_dummy": False,
+    })
+
+    # 1. Categories endpoint returns spending category
+    cat_res = await client.get("/api/v1/leaderboard/categories")
+    assert cat_res.status_code == 200
+    cats = cat_res.json()
+    spending_cat = next((c for c in cats if c["slug"] == "spending"), None)
+    assert spending_cat is not None
+    assert spending_cat["sort_metric"] == "spending"
+
+    # 2. Leaderboard endpoint returns entry with spending
+    lb_res = await client.get("/api/v1/leaderboard?category=spending")
+    assert lb_res.status_code == 200
+    entries = lb_res.json()
+    beta_entry = next((e for e in entries if e["id"] == "team_beta"), None)
+    assert beta_entry is not None
+    assert beta_entry["spending"] == 450
+

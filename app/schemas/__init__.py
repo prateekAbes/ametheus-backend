@@ -718,6 +718,7 @@ class LeaderboardEntryResponse(BaseModel):
     losses: int = 0
     rating: int = 1500
     earnings: Optional[Any] = 0
+    spending: Optional[int] = 0
     form: List[str] = []
     is_verified: bool = False
     category: str = "overall"

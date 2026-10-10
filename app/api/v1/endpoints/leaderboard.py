@@ -103,6 +103,16 @@ DEFAULT_CATEGORIES = [
         "is_system": True,
     },
     {
+        "_id": "cat_spending",
+        "name": "Highest Spending",
+        "slug": "spending",
+        "description": "Ranked by verified tournament and platform expenditure in INR",
+        "game_slug": "all",
+        "sort_metric": "spending",
+        "min_matches": 0,
+        "is_system": True,
+    },
+    {
         "_id": "cat_pc",
         "name": "PC Competitions",
         "slug": "pc",
@@ -127,12 +137,14 @@ DEFAULT_CATEGORIES = [
 
 
 async def ensure_default_categories(db: AsyncIOMotorDatabase):
-    count = await db.leaderboard_categories.count_documents({})
-    if count == 0:
-        for c in DEFAULT_CATEGORIES:
-            doc = dict(c)
-            doc["created_at"] = datetime.now(timezone.utc)
-            await db.leaderboard_categories.insert_one(doc)
+    for c in DEFAULT_CATEGORIES:
+        doc = dict(c)
+        doc.setdefault("created_at", datetime.now(timezone.utc))
+        await db.leaderboard_categories.update_one(
+            {"slug": c["slug"]},
+            {"$setOnInsert": doc},
+            upsert=True,
+        )
 
 @router.get("/stats", response_model=LeaderboardStatsSchema)
 async def get_leaderboard_stats(db: AsyncIOMotorDatabase = Depends(get_db)):
@@ -324,7 +336,7 @@ async def create_leaderboard_category(
             detail=f"Category with slug '{slug}' already exists.",
         )
 
-    valid_metrics = ["rating", "win_rate", "earnings", "wins", "matches_played"]
+    valid_metrics = ["rating", "win_rate", "earnings", "spending", "wins", "matches_played"]
     metric = payload.sort_metric if payload.sort_metric in valid_metrics else "rating"
 
     new_cat = {
@@ -569,6 +581,17 @@ async def get_leaderboard(
             }).to_list(length=100)
             real_earnings = sum(int(p.get("amount_paise", 0)) // 100 for p in payout_docs)
 
+            # Query real spending from approved payments
+            spending_docs = await db.game_payments.find({
+                "$or": [
+                    {"user_id": cap_id},
+                    {"team_id": {"$in": team_ids}},
+                ],
+                "status": "APPROVED",
+                "is_dummy": {"$ne": True},
+            }).to_list(length=100)
+            real_spending = sum(int(p.get("amount_inr", 0)) or (int(p.get("amount_paise", 0)) // 100) for p in spending_docs)
+
             is_disbanded = bool(team.get("is_disbanded", False) or team.get("status") == "DISBANDED")
             team_status = "DISBANDED" if is_disbanded else "ACTIVE"
 
@@ -588,6 +611,7 @@ async def get_leaderboard(
                 "losses": losses,
                 "rating": max(1000, 1500 + (wins * 25) - (losses * 10)),
                 "earnings": real_earnings,
+                "spending": real_spending,
                 "form": form if form else ["-"],
                 "is_verified": True,
                 "category": game_cat,
@@ -630,6 +654,7 @@ async def get_leaderboard(
                 "losses": int(c.get("losses", 0)),
                 "rating": int(c.get("rating", 1500)),
                 "earnings": int(c.get("earnings", 0)),
+                "spending": int(c.get("spending", 0)),
                 "form": c.get("form", []),
                 "is_verified": bool(c.get("is_verified", False)),
                 "category": c.get("category", "pc"),
@@ -679,6 +704,8 @@ async def get_leaderboard(
     # Dynamic metric sorting with deterministic tie-breaking (rating -> wins -> win_rate)
     if sort_metric == "win_rate":
         entries.sort(key=lambda x: (x["win_rate"], x["wins"], x["rating"]), reverse=True)
+    elif sort_metric == "spending":
+        entries.sort(key=lambda x: (x["spending"], x["rating"], x["wins"]), reverse=True)
     elif sort_metric == "earnings":
         entries.sort(key=lambda x: (x["earnings"], x["wins"], x["rating"]), reverse=True)
     elif sort_metric == "wins":

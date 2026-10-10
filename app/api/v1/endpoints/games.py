@@ -454,6 +454,8 @@ async def create_game(
         prize_pool_inr=payload.prize_pool_inr,
         play_url=payload.play_url,
         banner_url=payload.banner_url,
+        banner_tablet_url=payload.banner_tablet_url,
+        banner_mobile_url=payload.banner_mobile_url,
         logo_url=payload.logo_url,
         description=payload.description,
         server_region=payload.server_region,
