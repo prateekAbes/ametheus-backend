@@ -71,6 +71,7 @@ class GameResponse(BaseModel):
     entry_fee_inr: int = 0
     prize_pool_inr: int = 0
     play_url: Optional[str] = None
+    poster_url: Optional[str] = None
     banner_url: str
     banner_tablet_url: Optional[str] = None
     banner_mobile_url: Optional[str] = None
@@ -105,6 +106,7 @@ class GameCreate(BaseModel):
     entry_fee_inr: int = 0
     prize_pool_inr: int = 0
     play_url: Optional[str] = None
+    poster_url: Optional[str] = None
     banner_url: str = "https://images.unsplash.com/photo-1542751371-adc38448a05e"
     banner_tablet_url: Optional[str] = None
     banner_mobile_url: Optional[str] = None
@@ -136,6 +138,7 @@ class GameUpdate(BaseModel):
     entry_fee_inr: Optional[int] = None
     prize_pool_inr: Optional[int] = None
     play_url: Optional[str] = None
+    poster_url: Optional[str] = None
     banner_url: Optional[str] = None
     banner_tablet_url: Optional[str] = None
     banner_mobile_url: Optional[str] = None
@@ -367,6 +370,7 @@ class TournamentResponse(BaseModel):
     registration_deadline: Optional[str] = None
     check_in_window_minutes: Optional[int] = 15
     banner_url: Optional[str] = ""
+    hero_banner_url: Optional[str] = None
     banner_tablet_url: Optional[str] = None
     banner_mobile_url: Optional[str] = None
     logo_url: Optional[str] = None

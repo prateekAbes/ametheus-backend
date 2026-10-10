@@ -19,6 +19,7 @@ class Game(BaseModel):
     entry_fee_inr: int = 0
     prize_pool_inr: int = 0
     play_url: Optional[str] = None
+    poster_url: Optional[str] = None
     banner_url: str
     banner_tablet_url: Optional[str] = None
     banner_mobile_url: Optional[str] = None

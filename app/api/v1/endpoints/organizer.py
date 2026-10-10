@@ -75,6 +75,7 @@ class TournamentCreatePayload(BaseModel):
     tournament_type: Optional[str] = "Single Elimination"
     match_format: Optional[str] = "Best of 1"
     banner_url: Optional[str] = None
+    hero_banner_url: Optional[str] = None
     banner_tablet_url: Optional[str] = None
     banner_mobile_url: Optional[str] = None
     logo_url: Optional[str] = None
@@ -102,6 +103,7 @@ class TournamentUpdatePayload(BaseModel):
     tournament_type: Optional[str] = None
     match_format: Optional[str] = None
     banner_url: Optional[str] = None
+    hero_banner_url: Optional[str] = None
     banner_tablet_url: Optional[str] = None
     banner_mobile_url: Optional[str] = None
     logo_url: Optional[str] = None
@@ -166,6 +168,7 @@ def serialize_tournament_response(t: dict, game_obj: Optional[dict], reg_count: 
         tournament_type=t.get("tournament_type", "Single Elimination"),
         match_format=t.get("match_format", "Best of 1"),
         banner_url=t.get("banner_url", ""),
+        hero_banner_url=t.get("hero_banner_url"),
         banner_tablet_url=t.get("banner_tablet_url"),
         banner_mobile_url=t.get("banner_mobile_url"),
         logo_url=t.get("logo_url"),
@@ -225,6 +228,7 @@ async def create_tournament(
         tournament_type=payload.tournament_type or "Single Elimination",
         match_format=payload.match_format or "Best of 1",
         banner_url=banner,
+        hero_banner_url=payload.hero_banner_url,
         banner_tablet_url=banner_tablet,
         banner_mobile_url=banner_mobile,
         logo_url=logo,
@@ -285,6 +289,8 @@ async def update_tournament(
         update_fields["match_format"] = payload.match_format
     if payload.banner_url is not None:
         update_fields["banner_url"] = payload.banner_url
+    if payload.hero_banner_url is not None:
+        update_fields["hero_banner_url"] = payload.hero_banner_url
     if payload.banner_tablet_url is not None:
         update_fields["banner_tablet_url"] = payload.banner_tablet_url
     if payload.banner_mobile_url is not None:

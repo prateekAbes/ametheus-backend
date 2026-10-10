@@ -190,3 +190,71 @@ async def test_auth_sync_preserves_custom_uploaded_avatar(client, mock_db, monke
     # Also verify MongoDB record directly
     db_user = await mock_db.users.find_one({"clerk_user_id": "user_clerk_999"})
     assert db_user["avatar_url"] == "/api/v1/media/img_custom_avatar_123"
+
+@pytest.mark.asyncio
+async def test_game_poster_and_tournament_hero_banner_persistence(client, mock_db):
+    """Verify that Game.poster_url and Tournament.hero_banner_url are properly created, updated, and retrieved."""
+    # 1. Create a game with poster_url
+    game_create_payload = {
+        "slug": "apex-legends",
+        "name": "Apex Legends",
+        "category": "battle-royale",
+        "platform": "PC / Console",
+        "tag": "APEX",
+        "is_team_game": True,
+        "min_team_size": 3,
+        "max_team_size": 3,
+        "poster_url": "/api/v1/media/img_apex_poster",
+        "banner_url": "/api/v1/media/img_apex_banner",
+        "logo_url": "/api/v1/media/img_apex_logo",
+        "description": "Battle royale shooter",
+    }
+    g_resp = await client.post("/api/v1/games", json=game_create_payload)
+    assert g_resp.status_code == 201
+    g_data = g_resp.json()
+    assert g_data["poster_url"] == "/api/v1/media/img_apex_poster"
+
+    # Get game by slug
+    g_get = await client.get("/api/v1/games/apex-legends")
+    assert g_get.status_code == 200
+    assert g_get.json()["poster_url"] == "/api/v1/media/img_apex_poster"
+
+    # Update game poster_url
+    g_update = await client.put("/api/v1/games/apex-legends", json={"poster_url": "/api/v1/media/img_apex_poster_updated"})
+    assert g_update.status_code == 200
+    assert g_update.json()["poster_url"] == "/api/v1/media/img_apex_poster_updated"
+
+    # 2. Create tournament with hero_banner_url
+    tourn_create_payload = {
+        "game_id": g_data["id"],
+        "title": "Apex Champions Cup",
+        "starts_at": "2026-12-01T18:00:00Z",
+        "roster_lock_time": "2026-12-01T17:00:00Z",
+        "banner_url": "/api/v1/media/img_apex_tourn_card",
+        "hero_banner_url": "/api/v1/media/img_apex_tourn_hero",
+        "description": "Championship cup",
+    }
+    t_resp = await client.post("/api/v1/organizer/tournaments", json=tourn_create_payload)
+    assert t_resp.status_code == 201
+    t_data = t_resp.json()
+    assert t_data["banner_url"] == "/api/v1/media/img_apex_tourn_card"
+    assert t_data["hero_banner_url"] == "/api/v1/media/img_apex_tourn_hero"
+
+    # Fetch tournament list and detail
+    t_list_resp = await client.get("/api/v1/tournaments?status=COMING_SOON")
+    assert t_list_resp.status_code == 200
+    found_t = next((x for x in t_list_resp.json() if x["id"] == t_data["id"]), None)
+    assert found_t is not None
+    assert found_t["hero_banner_url"] == "/api/v1/media/img_apex_tourn_hero"
+
+    t_detail_resp = await client.get(f"/api/v1/tournaments/{t_data['slug']}")
+    assert t_detail_resp.status_code == 200
+    assert t_detail_resp.json()["hero_banner_url"] == "/api/v1/media/img_apex_tourn_hero"
+
+    # Update tournament hero_banner_url via organizer
+    t_update_resp = await client.put(
+        f"/api/v1/organizer/tournaments/{t_data['id']}",
+        json={"hero_banner_url": "/api/v1/media/img_apex_tourn_hero_v2"}
+    )
+    assert t_update_resp.status_code == 200
+    assert t_update_resp.json()["hero_banner_url"] == "/api/v1/media/img_apex_tourn_hero_v2"
