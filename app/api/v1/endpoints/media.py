@@ -117,7 +117,7 @@ async def upload_media_base64(
 
     return await _save_media(content, filename, content_type, db)
 
-@router.get("/{media_id}")
+@router.api_route("/{media_id}", methods=["GET", "HEAD"])
 async def get_media_file(
     media_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db),

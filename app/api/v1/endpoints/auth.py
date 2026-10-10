@@ -145,9 +145,19 @@ async def sync_clerk_user(
     now = get_utc_now()
 
     if user_by_clerk and user_by_email and str(user_by_clerk["_id"]) != str(user_by_email["_id"]):
-        # Merge duplicate accounts: keep the pre-existing email record, remove the orphaned auto-provisioned placeholder
+        # Merge duplicate accounts: preserve custom uploaded avatar and profile data
+        merge_updates = {}
+        for k in ["avatar_url", "display_name", "username", "username_lower", "has_chosen_username", "riot_id", "steam_id", "preferences", "privacy_settings"]:
+            val = user_by_clerk.get(k)
+            if val is not None and not user_by_email.get(k):
+                merge_updates[k] = val
+            elif val is not None and k == "avatar_url" and (str(val).startswith("/api/v1/media/") or str(val).startswith("http")):
+                merge_updates[k] = val
+        merge_updates["clerk_user_id"] = payload.clerk_user_id
+        if merge_updates:
+            await db.users.update_one({"_id": user_by_email["_id"]}, {"$set": merge_updates})
         await db.users.delete_one({"_id": user_by_clerk["_id"]})
-        user_doc = user_by_email
+        user_doc = await db.users.find_one({"_id": user_by_email["_id"]})
     else:
         user_doc = user_by_clerk or user_by_email
 
@@ -162,8 +172,10 @@ async def sync_clerk_user(
         # Only populate display_name if not already present in the user's database record
         if not user_doc.get("display_name") and payload.display_name:
             update_fields["display_name"] = payload.display_name.strip()
-        # Only populate avatar_url if not already present in the user's database record
+        # Only populate avatar_url if not already present or if incoming is an explicitly uploaded media path
         if not user_doc.get("avatar_url") and payload.avatar_url:
+            update_fields["avatar_url"] = payload.avatar_url.strip()
+        elif payload.avatar_url and str(payload.avatar_url).startswith("/api/v1/media/"):
             update_fields["avatar_url"] = payload.avatar_url.strip()
         # Enforce authoritative role
         if is_super_admin:
