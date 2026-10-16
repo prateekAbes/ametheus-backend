@@ -38,6 +38,56 @@ class Base64UploadPayload(BaseModel):
     data_url: str
     filename: Optional[str] = "upload.png"
 
+def _detect_file_type(content: bytes, filename: str, reported_mime: Optional[str] = None) -> tuple[str, str]:
+    """
+    Authoritatively sniffs binary magic bytes and filename extension.
+    Ensures valid JPEG, PNG, WebP, GIF, and SVG files are recognized even if client MIME is
+    missing, generic (application/octet-stream), or non-standard (e.g. image/jpg, image/pjpeg).
+    Returns (normalized_content_type, canonical_extension).
+    """
+    # 1. JPEG magic bytes: starts with \xff\xd8
+    if len(content) >= 3 and content.startswith(b"\xff\xd8"):
+        return "image/jpeg", ".jpg"
+
+    # 2. PNG magic bytes: \x89PNG\r\n\x1a\n
+    if len(content) >= 8 and content.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png", ".png"
+
+    # 3. WebP magic bytes: RIFF....WEBP
+    if len(content) >= 12 and content.startswith(b"RIFF") and content[8:12] == b"WEBP":
+        return "image/webp", ".webp"
+
+    # 4. GIF magic bytes: GIF87a or GIF89a
+    if len(content) >= 6 and content[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif", ".gif"
+
+    # 5. SVG vector: text check
+    stripped = content[:1024].lstrip()
+    if stripped.startswith(b"<svg") or (b"<?xml" in stripped[:100] and b"<svg" in content[:2048]):
+        return "image/svg+xml", ".svg"
+
+    # 6. Fallback to reported MIME if valid image and filename matches
+    lower_mime = (reported_mime or "").lower().split(";")[0].strip()
+    lower_fn = filename.lower()
+    if lower_mime in ("image/jpeg", "image/jpg", "image/pjpeg") or lower_fn.endswith((".jpg", ".jpeg")):
+        if content.startswith(b"\xff\xd8"):
+            return "image/jpeg", ".jpg"
+    if lower_mime == "image/png" or lower_fn.endswith(".png"):
+        if content.startswith(b"\x89PNG"):
+            return "image/png", ".png"
+    if lower_mime == "image/webp" or lower_fn.endswith(".webp"):
+        if b"WEBP" in content[:16]:
+            return "image/webp", ".webp"
+    if lower_mime == "image/gif" or lower_fn.endswith(".gif"):
+        if content[:3] == b"GIF":
+            return "image/gif", ".gif"
+    if lower_mime in ("image/svg+xml", "image/svg") or lower_fn.endswith(".svg"):
+        if b"<svg" in content[:2048]:
+            return "image/svg+xml", ".svg"
+
+    # Unrecognized / corrupted
+    return "application/octet-stream", ""
+
 def _extract_dimensions(content: bytes, content_type: str):
     """Extract width and height from binary headers without external dependencies."""
     try:
@@ -46,20 +96,58 @@ def _extract_dimensions(content: bytes, content_type: str):
         if content.startswith(b"\x89PNG\r\n\x1a\n") and len(content) >= 24:
             w, h = struct.unpack(">II", content[16:24])
             return w, h
+
         # GIF
         if content[:6] in (b"GIF87a", b"GIF89a") and len(content) >= 10:
             w, h = struct.unpack("<HH", content[6:10])
             return w, h
-        # JPEG basic SOF0 / SOF2 markers
+
+        # JPEG: Walk markers by segment length to avoid false positives and support progressive SOF2
         if content.startswith(b"\xff\xd8"):
             idx = 2
             length = len(content)
-            while idx < length - 9:
-                if content[idx] == 0xFF and content[idx + 1] in (0xC0, 0xC1, 0xC2, 0xC3):
-                    h, w = struct.unpack(">HH", content[idx + 5 : idx + 9])
-                    return w, h
-                # Skip marker segment
+            sof_markers = {
+                0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+                0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF,
+            }
+            while idx < length - 4:
+                if content[idx] != 0xFF:
+                    idx += 1
+                    continue
+                while idx < length and content[idx] == 0xFF:
+                    idx += 1
+                if idx >= length:
+                    break
+                marker = content[idx]
                 idx += 1
+                if marker in (0xD8, 0xD9, 0x01) or (0xD0 <= marker <= 0xD7):
+                    continue
+                if idx + 2 > length:
+                    break
+                seg_len = struct.unpack(">H", content[idx : idx + 2])[0]
+                if marker in sof_markers and idx + 7 <= length:
+                    h, w = struct.unpack(">HH", content[idx + 3 : idx + 7])
+                    return w, h
+                idx += seg_len
+
+        # WebP
+        if len(content) >= 30 and content.startswith(b"RIFF") and content[8:12] == b"WEBP":
+            chunk_type = content[12:16]
+            if chunk_type == b"VP8 " and len(content) >= 30:
+                if content[23:26] == b"\x9d\x01\x2a":
+                    w = struct.unpack("<H", content[26:28])[0] & 0x3FFF
+                    h = struct.unpack("<H", content[28:30])[0] & 0x3FFF
+                    return w, h
+            elif chunk_type == b"VP8L" and len(content) >= 25:
+                if content[20] == 0x2F:
+                    b0, b1, b2, b3 = content[21:25]
+                    w = 1 + (((b1 & 0x3F) << 8) | b0)
+                    h = 1 + (((b3 & 0x0F) << 10) | (b2 << 2) | ((b1 & 0xC0) >> 6))
+                    return w, h
+            elif chunk_type == b"VP8X" and len(content) >= 30:
+                w = 1 + struct.unpack("<I", content[24:27] + b"\x00")[0]
+                h = 1 + struct.unpack("<I", content[27:30] + b"\x00")[0]
+                return w, h
     except Exception:
         pass
     return None, None
@@ -178,22 +266,30 @@ async def _save_media(
     entity_id: Optional[str] = None,
     artwork_role: Optional[str] = None,
 ):
-    content_type = (content_type or "image/png").lower().split(";")[0].strip()
     if len(content) > MAX_FILE_SIZE:
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail="File size exceeds maximum limit of 20MB",
+            detail=f"File size ({len(content) / (1024*1024):.1f}MB) exceeds maximum limit of 20MB",
         )
 
-    if content_type not in ALLOWED_TYPES and not content_type.startswith("image/"):
+    # Detect authoritative content_type and canonical extension via magic bytes
+    auth_content_type, ext = _detect_file_type(content, filename, content_type)
+    if auth_content_type == "application/octet-stream" or auth_content_type not in ALLOWED_TYPES:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Unsupported file type: {content_type}. Allowed: PNG, JPEG, WEBP, GIF, SVG",
+            detail=f"Unsupported or corrupted file. Allowed formats: PNG, JPEG (.jpg/.jpeg), WEBP, GIF, SVG.",
         )
 
-    if content_type == "image/svg+xml" or filename.lower().endswith(".svg"):
+    content_type = auth_content_type
+
+    if content_type == "image/svg+xml":
         content = sanitize_svg(content)
-        content_type = "image/svg+xml"
+
+    # Ensure filename has appropriate extension if missing or non-matching
+    clean_filename = filename or f"upload{ext}"
+    lower_fn = clean_filename.lower()
+    if not any(lower_fn.endswith(e) for e in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg")):
+        clean_filename = f"{clean_filename}{ext}"
 
     w, h = _extract_dimensions(content, content_type)
     media_id = f"img_{uuid.uuid4().hex[:14]}"
@@ -203,7 +299,7 @@ async def _save_media(
     doc = {
         "id": media_id,
         "_id": media_id,
-        "filename": filename,
+        "filename": clean_filename,
         "content_type": content_type,
         "size": len(content),
         "width": w,
@@ -222,7 +318,7 @@ async def _save_media(
         "id": media_id,
         "url": f"/api/v1/media/{media_id}",
         "data_url": data_url_str,
-        "filename": filename,
+        "filename": clean_filename,
         "size": len(content),
         "width": w,
         "height": h,
@@ -420,5 +516,8 @@ async def get_media_file(
         headers={
             "Cache-Control": "public, max-age=31536000, immutable",
             "Content-Disposition": f'inline; filename="{doc.get("filename", "image.png")}"',
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
         },
     )
