@@ -37,21 +37,6 @@ async def _safe_send_notification_email(
     try:
         from app.services.email_service import send_notification_email
 
-        # Mark in-flight in sent_email_notifications
-        await db.sent_email_notifications.update_one(
-            {"event_hash": event_hash},
-            {
-                "$setOnInsert": {
-                    "event_hash": event_hash,
-                    "recipient": u_email,
-                    "title": title,
-                    "created_at": datetime.now(timezone.utc).isoformat(),
-                    "status": "PROCESSING",
-                }
-            },
-            upsert=True,
-        )
-
         ok, err = await send_notification_email(
             recipient=u_email,
             user_name=u_name,
@@ -167,14 +152,28 @@ async def create_notification(
         try:
             # Generate deterministic idempotency hash to prevent duplicate emails
             event_hash = hashlib.sha256(f"{user_id}:{final_title}:{message}".encode("utf-8")).hexdigest()
-            already_sent = await db.sent_email_notifications.find_one({"event_hash": event_hash})
-            if not already_sent:
-                if not user:
-                    user = await db.users.find_one({"$or": [{"_id": user_id}, {"id": user_id}]})
-                if user and user.get("email"):
-                    u_email = str(user["email"]).strip().lower()
-                    u_name = user.get("display_name") or user.get("username") or "Contender"
-                    # Fire non-blocking background task so website notification / API never waits on SMTP
+            if not user:
+                user = await db.users.find_one({"$or": [{"_id": user_id}, {"id": user_id}]})
+            if user and user.get("email"):
+                u_email = str(user["email"]).strip().lower()
+                u_name = user.get("display_name") or user.get("username") or "Contender"
+
+                # Atomically claim email delivery attempt via upsert
+                claim_res = await db.sent_email_notifications.update_one(
+                    {"event_hash": event_hash},
+                    {
+                        "$setOnInsert": {
+                            "event_hash": event_hash,
+                            "recipient": u_email,
+                            "title": final_title,
+                            "created_at": datetime.now(timezone.utc).isoformat(),
+                            "status": "PROCESSING",
+                        }
+                    },
+                    upsert=True,
+                )
+                if claim_res.upserted_id is not None:
+                    # Won the atomic claim, dispatch non-blocking background task
                     asyncio.create_task(
                         _safe_send_notification_email(
                             db=db,
@@ -187,6 +186,8 @@ async def create_notification(
                             notification_type=c_type or n_type,
                         )
                     )
+                else:
+                    logger.info(f"[Email Deduplication] Suppressed duplicate email dispatch for event_hash: {event_hash}")
         except Exception as e:
             logger.warning(f"[Ametheus Notification] Email trigger failed silently: {e}")
 
@@ -248,21 +249,39 @@ async def ensure_welcome_notification(
 ) -> Optional[Notification]:
     """
     Ensures that a user receives the official Welcome Notification exactly once upon joining.
-    Checks whether a welcome notification has already been created for the user.
-    If not, creates it reliably as an unread notification with link to /tournaments.
+    Atomic claim on the user's account prevents duplicate notifications and welcome emails
+    across logins, re-syncs, and concurrent requests.
     Execution is strictly isolated from SMTP failures.
     """
     if not user_id:
         return None
 
     try:
-        # Check if already issued
+        # Check if already issued in notifications collection
         existing = await db.notifications.find_one({
             "user_id": user_id,
             "title": {"$in": [WELCOME_NOTIFICATION_TITLE, "Welcome to AMETHEUS"]},
         })
         if existing:
             return Notification.from_mongo(existing)
+
+        # Atomic claim on the user's document
+        claim = await db.users.update_one(
+            {
+                "$or": [{"_id": user_id}, {"id": user_id}, {"clerk_user_id": user_id}],
+                "welcome_notification_sent": {"$ne": True},
+            },
+            {"$set": {"welcome_notification_sent": True}},
+        )
+        if claim.modified_count == 0:
+            # Another concurrent request already claimed the welcome notification
+            existing = await db.notifications.find_one({
+                "user_id": user_id,
+                "title": {"$in": [WELCOME_NOTIFICATION_TITLE, "Welcome to AMETHEUS"]},
+            })
+            if existing:
+                return Notification.from_mongo(existing)
+            return None
 
         return await create_notification(
             db=db,
@@ -271,6 +290,7 @@ async def ensure_welcome_notification(
             message=WELCOME_NOTIFICATION_MESSAGE,
             notification_type="SYSTEM",
             link="/tournaments",
+            send_email_copy=True,
         )
     except Exception as e:
         logger.warning(f"[Ametheus Notification] ensure_welcome_notification failed safely: {e}")

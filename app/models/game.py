@@ -36,6 +36,7 @@ class Game(BaseModel):
     hero_media_type: str = "gif"
     hero_media_enabled: bool = True
     gallery: List[Dict[str, Any]] = Field(default_factory=list)
+    media_config: Dict[str, Any] = Field(default_factory=dict)
     is_dummy: bool = False
     created_at: datetime = Field(default_factory=get_utc_now)
     updated_at: datetime = Field(default_factory=get_utc_now)

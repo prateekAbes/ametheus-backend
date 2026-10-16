@@ -85,10 +85,22 @@ def build_archive_query(section: str, payload: ArchiveFilterRequest, for_active:
     If for_active=False, targets archived records.
     """
     query: Dict[str, Any] = {}
-    if for_active:
-        query["is_archived"] = {"$ne": True}
+    if section == "support_tickets":
+        if for_active:
+            query["is_archived"] = {"$nin": [True, "true", "True"]}
+            query["status"] = {"$ne": "ARCHIVED"}
+        else:
+            query["$or"] = [
+                {"is_archived": True},
+                {"is_archived": "true"},
+                {"is_archived": "True"},
+                {"status": "ARCHIVED"},
+            ]
     else:
-        query["is_archived"] = True
+        if for_active:
+            query["is_archived"] = {"$ne": True}
+        else:
+            query["is_archived"] = True
 
     # Exclude synthetic dummy records
     query["is_dummy"] = {"$ne": True}
@@ -351,7 +363,7 @@ async def unarchive_record(
         "unarchived_at": now_iso,
         "unarchived_by": admin_username,
     }
-    if section == "support_tickets" and existing.get("status") == "ARCHIVED":
+    if section == "support_tickets" and str(existing.get("status", "")).upper() == "ARCHIVED":
         update_set["status"] = "RESOLVED" if existing.get("resolved_at") else "OPEN"
 
     res = await db[cfg["collection"]].update_one(
@@ -401,8 +413,26 @@ async def unarchive_bulk_records(
     if not id_clauses:
         return 0
 
+    target_match: Dict[str, Any] = {}
+    if section == "support_tickets":
+        target_match = {
+            "$and": [
+                {"$or": id_clauses},
+                {
+                    "$or": [
+                        {"is_archived": True},
+                        {"is_archived": "true"},
+                        {"is_archived": "True"},
+                        {"status": "ARCHIVED"},
+                    ]
+                },
+            ]
+        }
+    else:
+        target_match = {"$or": id_clauses, "is_archived": True}
+
     res = await db[cfg["collection"]].update_many(
-        {"$or": id_clauses, "is_archived": True},
+        target_match,
         {
             "$set": {
                 "is_archived": False,

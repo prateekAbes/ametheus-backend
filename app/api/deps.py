@@ -188,13 +188,6 @@ async def get_current_user(
         user.role = "ORGANIZER"
         await db.users.update_one({"_id": user_doc["_id"]}, {"$set": {"role": "ORGANIZER"}})
 
-    # Guarantee welcome notification exists for any newly provisioned or existing user lacking it
-    try:
-        from app.services.notification import ensure_welcome_notification
-        await ensure_welcome_notification(db=db, user_id=user.id)
-    except Exception:
-        pass
-
     return user
 
 async def get_current_user_optional(

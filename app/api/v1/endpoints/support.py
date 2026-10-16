@@ -114,7 +114,14 @@ def _clean_ticket_doc(doc: dict) -> dict:
         item["_id"] = str(item["_id"])
     if not item.get("ticket_id"):
         item["ticket_id"] = item["id"]
-    item["is_archived"] = bool(item.get("is_archived", False))
+    raw_archived = item.get("is_archived")
+    raw_status = str(item.get("status", "OPEN")).strip().upper().replace(" ", "_")
+    is_arch = bool(
+        raw_archived is True
+        or str(raw_archived).strip().lower() in ("true", "1")
+        or raw_status == "ARCHIVED"
+    )
+    item["is_archived"] = is_arch
     item["archived_at"] = str(item.get("archived_at")) if item.get("archived_at") else None
     item["archived_by"] = item.get("archived_by")
     item["archive_reason"] = item.get("archive_reason")
@@ -122,8 +129,13 @@ def _clean_ticket_doc(doc: dict) -> dict:
     item["last_message_at"] = item.get("last_message_at")
     item["last_message_by"] = item.get("last_message_by")
 
+    now_iso = datetime.now(timezone.utc).isoformat()
+    raw_created = item.get("created_at")
+    raw_updated = item.get("updated_at")
+    item["created_at"] = raw_created.isoformat() if hasattr(raw_created, "isoformat") else str(raw_created or now_iso)
+    item["updated_at"] = raw_updated.isoformat() if hasattr(raw_updated, "isoformat") else str(raw_updated or item["created_at"])
+
     # Strict normalization to the standard support ticket statuses
-    raw_status = str(item.get("status", "OPEN")).strip().upper().replace(" ", "_")
     if raw_status in ("NEW", "UNREAD"):
         raw_status = "OPEN"
     elif raw_status == "ON_HOLD":
@@ -467,9 +479,15 @@ async def list_support_tickets(
     """Admin endpoint to retrieve and search support tickets with status and category filtering."""
     query: dict = {}
     if is_archived:
-        query["is_archived"] = True
+        query["$or"] = [
+            {"is_archived": True},
+            {"is_archived": "true"},
+            {"is_archived": "True"},
+            {"status": "ARCHIVED"},
+        ]
     else:
-        query["is_archived"] = {"$ne": True}
+        query["is_archived"] = {"$nin": [True, "true", "True"]}
+        query["status"] = {"$ne": "ARCHIVED"}
 
     if status_filter and status_filter.upper() != "ALL":
         st = status_filter.upper()
@@ -505,8 +523,20 @@ async def get_support_ticket_counts(
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """Returns real-time totals of active (non-archived) vs archived support tickets."""
-    active_count = await db.support_tickets.count_documents({"is_archived": {"$ne": True}, "is_dummy": {"$ne": True}})
-    archived_count = await db.support_tickets.count_documents({"is_archived": True, "is_dummy": {"$ne": True}})
+    active_count = await db.support_tickets.count_documents({
+        "is_archived": {"$nin": [True, "true", "True"]},
+        "status": {"$ne": "ARCHIVED"},
+        "is_dummy": {"$ne": True},
+    })
+    archived_count = await db.support_tickets.count_documents({
+        "$or": [
+            {"is_archived": True},
+            {"is_archived": "true"},
+            {"is_archived": "True"},
+            {"status": "ARCHIVED"},
+        ],
+        "is_dummy": {"$ne": True},
+    })
     return {
         "active": active_count,
         "archived": archived_count,
@@ -695,7 +725,22 @@ async def get_users_with_support_tickets(
     User-centric 1st-level organization:
     Groups all tickets by user, reporting ticket counts, active statuses, and latest ticket activity.
     """
-    match_query: dict = {"is_archived": True if is_archived else {"$ne": True}}
+    if is_archived:
+        match_query = {
+            "$or": [
+                {"is_archived": True},
+                {"is_archived": "true"},
+                {"is_archived": "True"},
+                {"status": "ARCHIVED"},
+            ],
+            "is_dummy": {"$ne": True},
+        }
+    else:
+        match_query = {
+            "is_archived": {"$nin": [True, "true", "True"]},
+            "status": {"$ne": "ARCHIVED"},
+            "is_dummy": {"$ne": True},
+        }
     if search:
         search_rgx = {"$regex": re.escape(search.strip()), "$options": "i"}
         match_query["$or"] = [

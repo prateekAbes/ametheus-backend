@@ -193,6 +193,7 @@ async def list_tournaments(
                 bracket_rounds=bracket,
                 registered_rosters=[],
                 is_featured=bool(t.get("is_featured", False)),
+                media_config=t.get("media_config", {}),
             )
         )
     return response
@@ -529,6 +530,7 @@ async def get_tournament_by_slug(slug: str, db: AsyncIOMotorDatabase = Depends(g
         bracket_rounds=bracket,
         registered_rosters=registered_rosters,
         is_featured=bool(t.get("is_featured", False)),
+        media_config=t.get("media_config", {}),
     )
 
 @router.get("/{slug}/matches", response_model=List[MatchResponse])

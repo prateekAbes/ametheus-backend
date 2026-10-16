@@ -1,5 +1,5 @@
 import json
-from typing import Optional, List, Any
+from typing import Optional, List, Any, Dict
 from datetime import datetime
 from pydantic import BaseModel, Field
 from app.models.base import generate_uuid, get_utc_now
@@ -116,6 +116,7 @@ class Tournament(BaseModel):
     logo_url: Optional[str] = None
     badge_color: str = "#E56A10"
     description: str = ""
+    media_config: Dict[str, Any] = Field(default_factory=dict)
     rules: List[Any] = Field(default_factory=list)
     schedule: List[Any] = Field(default_factory=list)
     prizes: List[Any] = Field(default_factory=list)

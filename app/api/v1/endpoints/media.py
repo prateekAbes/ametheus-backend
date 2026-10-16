@@ -82,6 +82,41 @@ async def _save_media(content: bytes, filename: str, content_type: str, db: Asyn
         "content_type": content_type,
     }
 
+@router.get("")
+async def list_media_files(
+    search: Optional[str] = None,
+    limit: int = 50,
+    skip: int = 0,
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    List uploaded media files with metadata (excluding bulky base64 payloads).
+    Enables media reuse across any game, tournament, or homepage placement.
+    """
+    import re
+    query = {}
+    if search and search.strip():
+        query["filename"] = {"$regex": re.escape(search.strip()), "$options": "i"}
+
+    total = await db.media.count_documents(query)
+    cursor = db.media.find(query, {"data": 0}).sort("created_at", -1).skip(skip).limit(min(limit, 100))
+    docs = await cursor.to_list(length=limit)
+
+    items = []
+    for d in docs:
+        mid = str(d.get("_id", d.get("id")))
+        items.append({
+            "id": mid,
+            "url": f"/api/v1/media/{mid}",
+            "filename": d.get("filename", "image.png"),
+            "content_type": d.get("content_type", "image/png"),
+            "size": d.get("size", 0),
+            "created_at": d.get("created_at"),
+        })
+
+    return {"items": items, "total": total, "skip": skip, "limit": limit}
+
+
 @router.post("/upload")
 async def upload_media_file(
     file: UploadFile = File(...),

@@ -79,6 +79,7 @@ class TournamentCreatePayload(BaseModel):
     banner_tablet_url: Optional[str] = None
     banner_mobile_url: Optional[str] = None
     logo_url: Optional[str] = None
+    media_config: Optional[Dict[str, Any]] = None
     description: str
     rules: List[str] = []
     schedule: List[Dict[str, Any]] = []
@@ -107,6 +108,7 @@ class TournamentUpdatePayload(BaseModel):
     banner_tablet_url: Optional[str] = None
     banner_mobile_url: Optional[str] = None
     logo_url: Optional[str] = None
+    media_config: Optional[Dict[str, Any]] = None
     description: Optional[str] = None
     rules: Optional[List[str]] = None
     schedule: Optional[List[Dict[str, Any]]] = None
@@ -179,6 +181,7 @@ def serialize_tournament_response(t: dict, game_obj: Optional[dict], reg_count: 
         prizes=prizes,
         bracket_rounds=bracket,
         registered_rosters=[],
+        media_config=t.get("media_config", {}),
     )
 
 @router.post("/tournaments", response_model=TournamentResponse, status_code=status.HTTP_201_CREATED)
@@ -239,6 +242,8 @@ async def create_tournament(
         prizes=prizes,
         bracket_rounds=[],
     )
+    if payload.media_config is not None:
+        tourn.media_config = payload.media_config
     tourn_doc = tourn.to_mongo()
     await db.tournaments.insert_one(tourn_doc)
 
@@ -297,6 +302,16 @@ async def update_tournament(
         update_fields["banner_mobile_url"] = payload.banner_mobile_url
     if payload.logo_url is not None:
         update_fields["logo_url"] = payload.logo_url
+    if payload.media_config is not None:
+        update_fields["media_config"] = payload.media_config
+        if isinstance(payload.media_config, dict):
+            mc = payload.media_config
+            if "card" in mc and isinstance(mc["card"], dict) and mc["card"].get("asset_url"):
+                update_fields["banner_url"] = mc["card"]["asset_url"]
+            if "hero" in mc and isinstance(mc["hero"], dict) and mc["hero"].get("asset_url"):
+                update_fields["hero_banner_url"] = mc["hero"]["asset_url"]
+            if "logo" in mc and isinstance(mc["logo"], dict) and mc["logo"].get("asset_url"):
+                update_fields["logo_url"] = mc["logo"]["asset_url"]
     if payload.description is not None:
         update_fields["description"] = payload.description
     if payload.rules is not None:

@@ -21,9 +21,12 @@ from app.api.v1.endpoints import (
     organizer_communications,
     webhooks,
     crests,
+    placements,
 )
 
 api_router = APIRouter()
+api_router.include_router(placements.router, prefix="/placements", tags=["Site & Page Image Placements"])
+
 api_router.include_router(crests.router, prefix="/crests", tags=["Player Crests"])
 api_router.include_router(crests.admin_router, prefix="/admin/crests", tags=["Admin Player Crests"])
 api_router.include_router(organizer_communications.organizer_comm_router, prefix="/organizer", tags=["Organizer Communications"])

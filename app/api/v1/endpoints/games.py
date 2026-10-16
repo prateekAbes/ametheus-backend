@@ -374,6 +374,7 @@ def serialize_game_doc(g: dict, teams_count: int = 0) -> GameResponse:
         teams_count=teams_count,
         genre_id=g.get("genre_id"),
         genre_name=g.get("genre_name"),
+        media_config=g.get("media_config", {}),
     )
 
 @router.get("", response_model=List[GameResponse])
@@ -508,6 +509,15 @@ async def update_game(
             genre_doc = await db.genres.find_one({"$or": [{"_id": update_data["genre_id"]}, {"id": update_data["genre_id"]}, {"slug": update_data["genre_id"]}]})
             if genre_doc:
                 update_data["genre_name"] = genre_doc.get("name")
+    if "media_config" in update_data and isinstance(update_data["media_config"], dict):
+        mc = update_data["media_config"]
+        if "catalog_card" in mc and isinstance(mc["catalog_card"], dict) and mc["catalog_card"].get("asset_url"):
+            update_data["poster_url"] = mc["catalog_card"]["asset_url"]
+        if "banner" in mc and isinstance(mc["banner"], dict) and mc["banner"].get("asset_url"):
+            update_data["banner_url"] = mc["banner"]["asset_url"]
+        if "logo" in mc and isinstance(mc["logo"], dict) and mc["logo"].get("asset_url"):
+            update_data["logo_url"] = mc["logo"]["asset_url"]
+
     if update_data:
         await db.games.update_one({"_id": game["_id"]}, {"$set": update_data})
 

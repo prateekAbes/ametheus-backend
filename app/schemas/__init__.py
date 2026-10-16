@@ -88,6 +88,7 @@ class GameResponse(BaseModel):
     hero_media_type: Optional[str] = "gif"
     hero_media_enabled: bool = True
     gallery: List[Dict[str, Any]] = []
+    media_config: Optional[Dict[str, Any]] = None
     teams_count: int = 0
     model_config = ConfigDict(from_attributes=True)
 
@@ -123,6 +124,7 @@ class GameCreate(BaseModel):
     hero_media_type: Optional[str] = "gif"
     hero_media_enabled: Optional[bool] = True
     gallery: Optional[List[Dict[str, Any]]] = None
+    media_config: Optional[Dict[str, Any]] = None
 
 class GameUpdate(BaseModel):
     name: Optional[str] = None
@@ -155,6 +157,7 @@ class GameUpdate(BaseModel):
     hero_media_type: Optional[str] = None
     hero_media_enabled: Optional[bool] = None
     gallery: Optional[List[Dict[str, Any]]] = None
+    media_config: Optional[Dict[str, Any]] = None
 
 # Team
 class TeamMemberResponse(BaseModel):
@@ -382,6 +385,7 @@ class TournamentResponse(BaseModel):
     bracket_rounds: List[Dict[str, Any]] = []
     registered_rosters: List[Dict[str, Any]] = []
     is_featured: Optional[bool] = False
+    media_config: Optional[Dict[str, Any]] = None
     model_config = ConfigDict(from_attributes=True, extra="allow")
 
 class TournamentRegisterRequest(BaseModel):

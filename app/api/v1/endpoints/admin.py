@@ -4434,7 +4434,29 @@ async def list_admin_platform_notifications(
     if is_read is not None:
         query["is_read"] = is_read
     if user_id and user_id.strip():
-        query["user_id"] = user_id.strip()
+        uid_clean = user_id.strip()
+        user_matches = await db.users.find({
+            "$or": [
+                {"_id": uid_clean},
+                {"id": uid_clean},
+                {"clerk_user_id": uid_clean},
+                {"username": uid_clean},
+                {"username_lower": uid_clean.lower()},
+                {"email": uid_clean.lower()},
+            ]
+        }).to_list(length=10)
+        user_ids = {uid_clean}
+        for u in user_matches:
+            if u.get("_id"):
+                user_ids.add(str(u["_id"]))
+            if u.get("id"):
+                user_ids.add(str(u["id"]))
+            if u.get("clerk_user_id"):
+                user_ids.add(str(u["clerk_user_id"]))
+        if len(user_ids) == 1:
+            query["user_id"] = uid_clean
+        else:
+            query["user_id"] = {"$in": list(user_ids)}
     if search and search.strip():
         s = search.strip()
         rgx = {"$regex": re.escape(s), "$options": "i"}
@@ -4450,6 +4472,8 @@ async def list_admin_platform_notifications(
             "id": str(n.get("_id", n.get("id"))),
             "user_id": n.get("user_id"),
             "type": n.get("type", "SYSTEM"),
+            "category": n.get("category") or n.get("type", "SYSTEM"),
+            "label": n.get("label"),
             "title": n.get("title", ""),
             "message": n.get("message", ""),
             "is_read": bool(n.get("is_read", False)),

@@ -146,6 +146,7 @@ async def init_db_indexes(db: AsyncIOMotorDatabase):
         await db.notifications.create_index("user_id")
         await db.notifications.create_index([("user_id", 1), ("is_read", 1)])
         await db.notifications.create_index("is_archived")
+        await db.sent_email_notifications.create_index("event_hash", unique=True)
 
         # Support Tickets & Messages Indexes
         await db.game_payments.create_index("is_archived")
