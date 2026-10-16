@@ -306,12 +306,12 @@ async def update_tournament(
         update_fields["media_config"] = payload.media_config
         if isinstance(payload.media_config, dict):
             mc = payload.media_config
-            if "card" in mc and isinstance(mc["card"], dict) and mc["card"].get("asset_url"):
-                update_fields["banner_url"] = mc["card"]["asset_url"]
-            if "hero" in mc and isinstance(mc["hero"], dict) and mc["hero"].get("asset_url"):
-                update_fields["hero_banner_url"] = mc["hero"]["asset_url"]
-            if "logo" in mc and isinstance(mc["logo"], dict) and mc["logo"].get("asset_url"):
-                update_fields["logo_url"] = mc["logo"]["asset_url"]
+            if "card" in mc and isinstance(mc["card"], dict):
+                update_fields["banner_url"] = mc["card"].get("asset_url") or ""
+            if "hero" in mc and isinstance(mc["hero"], dict):
+                update_fields["hero_banner_url"] = mc["hero"].get("asset_url") or ""
+            if "logo" in mc and isinstance(mc["logo"], dict):
+                update_fields["logo_url"] = mc["logo"].get("asset_url") or ""
     if payload.description is not None:
         update_fields["description"] = payload.description
     if payload.rules is not None:

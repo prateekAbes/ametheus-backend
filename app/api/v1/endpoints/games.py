@@ -328,18 +328,20 @@ def normalize_category_slug(category: Optional[str]) -> str:
     }
     return aliases.get(c, c)
 
-def sanitize_game_images(slug: str, banner: str, logo: str):
-    fb = GAME_FALLBACK_IMAGES.get(slug, {
-        "banner": "https://images.unsplash.com/photo-1542751371-adc38448a05e?q=80&w=1200&auto=format&fit=crop",
-        "logo": "https://images.unsplash.com/photo-1550745165-9bc0b252726f?q=80&w=300&auto=format&fit=crop",
-    })
-    b = banner if (banner and "aida-public" not in banner and "_Banner" not in banner) else fb["banner"]
-    l = logo if (logo and "aida-public" not in logo and "_Logo" not in logo) else fb["logo"]
+def sanitize_game_images(slug: str, banner: Optional[str], logo: Optional[str]):
+    # Never inject fallback images into game responses. Empty artwork must remain empty.
+    b = (banner or "") if (banner and "aida-public" not in banner and "_Banner" not in banner) else ""
+    l = (logo or "") if (logo and "aida-public" not in logo and "_Logo" not in logo) else ""
     return b, l
 
 def serialize_game_doc(g: dict, teams_count: int = 0) -> GameResponse:
     gid = str(g.get("_id", g.get("id")))
-    b_url, l_url = sanitize_game_images(g.get("slug", ""), g.get("banner_url", ""), g.get("logo_url", ""))
+    raw_banner = g.get("banner_url") or ""
+    raw_logo = g.get("logo_url") or ""
+    b_url, l_url = sanitize_game_images(g.get("slug", ""), raw_banner, raw_logo)
+    poster = g.get("poster_url") or ""
+    if "aida-public" in poster:
+        poster = ""
     return GameResponse(
         id=gid,
         slug=g["slug"],
@@ -354,7 +356,7 @@ def serialize_game_doc(g: dict, teams_count: int = 0) -> GameResponse:
         entry_fee_inr=g.get("entry_fee_inr", 0),
         prize_pool_inr=g.get("prize_pool_inr", 0),
         play_url=g.get("play_url"),
-        poster_url=g.get("poster_url"),
+        poster_url=poster,
         banner_url=b_url,
         banner_tablet_url=g.get("banner_tablet_url"),
         banner_mobile_url=g.get("banner_mobile_url"),
@@ -498,9 +500,16 @@ async def update_game(
     if not game:
         raise HTTPException(status_code=404, detail="Game not found")
 
-    update_data = {k: v for k, v in payload.model_dump(exclude_unset=True).items() if v is not None}
-    if "category" in update_data:
+    fields_set = payload.model_fields_set
+    update_data = {}
+
+    for k in fields_set:
+        v = getattr(payload, k)
+        update_data[k] = v
+
+    if "category" in update_data and update_data["category"] is not None:
         update_data["category"] = normalize_category_slug(update_data["category"])
+
     if "genre_id" in update_data:
         if not update_data["genre_id"]:
             update_data["genre_id"] = None
@@ -509,14 +518,29 @@ async def update_game(
             genre_doc = await db.genres.find_one({"$or": [{"_id": update_data["genre_id"]}, {"id": update_data["genre_id"]}, {"slug": update_data["genre_id"]}]})
             if genre_doc:
                 update_data["genre_name"] = genre_doc.get("name")
-    if "media_config" in update_data and isinstance(update_data["media_config"], dict):
-        mc = update_data["media_config"]
-        if "catalog_card" in mc and isinstance(mc["catalog_card"], dict) and mc["catalog_card"].get("asset_url"):
-            update_data["poster_url"] = mc["catalog_card"]["asset_url"]
-        if "banner" in mc and isinstance(mc["banner"], dict) and mc["banner"].get("asset_url"):
-            update_data["banner_url"] = mc["banner"]["asset_url"]
-        if "logo" in mc and isinstance(mc["logo"], dict) and mc["logo"].get("asset_url"):
-            update_data["logo_url"] = mc["logo"]["asset_url"]
+
+    # Sync canonical artwork slots from media_config when provided
+    if "media_config" in fields_set:
+        mc = update_data.get("media_config")
+        if isinstance(mc, dict):
+            # Sync catalog_card / coming_soon_catalog_card asset_url to poster_url
+            if "catalog_card" in mc and isinstance(mc["catalog_card"], dict):
+                update_data["poster_url"] = mc["catalog_card"].get("asset_url") or ""
+            elif "coming_soon_catalog_card" in mc and isinstance(mc["coming_soon_catalog_card"], dict) and (game.get("status") in ["COMING_SOON", "MAINTENANCE"]):
+                update_data["poster_url"] = mc["coming_soon_catalog_card"].get("asset_url") or ""
+
+            # Sync banner asset_url to banner_url
+            if "banner" in mc and isinstance(mc["banner"], dict):
+                update_data["banner_url"] = mc["banner"].get("asset_url") or ""
+
+            # Sync logo asset_url to logo_url
+            if "logo" in mc and isinstance(mc["logo"], dict):
+                update_data["logo_url"] = mc["logo"].get("asset_url") or ""
+
+    # Ensure explicitly set empty/null image fields normalize to empty strings
+    for img_field in ["poster_url", "banner_url", "logo_url", "banner_tablet_url", "banner_mobile_url", "hero_media_url"]:
+        if img_field in fields_set and update_data.get(img_field) is None:
+            update_data[img_field] = ""
 
     if update_data:
         await db.games.update_one({"_id": game["_id"]}, {"$set": update_data})
