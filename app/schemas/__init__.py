@@ -720,6 +720,7 @@ class LeaderboardEntryResponse(BaseModel):
     game_name: Optional[str] = None
     captain: Optional[str] = None
     logo_url: Optional[str] = None
+    avatar_url: Optional[str] = None
     win_rate: Optional[Any] = 0.0
     matches_played: int = 0
     wins: int = 0

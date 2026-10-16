@@ -480,6 +480,9 @@ async def remove_entry_direct(
 async def get_leaderboard(
     category: Optional[str] = Query(None),
     game: Optional[str] = Query(None),
+    metric: Optional[str] = Query(None),
+    platform: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
     limit: Optional[int] = Query(None),
     skip: Optional[int] = Query(None),
     include_disqualified: Optional[bool] = Query(False),
@@ -495,13 +498,37 @@ async def get_leaderboard(
     if category and category != "all":
         cat_doc = await db.leaderboard_categories.find_one({"slug": category})
 
-    sort_metric = cat_doc.get("sort_metric", "rating") if cat_doc else "rating"
-    target_game = cat_doc.get("game_slug", "all") if cat_doc else "all"
-    min_matches = cat_doc.get("min_matches", 0) if cat_doc else 0
+    sort_metric = "rating"
+    if metric:
+        norm_m = metric.lower().strip()
+        if norm_m in ["win_rate", "highest_win_rate"]:
+            sort_metric = "win_rate"
+        elif norm_m in ["wins", "most_match_wins"]:
+            sort_metric = "wins"
+        elif norm_m in ["spending", "highest_spending"]:
+            sort_metric = "spending"
+        elif norm_m in ["earnings", "top_earnings"]:
+            sort_metric = "earnings"
+        else:
+            sort_metric = "rating"
+    elif cat_doc:
+        sort_metric = cat_doc.get("sort_metric", "rating")
+    elif category in ["win_rate", "wins", "spending", "earnings"]:
+        sort_metric = category
 
-    # Explicit game param takes precedence
+    target_game = "all"
     if game and game != "all":
         target_game = game
+    elif cat_doc and cat_doc.get("game_slug") != "all":
+        target_game = cat_doc.get("game_slug", "all")
+
+    target_platform = None
+    if platform and platform != "all":
+        target_platform = platform.lower().strip()
+    elif category in ["pc", "mobile"]:
+        target_platform = category
+
+    min_matches = cat_doc.get("min_matches", 0) if cat_doc else 0
 
     try:
         cursor = db.teams.find({"is_dummy": {"$ne": True}})
@@ -595,6 +622,11 @@ async def get_leaderboard(
             is_disbanded = bool(team.get("is_disbanded", False) or team.get("status") == "DISBANDED")
             team_status = "DISBANDED" if is_disbanded else "ACTIVE"
 
+            cap_avatar = captain.get("avatar_url") if captain else None
+            team_logo = team.get("logo_url")
+            avatar_url = cap_avatar or team_logo or None
+            logo_url = team_logo or cap_avatar or None
+
             entries.append({
                 "rank": idx + 1,
                 "id": team_id,
@@ -604,7 +636,8 @@ async def get_leaderboard(
                 "game_slug": game_slug,
                 "game_name": game_name,
                 "captain": captain_user,
-                "logo_url": team.get("logo_url") or None,
+                "logo_url": logo_url,
+                "avatar_url": avatar_url,
                 "win_rate": win_rate,
                 "matches_played": matches_played,
                 "wins": wins,
@@ -638,6 +671,7 @@ async def get_leaderboard(
                 captain_user = f"@{captain['username']}"
                 if c_name.lower().startswith("player_") or c_name.lower().startswith("user_"):
                     c_name = captain["username"]
+            c_avatar = c.get("avatar_url") or (captain.get("avatar_url") if captain else None) or c.get("logo_url")
             entries.append({
                 "rank": 1,
                 "id": c_id,
@@ -647,7 +681,8 @@ async def get_leaderboard(
                 "game_slug": c.get("game_slug"),
                 "game_name": c.get("game_name"),
                 "captain": captain_user,
-                "logo_url": c.get("logo_url"),
+                "logo_url": c.get("logo_url") or c_avatar,
+                "avatar_url": c_avatar,
                 "win_rate": float(c.get("win_rate", 0.0)),
                 "matches_played": int(c.get("matches_played", 0)),
                 "wins": int(c.get("wins", 0)),
@@ -666,13 +701,23 @@ async def get_leaderboard(
 
     # NOTE: No mock/fallback data augmentation. Empty DB = empty leaderboard.
 
+    # Apply search filter if specified
+    if search:
+        s = search.lower().strip()
+        entries = [
+            e for e in entries
+            if s in e.get("name", "").lower()
+            or s in e.get("tag", "").lower()
+            or s in e.get("captain", "").lower()
+        ]
+
     # Apply game filter if specified
     if target_game and target_game != "all":
         entries = [e for e in entries if e["game_slug"] == target_game]
 
-    # Apply platform category filter (pc / mobile) if category matches
-    if category in ["pc", "mobile"]:
-        entries = [e for e in entries if e["category"] == category]
+    # Apply platform category filter (pc / mobile) if specified
+    if target_platform in ["pc", "mobile"]:
+        entries = [e for e in entries if e.get("category") == target_platform]
 
     # Apply minimum matches filter
     if min_matches > 0:
