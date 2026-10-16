@@ -202,10 +202,10 @@ async def create_tournament(
     existing = await db.tournaments.find_one({"slug": base_slug})
     slug = base_slug if not existing else f"{base_slug}-{organizer.id[:6]}"
 
-    banner = payload.banner_url or game.get("banner_url")
-    banner_tablet = payload.banner_tablet_url or game.get("banner_tablet_url")
-    banner_mobile = payload.banner_mobile_url or game.get("banner_mobile_url")
-    logo = payload.logo_url or game.get("logo_url")
+    banner = payload.banner_url or None
+    banner_tablet = payload.banner_tablet_url or None
+    banner_mobile = payload.banner_mobile_url or None
+    logo = payload.logo_url or None
 
     prizes = payload.prizes if payload.prizes else [{"place": "1st", "amount": f"₹{payload.prize_pool_inr}"}]
 
@@ -230,7 +230,7 @@ async def create_tournament(
         format=payload.format,
         tournament_type=payload.tournament_type or "Single Elimination",
         match_format=payload.match_format or "Best of 1",
-        banner_url=banner,
+        banner_url=banner or "",
         hero_banner_url=payload.hero_banner_url,
         banner_tablet_url=banner_tablet,
         banner_mobile_url=banner_mobile,

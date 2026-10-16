@@ -108,10 +108,10 @@ class GameCreate(BaseModel):
     prize_pool_inr: int = 0
     play_url: Optional[str] = None
     poster_url: Optional[str] = None
-    banner_url: str = "https://images.unsplash.com/photo-1542751371-adc38448a05e"
+    banner_url: Optional[str] = None
     banner_tablet_url: Optional[str] = None
     banner_mobile_url: Optional[str] = None
-    logo_url: str = "https://images.unsplash.com/photo-1542751371-adc38448a05e"
+    logo_url: Optional[str] = None
     description: str = ""
     server_region: str = "AWS Mumbai (ap-south-1)"
     anti_cheat: str = "Standard Protocol"

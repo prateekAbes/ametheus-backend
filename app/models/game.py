@@ -20,10 +20,10 @@ class Game(BaseModel):
     prize_pool_inr: int = 0
     play_url: Optional[str] = None
     poster_url: Optional[str] = None
-    banner_url: str
+    banner_url: Optional[str] = ""
     banner_tablet_url: Optional[str] = None
     banner_mobile_url: Optional[str] = None
-    logo_url: str
+    logo_url: Optional[str] = ""
     description: str = ""
     server_region: str = "AWS Mumbai (ap-south-1)"
     anti_cheat: str = "Hardware TPM 2.0 Vanguard"
