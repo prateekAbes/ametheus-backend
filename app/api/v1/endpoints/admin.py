@@ -922,6 +922,12 @@ class CreateWinningPayoutPayload(BaseModel):
 async def list_admin_payments(
     status_filter: Optional[str] = None,
     game_id: Optional[str] = None,
+    search: Optional[str] = None,
+    payment_type: Optional[str] = None,
+    tournament_id: Optional[str] = None,
+    team_id: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
     is_archived: bool = False,
     admin_user: User = Depends(require_super_admin),
     db: AsyncIOMotorDatabase = Depends(get_db),
@@ -935,19 +941,55 @@ async def list_admin_payments(
     if status_filter and status_filter.upper() != "ALL":
         sf = status_filter.upper()
         if sf == "PENDING":
-            query["status"] = {"$in": ["PENDING", "PENDING_VERIFICATION", "SUBMITTED"]}
+            query["status"] = {"$in": ["PENDING", "PENDING_VERIFICATION", "SUBMITTED", "INITIATED"]}
         else:
             query["status"] = sf
+
+    if payment_type and payment_type.upper() != "ALL":
+        query["payment_type"] = payment_type.upper()
+
+    if tournament_id:
+        query["tournament_id"] = tournament_id
+
+    if team_id:
+        query["team_id"] = team_id
+
     if game_id:
         query["game_id"] = game_id
 
+    if start_date or end_date:
+        date_q = {}
+        if start_date:
+            try:
+                date_q["$gte"] = datetime.fromisoformat(start_date.replace("Z", "+00:00"))
+            except Exception:
+                pass
+        if end_date:
+            try:
+                date_q["$lte"] = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+            except Exception:
+                pass
+        if date_q:
+            query["created_at"] = date_q
+
+    if search and search.strip():
+        s_pat = re.escape(search.strip())
+        query["$or"] = [
+            {"utr": {"$regex": s_pat, "$options": "i"}},
+            {"user_id": {"$regex": s_pat, "$options": "i"}},
+            {"tournament_id": {"$regex": s_pat, "$options": "i"}},
+            {"team_name": {"$regex": s_pat, "$options": "i"}},
+            {"team_id": {"$regex": s_pat, "$options": "i"}},
+            {"id": {"$regex": s_pat, "$options": "i"}},
+        ]
+
     cursor = db.game_payments.find(query).sort("created_at", -1)
-    docs = await cursor.to_list(length=200)
+    docs = await cursor.to_list(length=300)
 
     user_ids = [str(d.get("user_id")) for d in docs if d.get("user_id")]
     u_map = {}
     if user_ids:
-        users = await db.users.find({"$or": [{"_id": {"$in": user_ids}}, {"id": {"$in": user_ids}}, {"clerk_user_id": {"$in": user_ids}}]}).to_list(len(user_ids))
+        users = await db.users.find({"$or": [{"_id": {"$in": user_ids}}, {"id": {"$in": user_ids}}, {"clerk_user_id": {"$in": user_ids}}]}).to_list(len(user_ids) + 10)
         for u in users:
             uid = str(u.get("_id", u.get("id")))
             u_map[uid] = u
@@ -960,6 +1002,12 @@ async def list_admin_payments(
         d["is_archived"] = bool(d.get("is_archived", False))
         if d.get("archived_at") and hasattr(d["archived_at"], "isoformat"):
             d["archived_at"] = d["archived_at"].isoformat()
+        if d.get("created_at") and hasattr(d["created_at"], "isoformat"):
+            d["created_at"] = d["created_at"].isoformat()
+        if d.get("updated_at") and hasattr(d["updated_at"], "isoformat"):
+            d["updated_at"] = d["updated_at"].isoformat()
+        if d.get("verified_at") and hasattr(d["verified_at"], "isoformat"):
+            d["verified_at"] = d["verified_at"].isoformat()
         uid = str(d.get("user_id", ""))
         if uid in u_map:
             u_info = u_map[uid]
@@ -967,6 +1015,8 @@ async def list_admin_payments(
                 d["user_email"] = u_info.get("email")
             if not d.get("user_name"):
                 d["user_name"] = u_info.get("display_name") or u_info.get("username")
+            if not d.get("user_username"):
+                d["user_username"] = u_info.get("username")
     return docs
 
 @router.post("/payments/{payment_id}/approve")
@@ -1055,15 +1105,30 @@ async def approve_payment(
 
     # Notify the user that their payment was approved
     from app.services.notification import create_notification
-    await create_notification(
-        db=db,
-        user_id=payment["user_id"],
-        title="Payment Approved",
-        message=f"Your payment of ₹{payment.get('amount_inr', 0)} for {payment.get('payment_type', 'Platform Service')} has been verified and approved.",
-        notification_type="WALLET",
-        category="WALLET",
-        link="/dashboard",
-    )
+    if payment.get("payment_type") == "TOURNAMENT_ENTRY":
+        actual_tid = payment.get("tournament_id")
+        tourn_doc = await db.tournaments.find_one({"$or": [{"_id": actual_tid}, {"id": actual_tid}, {"slug": actual_tid}]}) if actual_tid else None
+        tourn_title = (tourn_doc.get("title") if tourn_doc else payment.get("game_name")) or "Tournament"
+        tourn_slug = (tourn_doc.get("slug") if tourn_doc else actual_tid) or ""
+        await create_notification(
+            db=db,
+            user_id=payment["user_id"],
+            title="Tournament Registration Confirmed",
+            message=f'Your payment has been approved and your squad is officially registered for "{tourn_title}". Review your tournament schedule and rules, and join the official WhatsApp group for updates.',
+            notification_type="REGISTRATION",
+            category="REGISTRATION",
+            link=f"/tournaments/{tourn_slug}",
+        )
+    else:
+        await create_notification(
+            db=db,
+            user_id=payment["user_id"],
+            title="Payment Approved",
+            message=f"Your payment of ₹{payment.get('amount_inr', 0)} for {payment.get('payment_type', 'Platform Service')} has been verified and approved.",
+            notification_type="WALLET",
+            category="WALLET",
+            link="/dashboard",
+        )
 
     await record_audit_log(
         db=db,
@@ -1138,6 +1203,16 @@ async def reject_payment(
             {"$set": {"payment_status": "REJECTED"}}
         )
 
+        actual_tid = payment.get("tournament_id")
+        if actual_tid:
+            active_count = await db.tournament_registrations.count_documents({
+                "$or": [{"tournament_id": actual_tid}, {"tournament_id": str(actual_tid)}],
+                "payment_status": {"$nin": ["REJECTED", "CANCELLED", "REFUNDED"]},
+            })
+            tourn_doc = await db.tournaments.find_one({"$or": [{"_id": actual_tid}, {"id": actual_tid}, {"slug": actual_tid}]})
+            if tourn_doc and tourn_doc.get("status") == "REGISTRATION_CLOSED" and active_count < tourn_doc.get("max_teams", 16):
+                await db.tournaments.update_one({"_id": tourn_doc["_id"]}, {"$set": {"status": "REGISTRATION_OPEN"}})
+
     # Game entry team state transition
     if payment.get("payment_type") == "GAME_ENTRY" and payment.get("team_id"):
         t_id = payment.get("team_id")
@@ -1183,6 +1258,176 @@ async def reject_payment(
         "message": "Payment rejected successfully.",
         "payment_id": payment_id,
         "new_status": "REJECTED",
+    }
+
+@router.get("/registration-revenue-analytics")
+async def get_registration_revenue_analytics(
+    time_range: Optional[str] = "all",
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Tournament Registration & Revenue Analytics:
+    - Confirmed registrations vs reserved seats vs available capacity.
+    - Verified registration revenue vs pending payment totals.
+    - Separate wallet top-up metrics (no double counting).
+    - Tournament-wise registration performance.
+    """
+    from datetime import timedelta
+    now = datetime.now(timezone.utc)
+    date_filter = {}
+    if time_range == "this_week":
+        start_dt = now - timedelta(days=now.weekday())
+        date_filter = {"$gte": start_dt.replace(hour=0, minute=0, second=0, microsecond=0)}
+    elif time_range == "last_week":
+        end_dt = now - timedelta(days=now.weekday())
+        start_dt = end_dt - timedelta(days=7)
+        date_filter = {
+            "$gte": start_dt.replace(hour=0, minute=0, second=0, microsecond=0),
+            "$lt": end_dt.replace(hour=0, minute=0, second=0, microsecond=0),
+        }
+    elif time_range == "this_month":
+        start_dt = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        date_filter = {"$gte": start_dt}
+    elif time_range == "last_month":
+        first_this_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        last_month_end = first_this_month
+        prev_month = (first_this_month - timedelta(days=1)).replace(day=1)
+        date_filter = {"$gte": prev_month, "$lt": last_month_end}
+    elif time_range == "custom" and (start_date or end_date):
+        if start_date:
+            try:
+                date_filter["$gte"] = datetime.fromisoformat(start_date.replace("Z", "+00:00"))
+            except Exception:
+                pass
+        if end_date:
+            try:
+                date_filter["$lte"] = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+            except Exception:
+                pass
+
+    reg_match = {"status": {"$nin": ["DELETED"]}}
+    if date_filter:
+        reg_match["created_at"] = date_filter
+
+    confirmed_regs = await db.tournament_registrations.count_documents({
+        **reg_match,
+        "payment_status": {"$in": ["PAID", "FREE"]},
+    })
+    pending_regs = await db.tournament_registrations.count_documents({
+        **reg_match,
+        "payment_status": {"$in": ["PENDING", "PENDING_VERIFICATION"]},
+    })
+    rejected_regs = await db.tournament_registrations.count_documents({
+        **reg_match,
+        "payment_status": {"$in": ["REJECTED", "CANCELLED", "REFUNDED"]},
+    })
+
+    # Approved direct tournament entry revenue
+    pay_match_approved = {
+        "payment_type": "TOURNAMENT_ENTRY",
+        "status": "APPROVED",
+        "is_dummy": {"$ne": True},
+    }
+    if date_filter:
+        pay_match_approved["created_at"] = date_filter
+    approved_rev_agg = await db.game_payments.aggregate([
+        {"$match": pay_match_approved},
+        {"$group": {"_id": None, "total_inr": {"$sum": "$amount_inr"}}},
+    ]).to_list(1)
+    approved_revenue_inr = approved_rev_agg[0]["total_inr"] if approved_rev_agg else 0
+
+    # Pending payment amounts
+    pay_match_pending = {
+        "payment_type": "TOURNAMENT_ENTRY",
+        "status": {"$in": ["PENDING", "PENDING_VERIFICATION", "INITIATED"]},
+        "is_dummy": {"$ne": True},
+    }
+    if date_filter:
+        pay_match_pending["created_at"] = date_filter
+    pending_rev_agg = await db.game_payments.aggregate([
+        {"$match": pay_match_pending},
+        {"$group": {"_id": None, "total_inr": {"$sum": "$amount_inr"}}},
+    ]).to_list(1)
+    pending_payment_inr = pending_rev_agg[0]["total_inr"] if pending_rev_agg else 0
+
+    # Separate wallet top-up volume
+    wallet_match = {
+        "payment_type": "WALLET_TOPUP",
+        "status": "APPROVED",
+        "is_dummy": {"$ne": True},
+    }
+    if date_filter:
+        wallet_match["created_at"] = date_filter
+    wallet_agg = await db.game_payments.aggregate([
+        {"$match": wallet_match},
+        {"$group": {"_id": None, "total_inr": {"$sum": "$amount_inr"}}},
+    ]).to_list(1)
+    wallet_topup_inr = wallet_agg[0]["total_inr"] if wallet_agg else 0
+
+    # Tournament-wise breakdown
+    tournaments = await db.tournaments.find({
+        "status": {"$nin": ["DELETED", "HIDDEN", "DRAFT"]},
+        "is_dummy": {"$ne": True},
+    }).sort("created_at", -1).to_list(100)
+
+    tournament_breakdown = []
+    total_capacity = 0
+    total_available_seats = 0
+
+    for t in tournaments:
+        t_id = str(t.get("_id", t.get("id")))
+        t_slug = t.get("slug", t_id)
+        cap = int(t.get("max_teams", 16))
+        total_capacity += cap
+
+        t_conf = await db.tournament_registrations.count_documents({
+            "$or": [{"tournament_id": t_id}, {"tournament_id": t_slug}],
+            "payment_status": {"$in": ["PAID", "FREE"]},
+        })
+        t_pend = await db.tournament_registrations.count_documents({
+            "$or": [{"tournament_id": t_id}, {"tournament_id": t_slug}],
+            "payment_status": {"$in": ["PENDING", "PENDING_VERIFICATION"]},
+        })
+        t_avail = max(0, cap - t_conf - t_pend)
+        total_available_seats += t_avail
+
+        t_rev_agg = await db.game_payments.aggregate([
+            {"$match": {
+                "tournament_id": {"$in": [t_id, t_slug]},
+                "payment_type": "TOURNAMENT_ENTRY",
+                "status": "APPROVED",
+            }},
+            {"$group": {"_id": None, "total_inr": {"$sum": "$amount_inr"}}},
+        ]).to_list(1)
+        t_rev = t_rev_agg[0]["total_inr"] if t_rev_agg else 0
+
+        tournament_breakdown.append({
+            "id": t_id,
+            "title": t.get("title", "Tournament"),
+            "slug": t_slug,
+            "status": t.get("status", "REGISTRATION_OPEN"),
+            "entry_fee_inr": t.get("entry_fee_inr", 0),
+            "capacity": cap,
+            "confirmed_registrations": t_conf,
+            "pending_reservations": t_pend,
+            "available_seats": t_avail,
+            "approved_revenue_inr": t_rev,
+        })
+
+    return {
+        "confirmed_registrations": confirmed_regs,
+        "pending_reservations": pending_regs,
+        "available_seats": total_available_seats,
+        "total_capacity": total_capacity,
+        "rejected_cancelled_registrations": rejected_regs,
+        "approved_tournament_revenue_inr": approved_revenue_inr,
+        "pending_payment_amount_inr": pending_payment_inr,
+        "wallet_topup_volume_inr": wallet_topup_inr,
+        "time_range": time_range,
+        "tournaments": tournament_breakdown,
     }
 
 

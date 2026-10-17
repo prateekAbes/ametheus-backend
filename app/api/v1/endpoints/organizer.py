@@ -1,5 +1,6 @@
 import json
 import re
+from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any
 from fastapi import APIRouter, Depends, HTTPException, status
 from motor.motor_asyncio import AsyncIOMotorDatabase
@@ -84,6 +85,8 @@ class TournamentCreatePayload(BaseModel):
     rules: List[str] = []
     schedule: List[Dict[str, Any]] = []
     prizes: Optional[List[Dict[str, Any]]] = None
+    whatsapp_group_url: Optional[str] = None
+    community_link: Optional[str] = None
 
 class TournamentUpdatePayload(BaseModel):
     title: Optional[str] = None
@@ -115,6 +118,15 @@ class TournamentUpdatePayload(BaseModel):
     prizes: Optional[List[Dict[str, Any]]] = None
     status: Optional[str] = None
     registration_status: Optional[str] = None
+    whatsapp_group_url: Optional[str] = None
+    community_link: Optional[str] = None
+
+def parse_iso_datetime(dt_str: str) -> datetime:
+    s = dt_str.strip().replace("Z", "+00:00")
+    dt = datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
 
 def slugify(text: str) -> str:
     s = text.lower().strip()
@@ -181,6 +193,8 @@ def serialize_tournament_response(t: dict, game_obj: Optional[dict], reg_count: 
         prizes=prizes,
         bracket_rounds=bracket,
         registered_rosters=[],
+        whatsapp_group_url=t.get("whatsapp_group_url"),
+        community_link=t.get("community_link"),
         media_config=t.get("media_config", {}),
     )
 
@@ -193,6 +207,31 @@ async def create_tournament(
     """
     Organizer creates a new tournament (Rule 9). Default state is REGISTRATION_OPEN or payload.status.
     """
+    if not payload.title or not payload.title.strip():
+        raise HTTPException(status_code=422, detail="Tournament title cannot be empty")
+
+    min_size = payload.min_team_size or 1
+    max_size = payload.max_team_size or 5
+    if min_size < 1:
+        raise HTTPException(status_code=422, detail="Minimum team size must be at least 1")
+    if max_size < min_size:
+        raise HTTPException(status_code=422, detail="Maximum team size cannot be less than minimum team size")
+    if payload.max_teams < 2:
+        raise HTTPException(status_code=422, detail="Maximum teams must be at least 2")
+    if payload.prize_pool_inr < 0:
+        raise HTTPException(status_code=422, detail="Prize pool cannot be negative")
+    if payload.entry_fee_inr < 0:
+        raise HTTPException(status_code=422, detail="Entry fee cannot be negative")
+
+    try:
+        starts_dt = parse_iso_datetime(payload.starts_at)
+        lock_dt = parse_iso_datetime(payload.roster_lock_time)
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Invalid ISO 8601 date format for starts_at or roster_lock_time: {str(e)}")
+
+    if lock_dt > starts_dt:
+        raise HTTPException(status_code=422, detail="Roster lock time must be at or before tournament start time")
+
     game = await db.games.find_one({"$or": [{"_id": payload.game_id}, {"id": payload.game_id}, {"slug": payload.game_id}]})
     if not game:
         raise HTTPException(status_code=404, detail="Selected game discipline not found")
@@ -213,7 +252,7 @@ async def create_tournament(
         slug=slug,
         game_id=gid,
         organizer_id=organizer.id,
-        title=payload.title,
+        title=payload.title.strip(),
         prize_pool_inr=payload.prize_pool_inr,
         entry_fee_inr=payload.entry_fee_inr,
         status=payload.status or "DRAFT",
@@ -224,8 +263,8 @@ async def create_tournament(
         roster_lock_time=payload.roster_lock_time,
         server_region=payload.server_region,
         max_teams=payload.max_teams,
-        min_team_size=payload.min_team_size or 1,
-        max_team_size=payload.max_team_size or 5,
+        min_team_size=min_size,
+        max_team_size=max_size,
         rank_requirement=payload.rank_requirement,
         format=payload.format,
         tournament_type=payload.tournament_type or "Single Elimination",
@@ -241,6 +280,8 @@ async def create_tournament(
         schedule=payload.schedule,
         prizes=prizes,
         bracket_rounds=[],
+        whatsapp_group_url=payload.whatsapp_group_url,
+        community_link=payload.community_link,
     )
     if payload.media_config is not None:
         tourn.media_config = payload.media_config
@@ -271,18 +312,43 @@ async def update_tournament(
 
     update_fields = {}
     if payload.title is not None:
-        update_fields["title"] = payload.title
+        if not payload.title.strip():
+            raise HTTPException(status_code=422, detail="Tournament title cannot be empty")
+        update_fields["title"] = payload.title.strip()
     if payload.prize_pool_inr is not None:
+        if payload.prize_pool_inr < 0:
+            raise HTTPException(status_code=422, detail="Prize pool cannot be negative")
         update_fields["prize_pool_inr"] = payload.prize_pool_inr
     if payload.entry_fee_inr is not None:
+        if payload.entry_fee_inr < 0:
+            raise HTTPException(status_code=422, detail="Entry fee cannot be negative")
         update_fields["entry_fee_inr"] = payload.entry_fee_inr
     if payload.starts_at is not None:
         update_fields["starts_at"] = payload.starts_at
     if payload.roster_lock_time is not None:
         update_fields["roster_lock_time"] = payload.roster_lock_time
+    if payload.starts_at is not None or payload.roster_lock_time is not None:
+        new_starts = payload.starts_at or tourn.get("starts_at")
+        new_lock = payload.roster_lock_time or tourn.get("roster_lock_time")
+        if new_starts and new_lock and new_starts != "TBD" and new_lock != "TBD":
+            try:
+                starts_dt = parse_iso_datetime(new_starts)
+                lock_dt = parse_iso_datetime(new_lock)
+                if lock_dt > starts_dt:
+                    raise HTTPException(status_code=422, detail="Roster lock time must be at or before tournament start time")
+            except HTTPException:
+                raise
+            except Exception:
+                pass
+    if payload.whatsapp_group_url is not None:
+        update_fields["whatsapp_group_url"] = payload.whatsapp_group_url
+    if payload.community_link is not None:
+        update_fields["community_link"] = payload.community_link
     if payload.server_region is not None:
         update_fields["server_region"] = payload.server_region
     if payload.max_teams is not None:
+        if payload.max_teams < 2:
+            raise HTTPException(status_code=422, detail="Maximum teams must be at least 2")
         update_fields["max_teams"] = payload.max_teams
     if payload.rank_requirement is not None:
         update_fields["rank_requirement"] = payload.rank_requirement
@@ -321,8 +387,13 @@ async def update_tournament(
     if payload.prizes is not None:
         update_fields["prizes"] = payload.prizes
     if payload.min_team_size is not None:
+        if payload.min_team_size < 1:
+            raise HTTPException(status_code=422, detail="Minimum team size must be at least 1")
         update_fields["min_team_size"] = payload.min_team_size
     if payload.max_team_size is not None:
+        eff_min = payload.min_team_size if payload.min_team_size is not None else tourn.get("min_team_size", 1)
+        if payload.max_team_size < eff_min:
+            raise HTTPException(status_code=422, detail="Maximum team size cannot be less than minimum team size")
         update_fields["max_team_size"] = payload.max_team_size
     if payload.registration_status is not None:
         update_fields["registration_status"] = payload.registration_status.strip().upper()

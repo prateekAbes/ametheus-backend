@@ -360,6 +360,9 @@ class TournamentResponse(BaseModel):
     roster_lock_time: Optional[str] = "TBD"
     server_region: Optional[str] = "AWS Mumbai (ap-south-1)"
     registered_teams: Optional[int] = 0
+    confirmed_teams: Optional[int] = 0
+    reserved_teams: Optional[int] = 0
+    available_slots: Optional[int] = 16
     max_teams: Optional[int] = 16
     min_team_size: Optional[int] = 1
     max_team_size: Optional[int] = 5
@@ -387,6 +390,8 @@ class TournamentResponse(BaseModel):
     bracket_rounds: List[Dict[str, Any]] = []
     registered_rosters: List[Dict[str, Any]] = []
     is_featured: Optional[bool] = False
+    whatsapp_group_url: Optional[str] = None
+    community_link: Optional[str] = None
     media_config: Optional[Dict[str, Any]] = None
     model_config = ConfigDict(from_attributes=True, extra="allow")
 
@@ -435,6 +440,8 @@ class SubmitTournamentUtrRequest(BaseModel):
 class TournamentRegistrationStatusResponse(BaseModel):
     is_registered: bool
     registration: Optional[Dict[str, Any]] = None
+    team: Optional[Dict[str, Any]] = None
+    position: Optional[int] = None
 
 class TournamentStageFormatsUpdate(BaseModel):
     tournament_type: Optional[str] = None

@@ -77,6 +77,7 @@ async def find_tournament_by_id_or_slug(db: AsyncIOMotorDatabase, identifier: st
 async def list_tournaments(
     game: Optional[str] = None,
     status: Optional[str] = None,
+    search: Optional[str] = None,
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     filter_query = {"is_dummy": {"$ne": True}}
@@ -95,6 +96,46 @@ async def list_tournaments(
     else:
         filter_query["status"] = {"$nin": ["DELETED", "CANCELLED", "HIDDEN", "DRAFT"]}
 
+    if search and search.strip():
+        search_str = search.strip()
+        search_terms = search_str.split()
+
+        all_games = await db.games.find({}).to_list(length=100)
+
+        term_clauses = []
+        for term in search_terms:
+            t_pat = re.escape(term)
+            term_lower = term.lower()
+
+            term_game_ids = []
+            for g in all_games:
+                g_name = (g.get("name") or "").lower()
+                g_slug = (g.get("slug") or "").lower()
+                g_short = (g.get("short_name") or "").lower()
+                if term_lower in g_name or term_lower in g_slug or term_lower in g_short:
+                    term_game_ids.append(str(g.get("_id", g.get("id"))))
+                    if g.get("slug"):
+                        term_game_ids.append(g["slug"])
+
+            clauses = [
+                {"title": {"$regex": t_pat, "$options": "i"}},
+                {"description": {"$regex": t_pat, "$options": "i"}},
+                {"format": {"$regex": t_pat, "$options": "i"}},
+                {"slug": {"$regex": t_pat, "$options": "i"}},
+                {"game_slug": {"$regex": t_pat, "$options": "i"}},
+                {"game_name": {"$regex": t_pat, "$options": "i"}},
+            ]
+            if term_game_ids:
+                clauses.append({"game_id": {"$in": term_game_ids}})
+
+            term_clauses.append({"$or": clauses})
+
+        if term_clauses:
+            if "$and" in filter_query:
+                filter_query["$and"].extend(term_clauses)
+            else:
+                filter_query["$and"] = term_clauses
+
     cursor = db.tournaments.find(filter_query)
     tournaments = await cursor.to_list(length=100)
 
@@ -111,6 +152,12 @@ async def list_tournaments(
             "$or": [{"tournament_id": tid}, {"tournament_id": t.get("slug")}],
             "payment_status": {"$in": ["PAID", "FREE"]},
         })
+        reserved_count = await db.tournament_registrations.count_documents({
+            "$or": [{"tournament_id": tid}, {"tournament_id": t.get("slug")}],
+            "payment_status": {"$in": ["PENDING", "PENDING_VERIFICATION"]},
+        })
+        max_teams_val = int(t.get("max_teams", 16))
+        avail_slots = max(0, max_teams_val - reg_count - reserved_count)
 
         rules = safe_json_loads(t.get("rules", t.get("rules_json")), [])
         schedule = safe_json_loads(t.get("schedule", t.get("schedule_json")), [])
@@ -149,6 +196,10 @@ async def list_tournaments(
         else:
             norm_status = raw_stat
 
+        is_solo_game = bool(game_obj and (not game_obj.get("is_team_game", True) or game_obj.get("slug") == "chess"))
+        calc_min_size = 1 if is_solo_game else max(1, int(t.get("min_team_size") or 1))
+        calc_max_size = 1 if is_solo_game else max(calc_min_size, int(t.get("max_team_size") or 5))
+
         response.append(
             TournamentResponse(
                 id=tid,
@@ -169,9 +220,12 @@ async def list_tournaments(
                 roster_lock_time=t.get("roster_lock_time", "TBD"),
                 server_region=t.get("server_region", "AWS Mumbai (ap-south-1)"),
                 registered_teams=reg_count,
-                max_teams=t.get("max_teams", 16),
-                min_team_size=t.get("min_team_size", 1),
-                max_team_size=t.get("max_team_size", 5),
+                confirmed_teams=reg_count,
+                reserved_teams=reserved_count,
+                available_slots=avail_slots,
+                max_teams=max_teams_val,
+                min_team_size=calc_min_size,
+                max_team_size=calc_max_size,
                 rank_requirement=t.get("rank_requirement", "Open to All Ranks"),
                 format=t.get("format", "Single Elimination"),
                 tournament_type=t.get("tournament_type", "Single Elimination"),
@@ -374,6 +428,12 @@ async def get_tournament_by_slug(slug: str, db: AsyncIOMotorDatabase = Depends(g
         "$or": [{"tournament_id": tid}, {"tournament_id": t.get("slug")}],
         "payment_status": {"$in": ["PAID", "FREE"]},
     })
+    reserved_count = await db.tournament_registrations.count_documents({
+        "$or": [{"tournament_id": tid}, {"tournament_id": t.get("slug")}],
+        "payment_status": {"$in": ["PENDING", "PENDING_VERIFICATION"]},
+    })
+    max_teams_val = int(t.get("max_teams", 16))
+    avail_slots = max(0, max_teams_val - reg_count - reserved_count)
 
     rules = safe_json_loads(t.get("rules", t.get("rules_json")), [])
     schedule = safe_json_loads(t.get("schedule", t.get("schedule_json")), [])
@@ -383,10 +443,12 @@ async def get_tournament_by_slug(slug: str, db: AsyncIOMotorDatabase = Depends(g
     prize_inr = t.get("prize_pool_inr") or 0
     fee_inr = t.get("entry_fee_inr") or 0
 
-    # Auto-derive min/max team size for solo titles (e.g. Chess)
+    # Auto-derive min/max team size for solo titles (e.g. Chess) and handle legacy/missing values safely
     is_solo_game = bool(game_obj and (not game_obj.get("is_team_game", True) or game_obj.get("slug") == "chess"))
-    min_team_size = 1 if is_solo_game else t.get("min_team_size", 1)
-    max_team_size = 1 if is_solo_game else t.get("max_team_size", 5)
+    raw_min = t.get("min_team_size") or t.get("required_team_size")
+    min_team_size = 1 if is_solo_game else max(1, int(raw_min) if raw_min else 1)
+    raw_max = t.get("max_team_size")
+    max_team_size = 1 if is_solo_game else max(min_team_size, int(raw_max) if raw_max else 5)
 
     # 1. Bracket rounds: if empty, auto-assemble from matches
     if not bracket:
@@ -506,7 +568,10 @@ async def get_tournament_by_slug(slug: str, db: AsyncIOMotorDatabase = Depends(g
         roster_lock_time=t.get("roster_lock_time", "TBD"),
         server_region=t.get("server_region", "AWS Mumbai (ap-south-1)"),
         registered_teams=reg_count,
-        max_teams=t.get("max_teams", 16),
+        confirmed_teams=reg_count,
+        reserved_teams=reserved_count,
+        available_slots=avail_slots,
+        max_teams=max_teams_val,
         min_team_size=min_team_size,
         max_team_size=max_team_size,
         rank_requirement=t.get("rank_requirement", "Open to All Ranks"),
@@ -874,49 +939,160 @@ async def get_registration_status(
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """
-    Returns whether current user (or user's teams) is currently registered for the tournament.
+    Returns whether current user (or user's teams) is currently registered for the tournament,
+    along with registration details, registration position, and registered team roster.
     """
     tourn = await find_tournament_by_id_or_slug(db, id)
     if not tourn:
         raise HTTPException(status_code=404, detail="Tournament not found")
 
     tid = str(tourn.get("_id", tourn.get("id")))
+    tslug = tourn.get("slug", tid)
+
+    valid_user_ids = [str(current_user.id)]
+    if getattr(current_user, "clerk_user_id", None):
+        valid_user_ids.append(str(current_user.clerk_user_id))
 
     # 1. Check solo registration
-    solo_reg = await db.tournament_registrations.find_one({
-        "tournament_id": tid,
-        "player_id": current_user.id,
+    reg = await db.tournament_registrations.find_one({
+        "tournament_id": {"$in": [tid, tslug]},
+        "player_id": {"$in": valid_user_ids},
         "payment_status": {"$nin": ["REJECTED", "CANCELLED", "REFUNDED"]},
         "status": {"$nin": ["CANCELLED", "REFUNDED"]},
     })
-    if solo_reg:
-        solo_reg["id"] = str(solo_reg.get("_id", solo_reg.get("id")))
-        solo_reg.pop("_id", None)
-        return TournamentRegistrationStatusResponse(is_registered=True, registration=solo_reg)
 
-    # 2. Check teams where user is captain or member
-    user_teams_cursor = db.teams.find({
-        "$or": [
-            {"captain_id": current_user.id},
-            {"members.user_id": current_user.id},
-        ]
-    })
-    user_teams = await user_teams_cursor.to_list(length=50)
-    team_ids = [str(t.get("_id", t.get("id"))) for t in user_teams]
-
-    if team_ids:
-        team_reg = await db.tournament_registrations.find_one({
-            "tournament_id": tid,
-            "team_id": {"$in": team_ids},
-            "payment_status": {"$nin": ["REJECTED", "CANCELLED", "REFUNDED"]},
-            "status": {"$nin": ["CANCELLED", "REFUNDED"]},
+    # 2. Check team registration if not found as solo
+    if not reg:
+        user_teams_cursor = db.teams.find({
+            "$or": [
+                {"captain_id": {"$in": valid_user_ids}},
+                {"members.user_id": {"$in": valid_user_ids}},
+                {"substitutes.user_id": {"$in": valid_user_ids}},
+            ]
         })
-        if team_reg:
-            team_reg["id"] = str(team_reg.get("_id", team_reg.get("id")))
-            team_reg.pop("_id", None)
-            return TournamentRegistrationStatusResponse(is_registered=True, registration=team_reg)
+        user_teams = await user_teams_cursor.to_list(length=50)
+        team_ids = [str(t.get("_id", t.get("id"))) for t in user_teams]
+        if team_ids:
+            reg = await db.tournament_registrations.find_one({
+                "tournament_id": {"$in": [tid, tslug]},
+                "team_id": {"$in": team_ids},
+                "payment_status": {"$nin": ["REJECTED", "CANCELLED", "REFUNDED"]},
+                "status": {"$nin": ["CANCELLED", "REFUNDED"]},
+            })
 
-    return TournamentRegistrationStatusResponse(is_registered=False, registration=None)
+    if not reg:
+        return TournamentRegistrationStatusResponse(is_registered=False, registration=None, team=None, position=None)
+
+    reg_dict = dict(reg)
+    reg_dict["id"] = str(reg_dict.get("_id", reg_dict.get("id")))
+    reg_dict.pop("_id", None)
+    if reg_dict.get("created_at") and hasattr(reg_dict["created_at"], "isoformat"):
+        reg_dict["created_at"] = reg_dict["created_at"].isoformat()
+    if reg_dict.get("registered_at") and hasattr(reg_dict["registered_at"], "isoformat"):
+        reg_dict["registered_at"] = reg_dict["registered_at"].isoformat()
+
+    # Calculate position if confirmed
+    position = None
+    if reg_dict.get("payment_status") in ["PAID", "FREE"]:
+        reg_time = reg.get("created_at") or reg.get("registered_at")
+        pos_count = await db.tournament_registrations.count_documents({
+            "$or": [{"tournament_id": tid}, {"tournament_id": tslug}],
+            "payment_status": {"$in": ["PAID", "FREE"]},
+            "created_at": {"$lte": reg_time} if reg_time else {"$exists": True},
+        })
+        position = max(1, pos_count)
+
+    team_payload = None
+    if reg_dict.get("team_id"):
+        team_doc = await db.teams.find_one({"$or": [{"_id": reg_dict["team_id"]}, {"id": reg_dict["team_id"]}]})
+        if team_doc:
+            captain_id = str(team_doc.get("captain_id"))
+            cap_user = await db.users.find_one({"$or": [{"_id": captain_id}, {"id": captain_id}, {"clerk_user_id": captain_id}]})
+            captain_name = (cap_user.get("display_name") or cap_user.get("username", "Captain")) if cap_user else "Captain"
+
+            raw_members = team_doc.get("members", [])
+            user_ids_to_fetch = set()
+            if captain_id:
+                user_ids_to_fetch.add(captain_id)
+            for m in raw_members:
+                if isinstance(m, dict) and m.get("user_id"):
+                    user_ids_to_fetch.add(str(m.get("user_id")))
+
+            user_docs = await db.users.find({
+                "$or": [{"_id": {"$in": list(user_ids_to_fetch)}}, {"id": {"$in": list(user_ids_to_fetch)}}, {"clerk_user_id": {"$in": list(user_ids_to_fetch)}}]
+            }).to_list(len(user_ids_to_fetch) + 10)
+            user_map = {}
+            for u in user_docs:
+                u_id = str(u.get("_id", u.get("id")))
+                user_map[u_id] = u
+                if u.get("clerk_user_id"):
+                    user_map[str(u["clerk_user_id"])] = u
+
+            members_list = []
+            cap_info = user_map.get(captain_id)
+            members_list.append({
+                "user_id": captain_id,
+                "username": cap_info.get("username", captain_name) if cap_info else captain_name,
+                "display_name": (cap_info.get("display_name") or cap_info.get("username", captain_name)) if cap_info else captain_name,
+                "avatar_url": cap_info.get("avatar_url") if cap_info else None,
+                "role": "CAPTAIN",
+                "game_handle": cap_info.get("username", captain_name) if cap_info else captain_name,
+            })
+
+            for m in raw_members:
+                if not isinstance(m, dict):
+                    continue
+                uid = str(m.get("user_id"))
+                if uid == captain_id:
+                    continue
+                uinfo = user_map.get(uid)
+                uname = uinfo.get("username", "player") if uinfo else "player"
+                dname = (uinfo.get("display_name") or uname) if uinfo else uname
+                members_list.append({
+                    "user_id": uid,
+                    "username": uname,
+                    "display_name": dname,
+                    "avatar_url": uinfo.get("avatar_url") if uinfo else None,
+                    "role": m.get("role", "MEMBER"),
+                    "game_handle": m.get("game_handle") or uname,
+                })
+
+            is_captain = any(str(cid) in valid_user_ids for cid in [captain_id])
+            team_payload = {
+                "id": str(team_doc.get("_id", team_doc.get("id"))),
+                "name": team_doc.get("name", "Team"),
+                "tag": team_doc.get("tag", "TEAM"),
+                "logo_url": team_doc.get("logo_url"),
+                "captain_id": captain_id,
+                "captain_name": captain_name,
+                "my_role": "CAPTAIN" if is_captain else "PLAYER",
+                "members": members_list,
+            }
+    else:
+        team_payload = {
+            "id": str(current_user.id),
+            "name": current_user.display_name or current_user.username,
+            "tag": "SOLO",
+            "logo_url": None,
+            "captain_id": str(current_user.id),
+            "captain_name": current_user.username,
+            "my_role": "CAPTAIN",
+            "members": [{
+                "user_id": str(current_user.id),
+                "username": current_user.username,
+                "display_name": current_user.display_name or current_user.username,
+                "avatar_url": current_user.avatar_url,
+                "role": "SOLO CONTENDER",
+                "game_handle": current_user.username,
+            }],
+        }
+
+    return TournamentRegistrationStatusResponse(
+        is_registered=True,
+        registration=reg_dict,
+        team=team_payload,
+        position=position,
+    )
 
 @router.post("/{id}/register-upi", response_model=TournamentRegisterUpiResponse)
 @router.post("/{id}/register/upi", response_model=TournamentRegisterUpiResponse)
@@ -931,7 +1107,7 @@ async def register_tournament_direct_upi(
     1. Validates tournament status, deadline, and capacity.
     2. Validates team requirements (or solo player).
     3. Fetches active rotating platform UPI account.
-    4. Creates TournamentRegistration with PENDING_VERIFICATION.
+    4. Creates TournamentRegistration with PENDING (immediately reserves slot).
     5. Creates GamePayment with TOURNAMENT_ENTRY and INITIATED status.
     6. Returns UPI ID, QR code and payee details for user transfer.
     """
@@ -1051,13 +1227,14 @@ async def register_tournament_direct_upi(
         note=f"Tournament entry fee: {tourn.get('title', 'Tournament')[:25]}",
     )
 
+    reg_id = f"reg_upi_{uuid.uuid4().hex[:10]}"
     payment = GamePayment(
         payment_type="TOURNAMENT_ENTRY",
         user_id=current_user.id,
         game_id=tourn.get("game_id"),
         game_name=tourn.get("title"),
         tournament_id=tid,
-        registration_id=None,
+        registration_id=reg_id,
         team_id=team_id,
         team_name=team_name,
         amount_paise=fee_paise,
@@ -1073,9 +1250,29 @@ async def register_tournament_direct_upi(
     )
     await db.game_payments.insert_one(payment.to_mongo())
 
+    # Create reserved TournamentRegistration with PENDING
+    user_game_id = payload.game_id or payload.in_game_id
+    reg = TournamentRegistration(
+        id=reg_id,
+        tournament_id=tid,
+        team_id=team_id,
+        player_id=current_user.id if not team_id else None,
+        game_id=user_game_id,
+        in_game_id=user_game_id,
+        payment_method="UPI",
+        payment_status="PENDING",
+        payment_id=payment.id,
+        order_id=f"upi_tourn_{uuid.uuid4().hex[:10]}",
+        check_in_status="PENDING",
+    )
+    await db.tournament_registrations.insert_one(reg.to_mongo())
+
+    if reg_count + 1 >= max_teams:
+        await db.tournaments.update_one({"_id": tourn["_id"]}, {"$set": {"status": "REGISTRATION_CLOSED"}})
+
     return TournamentRegisterUpiResponse(
         payment_id=payment.id,
-        registration_id="",
+        registration_id=reg_id,
         tournament_id=tid,
         tournament_title=tourn.get("title", "Tournament"),
         amount_inr=float(fee_inr),
@@ -1378,8 +1575,8 @@ async def get_tournament_community_link(
     tid = str(tourn.get("_id", tourn.get("id")))
     tslug = tourn.get("slug", tid)
 
-    platform = tourn.get("community_platform")
-    link = tourn.get("community_link")
+    platform = tourn.get("community_platform") or "WHATSAPP"
+    link = tourn.get("community_link") or tourn.get("whatsapp_group_url")
 
     if not link:
         return {"community_platform": platform, "community_link": None}
@@ -1390,24 +1587,28 @@ async def get_tournament_community_link(
 
     # Check tournament assignment for scoped admins
     assign_check = await db.tournament_admin_assignments.find_one({
-        "admin_user_id": current_user.id,
+        "admin_user_id": {"$in": [current_user.id, getattr(current_user, "clerk_user_id", None)]},
         "tournament_id": {"$in": [tid, tslug]},
     })
     if assign_check:
         return {"community_platform": platform, "community_link": link}
 
     # Check if current user is a confirmed participant (solo or team member)
+    valid_user_ids = [str(current_user.id)]
+    if getattr(current_user, "clerk_user_id", None):
+        valid_user_ids.append(str(current_user.clerk_user_id))
+
     user_teams_cursor = db.teams.find({
         "$or": [
-            {"captain_id": current_user.id},
-            {"members.user_id": current_user.id},
-            {"substitutes.user_id": current_user.id},
+            {"captain_id": {"$in": valid_user_ids}},
+            {"members.user_id": {"$in": valid_user_ids}},
+            {"substitutes.user_id": {"$in": valid_user_ids}},
         ]
     })
     user_teams = await user_teams_cursor.to_list(length=100)
     user_team_ids = [str(t.get("_id", t.get("id"))) for t in user_teams]
 
-    reg_or = [{"player_id": current_user.id}]
+    reg_or = [{"player_id": {"$in": valid_user_ids}}]
     if user_team_ids:
         reg_or.append({"team_id": {"$in": user_team_ids}})
 
