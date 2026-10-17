@@ -121,11 +121,17 @@ async def init_db_indexes(db: AsyncIOMotorDatabase):
         await db.game_payments.create_index("payment_account_code")
         await db.game_payments.create_index("is_dummy")
 
-        # Matches
+        # Matches (Encounters)
         await db.matches.create_index("tournament_id")
         await db.matches.create_index("status")
         await db.matches.create_index("scheduled_at")
         await db.matches.create_index([("tournament_id", 1), ("stage", 1)])
+
+        # Live Matches (Single canonical live match per tournament enforced by database unique constraint)
+        await db.live_matches.create_index("tournament_id", unique=True)
+        await db.live_matches.create_index("status")
+        await db.live_matches.create_index("game_id")
+        await db.live_matches.create_index("game_slug")
 
         # Wallet Ledger
         await db.wallet_ledger.create_index("user_id")

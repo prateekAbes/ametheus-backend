@@ -258,13 +258,16 @@ async def test_tournament_whatsapp_gating_lifecycle(mock_db, make_client):
         "created_at": datetime.now(timezone.utc),
     })
 
-    # SCENARIO A: Registration is OPEN -> Player 1 gets 403 Forbidden with gating message
+    # SCENARIO A: Registration is OPEN -> Confirmed Player 1 can access WhatsApp link immediately upon registration
     async with make_client(player1) as client_p1:
         res_open = await client_p1.get("/api/v1/tournaments/t-whatsapp-test/community")
-        assert res_open.status_code == 403
-        detail_msg = res_open.json()["detail"].lower()
-        assert "registration" in detail_msg
-        assert "open" in detail_msg or "unlock" in detail_msg
+        assert res_open.status_code == 200
+        assert res_open.json()["whatsapp_group_url"] == "https://chat.whatsapp.com/SecretLeagueGroup999"
+
+    # SCENARIO A2: Unregistered user tries to access -> 403 Forbidden
+    async with make_client(player_unregistered) as client_unreg_early:
+        res_unreg_early = await client_unreg_early.get("/api/v1/tournaments/t-whatsapp-test/community")
+        assert res_unreg_early.status_code == 403
 
     # SCENARIO B: Admin can access even while registration is OPEN
     async with make_client(admin_user) as client_adm:

@@ -1778,7 +1778,7 @@ async def get_tournament_community_link(
     confirmed_reg = await db.tournament_registrations.find_one({
         "tournament_id": {"$in": [tid, tslug]},
         "$or": reg_or,
-        "payment_status": {"$in": ["PAID", "FREE"]},
+        "payment_status": {"$in": ["PAID", "FREE", "PENDING_VERIFICATION"]},
         "status": {"$nin": ["CANCELLED", "REFUNDED"]},
     })
 
@@ -1786,48 +1786,6 @@ async def get_tournament_community_link(
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Community link is restricted to confirmed participants of this tournament.",
-        )
-
-    # Gating rule: Strictly hide community / WhatsApp link from participants while registration remains open.
-    # Registration is officially closed if:
-    # 1. Admin/organizer marked status as closed/ongoing/live/completed
-    tourn_status = str(tourn.get("status", "")).upper()
-    is_status_closed = tourn_status in ["REGISTRATION_CLOSED", "CLOSED", "ONGOING", "LIVE", "COMPLETED"]
-
-    # 2. Registration deadline has passed
-    is_deadline_passed = False
-    reg_deadline = tourn.get("registration_deadline")
-    if reg_deadline:
-        reg_deadline_dt = None
-        if isinstance(reg_deadline, str):
-            try:
-                reg_deadline_dt = datetime.fromisoformat(reg_deadline.replace("Z", "+00:00"))
-            except Exception:
-                reg_deadline_dt = None
-        elif isinstance(reg_deadline, datetime):
-            reg_deadline_dt = reg_deadline
-
-        if reg_deadline_dt:
-            if reg_deadline_dt.tzinfo is None:
-                reg_deadline_dt = reg_deadline_dt.replace(tzinfo=timezone.utc)
-            now_utc = datetime.now(timezone.utc)
-            is_deadline_passed = (now_utc >= reg_deadline_dt)
-
-    # 3. Maximum participant capacity (slot limit) has been reached
-    max_teams_val = int(tourn.get("max_teams", 16))
-    confirmed_count = await db.tournament_registrations.count_documents({
-        "tournament_id": {"$in": [tid, tslug]},
-        "payment_status": {"$in": ["PAID", "FREE"]},
-        "status": {"$nin": ["CANCELLED", "REFUNDED"]},
-    })
-    is_capacity_full = (confirmed_count >= max_teams_val)
-
-    is_registration_closed = is_status_closed or is_deadline_passed or is_capacity_full
-
-    if not is_registration_closed:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Tournament registration is currently open. The official WhatsApp group link will unlock automatically once registration officially closes.",
         )
 
     return {

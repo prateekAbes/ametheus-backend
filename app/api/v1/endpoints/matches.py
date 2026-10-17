@@ -8,7 +8,7 @@ from app.api.deps import get_db, get_current_user, get_current_user_optional
 from app.models.user import User
 from app.models.match import Match
 from app.models.dispute import Dispute
-from app.schemas import MatchResponse, MatchResultSubmit, DisputeCreate
+from app.schemas import MatchResponse, MatchResultSubmit, DisputeCreate, BattleRoyaleSubmitResultsPayload
 from app.services.audit import record_audit_log
 from app.core.ws import ws_manager
 
@@ -28,30 +28,128 @@ def normalize_match_format(fmt: Optional[str]) -> str:
 async def list_matches(
     tournament_id: Optional[str] = Query(None, description="Filter matches by tournament ID or slug"),
     status: Optional[str] = Query(None, description="Filter matches by status (e.g. LIVE, UPCOMING, COMPLETED)"),
+    current_user: Optional[User] = Depends(get_current_user_optional),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
-    query = {"roster_status": {"$ne": "DRAFT"}}
-    if tournament_id:
-        tourn = await db.tournaments.find_one({"$or": [{"_id": tournament_id}, {"id": tournament_id}, {"slug": tournament_id}]})
-        if tourn:
-            tid = str(tourn.get("_id", tourn.get("id")))
-            tslug = tourn.get("slug")
-            query["$or"] = [{"tournament_id": tid}, {"tournament_id": tslug}]
+    """
+    Architecture: Single Live Match Card Per Tournament.
+    - When tournament_id is NOT provided: Returns exactly ONE Live Match card per tournament from db.live_matches.
+      The card dynamically tracks the active encounter (Match 1 -> Match 2 -> Grand Final or BR rounds).
+    - When tournament_id IS provided: Returns all individual encounters from db.matches for tournament brackets,
+      round history, and drill-down navigation without deleting previous results.
+    """
+    is_admin_or_organizer = bool(current_user and current_user.role in ["SUPER_ADMIN", "ADMIN", "ORGANIZER"])
 
-            # Auto-generate matches if tournament is LIVE or ONGOING with 0 matches and >= 2 registrations
-            if tourn.get("status") in ["LIVE", "ONGOING"]:
-                matches_count = await db.matches.count_documents({"$or": [{"tournament_id": tid}, {"tournament_id": tslug}]})
-                reg_count = await db.tournament_registrations.count_documents({
-                    "$or": [{"tournament_id": tid}, {"tournament_id": tslug}],
-                    "payment_status": {"$nin": ["REJECTED", "CANCELLED", "REFUNDED"]},
-                })
-                if matches_count == 0 and reg_count >= 2:
-                    from app.services.bracket_engine import build_single_elimination_bracket
-                    from app.models.tournament import Tournament
-                    tourn_obj = Tournament.from_mongo(tourn)
-                    await build_single_elimination_bracket(tournament=tourn_obj, db=db)
-        else:
-            query["tournament_id"] = tournament_id
+    # 1. Single Live Match per Tournament (Live Matches Public View)
+    if not tournament_id:
+        lm_count = await db.live_matches.count_documents({})
+        tourn_count = await db.tournaments.count_documents({})
+        if lm_count < tourn_count or lm_count == 0:
+            from app.services.live_match_service import reconcile_all_live_matches
+            await reconcile_all_live_matches(db)
+
+        lm_query = {}
+        if status:
+            stat_upper = status.upper()
+            if stat_upper in ["LIVE", "ONGOING"]:
+                lm_query["status"] = {"$in": ["LIVE", "IN_PROGRESS", "CHECK_IN_OPEN"]}
+            elif stat_upper in ["UPCOMING", "SCHEDULED"]:
+                lm_query["status"] = {"$in": ["SCHEDULED", "CHECK_IN_OPEN"]}
+            else:
+                lm_query["status"] = stat_upper
+
+        cursor = db.live_matches.find(lm_query)
+        live_matches = await cursor.to_list(length=200)
+
+        response = []
+        for lm in live_matches:
+            mid = str(lm.get("id") or lm.get("_id"))
+            tourn_id_val = str(lm.get("tournament_id") or "")
+            match_status = lm.get("status", "SCHEDULED")
+            scheduled_at_iso = lm.get("scheduled_at").isoformat() if isinstance(lm.get("scheduled_at"), datetime) else lm.get("scheduled_at")
+            credentials_released = bool(lm.get("credentials_released", False))
+
+            if is_admin_or_organizer:
+                lobby_code = lm.get("lobby_code") or lm.get("room_id")
+                lobby_password = lm.get("lobby_password") or lm.get("room_password")
+                room_id = lm.get("room_id") or lm.get("lobby_code")
+                room_password = lm.get("room_password") or lm.get("lobby_password")
+                custom_instructions = lm.get("custom_instructions")
+            else:
+                lobby_code = None
+                lobby_password = None
+                room_id = None
+                room_password = None
+                custom_instructions = None
+
+            enc_history = lm.get("encounter_history") or []
+
+            response.append(
+                MatchResponse(
+                    id=mid,
+                    tournament_id=tourn_id_val,
+                    tournament_title=lm.get("tournament_title", "Championship"),
+                    game_slug=lm.get("game_slug", "valorant"),
+                    game_name=lm.get("game_name", "Valorant"),
+                    stage=lm.get("current_stage") or lm.get("current_round_name") or "Round 1",
+                    match_type="BATTLE_ROYALE" if lm.get("is_battle_royale") else "MATCH",
+                    format=normalize_match_format(lm.get("format")),
+                    series_format=lm.get("series_format", "BO1"),
+                    scheduled_time=lm.get("scheduled_time", "TBD"),
+                    scheduled_at=scheduled_at_iso,
+                    live_link=lm.get("youtube_live_url") or lm.get("live_link"),
+                    youtube_live_url=lm.get("youtube_live_url") or lm.get("live_link"),
+                    order=lm.get("current_encounter_number", 1),
+                    status=match_status,
+                    server_region=lm.get("server_region", "AWS Mumbai (ap-south-1)"),
+                    lobby_code=lobby_code,
+                    lobby_password=lobby_password,
+                    room_id=room_id,
+                    room_password=room_password,
+                    custom_instructions=custom_instructions,
+                    credentials_released=credentials_released,
+                    teams=lm.get("teams", []),
+                    team_ids=lm.get("team_ids", []),
+                    placements=lm.get("placements", []),
+                    qualifier_team_ids=lm.get("qualifier_team_ids", []),
+                    qualifiers_count=lm.get("qualifiers_count"),
+                    is_final_round=bool(lm.get("is_final_round", False)),
+                    team_a=lm.get("team_a"),
+                    team_b=lm.get("team_b"),
+                    winner_team_id=lm.get("winner_team_id"),
+                    check_in_status=lm.get("check_in_status") or {},
+                    current_encounter_id=lm.get("current_encounter_id"),
+                    current_encounter_number=lm.get("current_encounter_number", 1),
+                    current_encounter_title=lm.get("current_encounter_title", "Match 1"),
+                    current_round_name=lm.get("current_round_name", "Round 1"),
+                    current_round_number=lm.get("current_round_number", 1),
+                    encounter_history=enc_history,
+                )
+            )
+        return response
+
+    # 2. Specific Tournament Encounters (Round Management & Bracket Drill-Down)
+    query = {"roster_status": {"$ne": "DRAFT"}}
+    tourn = await db.tournaments.find_one({"$or": [{"_id": tournament_id}, {"id": tournament_id}, {"slug": tournament_id}]})
+    if tourn:
+        tid = str(tourn.get("_id", tourn.get("id")))
+        tslug = tourn.get("slug")
+        query["$or"] = [{"tournament_id": tid}, {"tournament_id": tslug}]
+
+        # Auto-generate matches if tournament is LIVE or ONGOING with 0 matches and >= 2 registrations
+        if tourn.get("status") in ["LIVE", "ONGOING"]:
+            matches_count = await db.matches.count_documents({"$or": [{"tournament_id": tid}, {"tournament_id": tslug}]})
+            reg_count = await db.tournament_registrations.count_documents({
+                "$or": [{"tournament_id": tid}, {"tournament_id": tslug}],
+                "payment_status": {"$nin": ["REJECTED", "CANCELLED", "REFUNDED"]},
+            })
+            if matches_count == 0 and reg_count >= 2:
+                from app.services.bracket_engine import build_single_elimination_bracket
+                from app.models.tournament import Tournament
+                tourn_obj = Tournament.from_mongo(tourn)
+                await build_single_elimination_bracket(tournament=tourn_obj, db=db)
+    else:
+        query["tournament_id"] = tournament_id
 
     if status:
         stat_upper = status.upper()
@@ -69,11 +167,11 @@ async def list_matches(
     for m in matches:
         mid = str(m.get("_id", m.get("id")))
         tourn_id = m.get("tournament_id")
-        tourn = await db.tournaments.find_one({"$or": [{"_id": tourn_id}, {"id": tourn_id}, {"slug": tourn_id}]}) if tourn_id else None
+        t_doc = tourn or (await db.tournaments.find_one({"$or": [{"_id": tourn_id}, {"id": tourn_id}, {"slug": tourn_id}]}) if tourn_id else None)
         
         game = None
-        if tourn and tourn.get("game_id"):
-            gid = tourn["game_id"]
+        if t_doc and t_doc.get("game_id"):
+            gid = t_doc["game_id"]
             game = await db.games.find_one({"$or": [{"_id": gid}, {"id": gid}, {"slug": gid}]})
 
         team_a_id = m.get("team_a_id")
@@ -93,16 +191,31 @@ async def list_matches(
 
         match_status = m.get("status", "SCHEDULED")
         scheduled_at_iso = m.get("scheduled_at").isoformat() if isinstance(m.get("scheduled_at"), datetime) else m.get("scheduled_at")
-        
-        # Public match listing must never leak private room credentials
-        lobby_code = None
-        lobby_password = None
+        credentials_released = bool(m.get("credentials_released", False))
+
+        if is_admin_or_organizer:
+            lobby_code = m.get("lobby_code") or m.get("room_id")
+            lobby_password = m.get("lobby_password") or m.get("room_password")
+            room_id = m.get("room_id") or m.get("lobby_code")
+            room_password = m.get("room_password") or m.get("lobby_password")
+            custom_instructions = m.get("custom_instructions") or m.get("match_message")
+        else:
+            # Public match listing must never leak private room credentials
+            lobby_code = None
+            lobby_password = None
+            room_id = None
+            room_password = None
+            custom_instructions = None
+
+        m_num = int(m.get("match_number") or m.get("order") or 1)
+        r_name = m.get("round_name") or m.get("stage") or "Round 1"
+        r_num = int(m.get("round_number") or 1)
 
         response.append(
             MatchResponse(
                 id=mid,
                 tournament_id=tourn_id or "",
-                tournament_title=tourn["title"] if tourn else "Championship",
+                tournament_title=t_doc["title"] if t_doc else "Championship",
                 game_slug=game["slug"] if game else "valorant",
                 game_name=game["name"] if game else "Valorant",
                 stage=m.get("stage", "Quarterfinals"),
@@ -118,12 +231,29 @@ async def list_matches(
                 server_region=m.get("server_region", "AWS Mumbai (ap-south-1)"),
                 lobby_code=lobby_code,
                 lobby_password=lobby_password,
+                room_id=room_id,
+                room_password=room_password,
+                custom_instructions=custom_instructions,
+                credentials_released=credentials_released,
+                teams=m.get("teams", []),
+                team_ids=m.get("team_ids", []),
+                placements=m.get("placements", []),
+                qualifier_team_ids=m.get("qualifier_team_ids", []),
+                qualifiers_count=m.get("qualifiers_count"),
+                is_final_round=bool(m.get("is_final_round", False)),
+                next_match_id=m.get("next_match_id"),
                 team_a={"id": team_a_id, "name": team_a["name"], "tag": team_a.get("tag", "TEAM"), "score": m.get("score_a", 0)} if team_a else None,
                 team_b={"id": team_b_id, "name": team_b["name"], "tag": team_b.get("tag", "TEAM"), "score": m.get("score_b", 0)} if team_b else None,
                 winner_team_id=m.get("winner_team_id"),
                 check_in_status=m.get("check_in_status") or {"team_a": False, "team_b": False},
                 evidence_url=m.get("evidence_url"),
                 dispute_notes=m.get("dispute_notes"),
+                current_encounter_id=mid,
+                current_encounter_number=m_num,
+                current_encounter_title=m.get("stage") or f"Match {m_num}",
+                current_round_name=r_name,
+                current_round_number=r_num,
+                encounter_history=[],
             )
         )
     return response
@@ -134,7 +264,19 @@ async def captain_check_in(
     current_user: User = Depends(get_current_user),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
-    match = await db.matches.find_one({"$or": [{"_id": id}, {"id": id}]})
+    from bson import ObjectId
+    m_query = [{"_id": id}, {"id": id}]
+    if ObjectId.is_valid(id):
+        m_query.append({"_id": ObjectId(id)})
+    match = await db.matches.find_one({"$or": m_query})
+    if not match:
+        live_doc = await db.live_matches.find_one({"$or": [{"_id": id}, {"id": id}, {"tournament_id": id}]})
+        if live_doc and live_doc.get("current_encounter_id"):
+            enc_id = live_doc["current_encounter_id"]
+            enc_query = [{"_id": enc_id}, {"id": enc_id}]
+            if ObjectId.is_valid(enc_id):
+                enc_query.append({"_id": ObjectId(enc_id)})
+            match = await db.matches.find_one({"$or": enc_query})
     if not match:
         raise HTTPException(status_code=404, detail="Match not found")
 
@@ -268,6 +410,12 @@ async def captain_check_in(
         target=f"Match {mid}",
         details=f"Player @{current_user.username} checked in. Match status remains {new_status}.",
     )
+    try:
+        from app.services.live_match_service import sync_live_match_for_tournament
+        await sync_live_match_for_tournament(str(match.get("tournament_id")), db)
+    except Exception:
+        pass
+
     return {"status": "success", "message": f"Check-in verified. Match is {new_status}.", "check_in_status": check_in_status}
 
 @router.post("/{id}/submit-result")
@@ -284,7 +432,19 @@ async def submit_match_result(
             detail="Only tournament organizers or administrators are authorized to submit match results.",
         )
 
-    match = await db.matches.find_one({"$or": [{"_id": id}, {"id": id}]})
+    from bson import ObjectId
+    m_query = [{"_id": id}, {"id": id}]
+    if ObjectId.is_valid(id):
+        m_query.append({"_id": ObjectId(id)})
+    match = await db.matches.find_one({"$or": m_query})
+    if not match:
+        live_doc = await db.live_matches.find_one({"$or": [{"_id": id}, {"id": id}, {"tournament_id": id}]})
+        if live_doc and live_doc.get("current_encounter_id"):
+            enc_id = live_doc["current_encounter_id"]
+            enc_query = [{"_id": enc_id}, {"id": enc_id}]
+            if ObjectId.is_valid(enc_id):
+                enc_query.append({"_id": ObjectId(enc_id)})
+            match = await db.matches.find_one({"$or": enc_query})
     if not match:
         raise HTTPException(status_code=404, detail="Match not found")
 
@@ -317,6 +477,12 @@ async def submit_match_result(
         "score_b": payload.score_b,
         "status": "COMPLETED",
     })
+
+    try:
+        from app.services.live_match_service import sync_live_match_for_tournament
+        await sync_live_match_for_tournament(str(match.get("tournament_id")), db)
+    except Exception:
+        pass
 
     return {"status": "success", "message": "Match result finalized successfully"}
 
@@ -522,8 +688,67 @@ async def get_match_detail(
         m_query["$or"].append({"_id": ObjectId(id)})
 
     match = await db.matches.find_one(m_query)
+    live_doc = None
     if not match:
-        raise HTTPException(status_code=404, detail="Match not found")
+        live_doc = await db.live_matches.find_one({"$or": [{"_id": id}, {"id": id}, {"tournament_id": id}]})
+        if live_doc and live_doc.get("current_encounter_id"):
+            enc_id = live_doc["current_encounter_id"]
+            enc_query = [{"_id": enc_id}, {"id": enc_id}]
+            if ObjectId.is_valid(enc_id):
+                enc_query.append({"_id": ObjectId(enc_id)})
+            match = await db.matches.find_one({"$or": enc_query})
+
+        if not match:
+            tourn_doc_check = await db.tournaments.find_one({"$or": [{"_id": id}, {"id": id}, {"slug": id}]})
+            if tourn_doc_check:
+                from app.services.live_match_service import sync_live_match_for_tournament
+                tid_str = str(tourn_doc_check.get("_id", tourn_doc_check.get("id")))
+                synced_live = await sync_live_match_for_tournament(tid_str, db)
+                if synced_live and synced_live.get("current_encounter_id"):
+                    enc_id = synced_live["current_encounter_id"]
+                    enc_query = [{"_id": enc_id}, {"id": enc_id}]
+                    if ObjectId.is_valid(enc_id):
+                        enc_query.append({"_id": ObjectId(enc_id)})
+                    match = await db.matches.find_one({"$or": enc_query})
+                    live_doc = synced_live
+
+        if not match:
+            if live_doc:
+                return {
+                    "id": str(live_doc.get("id") or live_doc.get("_id")),
+                    "tournament_id": live_doc.get("tournament_id"),
+                    "tournament_title": live_doc.get("tournament_title"),
+                    "game_slug": live_doc.get("game_slug"),
+                    "game_name": live_doc.get("game_name"),
+                    "stage": live_doc.get("current_stage", "Round 1"),
+                    "format": live_doc.get("format", "Knockout"),
+                    "series_format": live_doc.get("series_format", "BO1"),
+                    "status": live_doc.get("status", "SCHEDULED"),
+                    "scheduled_time": live_doc.get("scheduled_time", "TBD"),
+                    "scheduled_at": live_doc.get("scheduled_at"),
+                    "team_a": live_doc.get("team_a"),
+                    "team_b": live_doc.get("team_b"),
+                    "teams": live_doc.get("teams", []),
+                    "tournament": {
+                        "id": live_doc.get("tournament_id"),
+                        "title": live_doc.get("tournament_title"),
+                        "game_slug": live_doc.get("game_slug"),
+                        "game_name": live_doc.get("game_name"),
+                        "status": live_doc.get("status", "SCHEDULED"),
+                    },
+                    "team_a_details": None,
+                    "team_b_details": None,
+                    "teams_details": [],
+                    "previous_matches": [],
+                    "next_match": None,
+                    "tournament_progression": [],
+                    "current_encounter_id": None,
+                    "current_encounter_number": 1,
+                    "current_encounter_title": "Match 1",
+                    "current_round_name": "Round 1",
+                    "encounter_history": live_doc.get("encounter_history", []),
+                }
+            raise HTTPException(status_code=404, detail="Match not found")
 
     m = Match.from_mongo(match).model_dump()
 
@@ -639,9 +864,10 @@ async def get_match_detail(
 
     # Strip sensitive credentials from public payload unless released and authorized
     credentials_released = bool(m.get("credentials_released", False))
+    is_admin_or_organizer = bool(current_user and current_user.role in ["SUPER_ADMIN", "ADMIN", "ORGANIZER"])
     is_authorized = await is_match_authorized_viewer(current_user, m, db)
 
-    if not (credentials_released and is_authorized):
+    if not is_admin_or_organizer and not (credentials_released and is_authorized):
         m["room_id"] = None
         m["room_password"] = None
         m["lobby_code"] = None
@@ -649,6 +875,20 @@ async def get_match_detail(
         m["custom_instructions"] = None
 
     m.pop("join_info", None)
+
+    live_match = await db.live_matches.find_one({"tournament_id": tourn_id}) if tourn_id else None
+    if live_match:
+        m["current_encounter_id"] = live_match.get("current_encounter_id")
+        m["current_encounter_number"] = live_match.get("current_encounter_number")
+        m["current_encounter_title"] = live_match.get("current_encounter_title")
+        m["current_round_name"] = live_match.get("current_round_name")
+        m["encounter_history"] = live_match.get("encounter_history", [])
+    else:
+        m["current_encounter_id"] = str(match.get("_id", match.get("id")))
+        m["current_encounter_number"] = int(match.get("match_number") or match.get("order") or 1)
+        m["current_encounter_title"] = match.get("stage") or f"Match {m['current_encounter_number']}"
+        m["current_round_name"] = match.get("round_name") or match.get("stage") or "Round 1"
+        m["encounter_history"] = []
 
     return {
         **m,
@@ -691,6 +931,14 @@ async def get_match_join_info(
         m_query["$or"].append({"_id": ObjectId(id)})
 
     match = await db.matches.find_one(m_query)
+    if not match:
+        live_doc = await db.live_matches.find_one({"$or": [{"_id": id}, {"id": id}, {"tournament_id": id}]})
+        if live_doc and live_doc.get("current_encounter_id"):
+            enc_id = live_doc["current_encounter_id"]
+            enc_query = [{"_id": enc_id}, {"id": enc_id}]
+            if ObjectId.is_valid(enc_id):
+                enc_query.append({"_id": ObjectId(enc_id)})
+            match = await db.matches.find_one({"$or": enc_query})
     if not match:
         raise HTTPException(status_code=404, detail="Match not found")
 
@@ -845,9 +1093,13 @@ async def update_match_details(
 
     update_data = {}
     if payload.lobby_code is not None:
-        update_data["lobby_code"] = payload.lobby_code.strip() if payload.lobby_code else None
+        val = payload.lobby_code.strip() if payload.lobby_code else None
+        update_data["lobby_code"] = val
+        update_data["room_id"] = val
     if payload.lobby_password is not None:
-        update_data["lobby_password"] = payload.lobby_password.strip() if payload.lobby_password else None
+        val = payload.lobby_password.strip() if payload.lobby_password else None
+        update_data["lobby_password"] = val
+        update_data["room_password"] = val
     if payload.youtube_live_url is not None:
         url = payload.youtube_live_url.strip() or None
         update_data["youtube_live_url"] = url
@@ -870,6 +1122,27 @@ async def update_match_details(
     if update_data:
         update_data["updated_at"] = datetime.now(timezone.utc)
         await db.matches.update_one({"_id": match["_id"]}, {"$set": update_data})
+        try:
+            from app.services.live_match_service import sync_live_match_for_tournament
+            await sync_live_match_for_tournament(str(match.get("tournament_id")), db)
+        except Exception:
+            pass
 
     return {"status": "success", "message": "Match updated successfully"}
+
+@router.post("/{id}/battle-royale-results")
+async def submit_match_battle_royale_results(
+    id: str,
+    payload: BattleRoyaleSubmitResultsPayload,
+    current_user: User = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    from app.api.v1.endpoints.admin import submit_battle_royale_results_admin
+    return await submit_battle_royale_results_admin(
+        id=id,
+        payload=payload,
+        admin_user=current_user,
+        db=db,
+    )
+
 

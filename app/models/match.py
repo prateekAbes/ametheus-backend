@@ -62,6 +62,10 @@ class Match(BaseModel):
     check_ins: list[dict] = Field(default_factory=list)
     alive_status: dict[str, bool] = Field(default_factory=dict)
     placements: list[dict] = Field(default_factory=list)
+    qualifiers: list[dict] = Field(default_factory=list)
+    qualifier_team_ids: list[str] = Field(default_factory=list)
+    qualifiers_count: Optional[int] = None
+    is_final_round: bool = False
     scoring_matrix: Optional[dict] = None
     participant_ratings: list[dict] = Field(default_factory=list)
     join_info_enabled: bool = False

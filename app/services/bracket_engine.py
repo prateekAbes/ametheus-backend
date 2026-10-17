@@ -176,6 +176,11 @@ async def build_single_elimination_bracket(
         {"$or": [{"_id": tournament.id}, {"id": tournament.id}]},
         {"$set": {"bracket_rounds": bracket_tree, "status": "LIVE"}}
     )
+    try:
+        from app.services.live_match_service import sync_live_match_for_tournament
+        await sync_live_match_for_tournament(str(tournament.id), db)
+    except Exception as e:
+        print(f"[Live Match Sync Warning in build_single_elimination_bracket]: {e}")
     return {"total_rounds": total_rounds, "bracket": bracket_tree}
 
 # 2. DOUBLE ELIMINATION
@@ -431,6 +436,11 @@ async def build_round_robin_schedule(
         {"$or": [{"_id": tournament.id}, {"id": tournament.id}]},
         {"$set": {"bracket_rounds": bracket_tree, "status": "LIVE"}}
     )
+    try:
+        from app.services.live_match_service import sync_live_match_for_tournament
+        await sync_live_match_for_tournament(str(tournament.id), db)
+    except Exception as e:
+        print(f"[Live Match Sync Warning in build_round_robin_schedule]: {e}")
     return {"total_rounds": total_rounds, "bracket": bracket_tree}
 
 # 5. DOUBLE ROUND ROBIN
@@ -823,6 +833,11 @@ async def generate_tournament_bracket(
             {"$or": [{"_id": tournament.id}, {"id": tournament.id}]},
             {"$set": {"bracket_rounds": bracket_tree, "status": "LIVE"}}
         )
+        try:
+            from app.services.live_match_service import sync_live_match_for_tournament
+            await sync_live_match_for_tournament(str(tournament.id), db)
+        except Exception as e:
+            print(f"[Live Match Sync Warning in generate_matches_for_tournament]: {e}")
         return {"total_rounds": 1, "bracket": bracket_tree}
     elif "robin" in raw_fmt:
         return await build_round_robin_schedule(tournament, db)
@@ -1080,20 +1095,40 @@ async def advance_bracket_match(
         except Exception as e:
             print(f"[Tournament Bracket Update Warning]: {e}")
 
-    # Check if all tournament matches are completed
-    tourn_id_str = str(tournament_id)
-    remaining = await db.matches.count_documents({
-        "$or": [{"tournament_id": tourn_id_str}, {"tournament_id": tournament_id}],
-        "status": {"$in": ["LIVE", "SCHEDULED", "CHECK_IN_OPEN", "PENDING_VERIFICATION", "DISPUTED"]}
-    })
-    total_m = await db.matches.count_documents({
-        "$or": [{"tournament_id": tourn_id_str}, {"tournament_id": tournament_id}],
-    })
-    if total_m > 0 and remaining == 0:
-        await db.tournaments.update_one(
-            {"$or": [{"_id": tournament_id}, {"id": tournament_id}, {"slug": tournament_id}]},
-            {"$set": {"status": "COMPLETED"}}
+    # Check if tournament has reached its actual final stage and all matches are complete
+    # Strict Rule: Battle Royale matches and preliminary/intermediate rounds must NEVER auto-complete the tournament!
+    is_br = (
+        (completed_match.format or "").lower().strip() == "battle royale"
+        or (completed_match.match_type or "").upper().strip() == "BATTLE_ROYALE"
+    )
+    if not is_br:
+        round_name_clean = (completed_match.round_name or completed_match.stage or "").lower().strip()
+        is_final_stage = (
+            getattr(completed_match, "is_final_round", False)
+            or round_name_clean in ["final", "grand final", "finals", "championship"]
+            or (round_name_clean.startswith("final") and "semi" not in round_name_clean and "quarter" not in round_name_clean)
         )
+
+        if is_final_stage:
+            tourn_id_str = str(tournament_id)
+            remaining = await db.matches.count_documents({
+                "$or": [{"tournament_id": tourn_id_str}, {"tournament_id": tournament_id}],
+                "status": {"$in": ["LIVE", "SCHEDULED", "CHECK_IN_OPEN", "PENDING_VERIFICATION", "DISPUTED"]}
+            })
+            total_m = await db.matches.count_documents({
+                "$or": [{"tournament_id": tourn_id_str}, {"tournament_id": tournament_id}],
+            })
+            if total_m > 0 and remaining == 0:
+                await db.tournaments.update_one(
+                    {"$or": [{"_id": tournament_id}, {"id": tournament_id}, {"slug": tournament_id}]},
+                    {"$set": {"status": "COMPLETED", "winner_team_id": winner_team_id}}
+                )
+
+    try:
+        from app.services.live_match_service import sync_live_match_for_tournament
+        await sync_live_match_for_tournament(str(tournament_id), db)
+    except Exception as e:
+        print(f"[Live Match Sync Warning in advance_bracket_match]: {e}")
 
     return next_match
 

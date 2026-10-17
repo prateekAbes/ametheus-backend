@@ -499,6 +499,23 @@ class MatchResponse(BaseModel):
     check_in_status: Optional[Dict[str, bool]] = None
     evidence_url: Optional[str] = None
     dispute_notes: Optional[str] = None
+    room_id: Optional[str] = None
+    room_password: Optional[str] = None
+    custom_instructions: Optional[str] = None
+    credentials_released: Optional[bool] = False
+    teams: Optional[List[Dict[str, Any]]] = None
+    team_ids: Optional[List[str]] = None
+    placements: Optional[List[Dict[str, Any]]] = None
+    qualifier_team_ids: Optional[List[str]] = None
+    qualifiers_count: Optional[int] = None
+    is_final_round: Optional[bool] = False
+    next_match_id: Optional[str] = None
+    current_encounter_id: Optional[str] = None
+    current_encounter_number: Optional[int] = None
+    current_encounter_title: Optional[str] = None
+    current_round_name: Optional[str] = None
+    current_round_number: Optional[int] = None
+    encounter_history: Optional[List[Dict[str, Any]]] = None
     model_config = ConfigDict(from_attributes=True, extra="allow")
 
 class AdminMatchPairRequest(BaseModel):
@@ -580,6 +597,12 @@ class AdminMatchUpdatePayload(BaseModel):
     join_info_enabled: Optional[bool] = None
     join_info: Optional[Dict[str, str]] = None
     match_message: Optional[str] = None
+    lobby_code: Optional[str] = None
+    lobby_password: Optional[str] = None
+    room_id: Optional[str] = None
+    room_password: Optional[str] = None
+    server_region: Optional[str] = None
+    custom_instructions: Optional[str] = None
 
 class AdminPublishRosterPayload(BaseModel):
     notify_leaders: bool = True
@@ -887,7 +910,7 @@ class MatchCredentialsUpdatePayload(BaseModel):
 class BattleRoyaleTeamResult(BaseModel):
     team_id: str
     team_name: Optional[str] = None
-    placement: int
+    placement: Optional[int] = None
     kills: int = 0
     placement_points: Optional[int] = None
     elimination_points: Optional[int] = None
@@ -898,6 +921,11 @@ class BattleRoyaleTeamResult(BaseModel):
 class BattleRoyaleSubmitResultsPayload(BaseModel):
     results: Optional[List[BattleRoyaleTeamResult]] = None
     team_results: Optional[List[BattleRoyaleTeamResult]] = None
+    qualifier_team_ids: Optional[List[str]] = None
+    qualifiers_count: Optional[int] = None
+    advance_to_next_round: bool = False
+    next_round_name: Optional[str] = None
+    is_final_round: bool = False
     scoring_matrix: Optional[Dict[str, Any]] = None
 
     def get_results(self) -> List[BattleRoyaleTeamResult]:

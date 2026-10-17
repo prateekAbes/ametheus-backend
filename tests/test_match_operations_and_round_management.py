@@ -424,6 +424,13 @@ async def test_battle_royale_squad_alive_status_and_results(mock_db, make_client
         teams=teams,
         alive_status={"squad_1": True, "squad_2": True, "squad_3": True},
     )
+    await mock_db.tournaments.insert_one({
+        "_id": "tourn_br_01",
+        "id": "tourn_br_01",
+        "title": "BR Tournament",
+        "format": "Battle Royale",
+        "status": "LIVE",
+    })
     await mock_db.matches.insert_one(br_match.to_mongo())
 
     client = make_client(admin)

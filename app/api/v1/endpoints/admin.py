@@ -2899,6 +2899,8 @@ class GenerateBRMatchesPayload(BaseModel):
     stage_name: str = "Round 1"
     round_name: str = "Round 1"
     balanced: bool = False
+    lobby_size: Optional[int] = None
+    max_teams_per_match: Optional[int] = None
     custom_distribution: Optional[List[Dict[str, Any]]] = None
 
 class RebalanceBRMatchesPayload(BaseModel):
@@ -2993,6 +2995,8 @@ async def get_battle_royale_calculation_admin(
 async def generate_battle_royale_matches_admin(
     id: str,
     payload: Optional[GenerateBRMatchesPayload] = None,
+    round_number: Optional[int] = None,
+    lobby_size: Optional[int] = None,
     admin_user: User = Depends(require_organizer),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
@@ -3000,6 +3004,7 @@ async def generate_battle_royale_matches_admin(
     Generates Battle Royale match lobbies distributing the actual registered teams.
     Saves to db.matches and marks tournament format as Battle Royale.
     """
+    import math
     from app.services.battle_royale_engine import (
         get_confirmed_registered_teams,
         get_battle_royale_specs,
@@ -3027,11 +3032,44 @@ async def generate_battle_royale_matches_admin(
         game_doc=game_doc,
     )
 
+    effective_round_num = round_number or payload.round_number or 1
+    if effective_round_num > 1:
+        prev_round = effective_round_num - 1
+        qual_docs = await db.tournament_qualifications.find({
+            "$or": [{"tournament_id": tid}, {"tournament_id": tslug}],
+            "source_round_number": prev_round,
+            "status": "QUALIFIED",
+        }).to_list(length=500)
+        if qual_docs:
+            qual_ids = set([d["participant_id"] for d in qual_docs])
+            teams_list = [t for t in teams_list if t["id"] in qual_ids]
+        else:
+            # Fallback to previous round match qualifiers
+            prev_match = await db.matches.find_one({
+                "$or": [{"tournament_id": tid}, {"tournament_id": tslug}],
+                "round_number": prev_round,
+            })
+            if prev_match and prev_match.get("qualifier_team_ids"):
+                qual_ids = set(prev_match["qualifier_team_ids"])
+                teams_list = [t for t in teams_list if t["id"] in qual_ids]
+
     calc = calculate_battle_royale_parameters(
         actual_registered_teams=len(teams_list),
         room_capacity=room_capacity,
         players_per_team=players_per_team,
     )
+
+    effective_max_teams = None
+    if lobby_size is not None and lobby_size > 0:
+        effective_max_teams = lobby_size
+    elif payload.lobby_size is not None and payload.lobby_size > 0:
+        effective_max_teams = payload.lobby_size
+    elif payload.max_teams_per_match is not None and payload.max_teams_per_match > 0:
+        effective_max_teams = payload.max_teams_per_match
+    else:
+        effective_max_teams = calc["max_teams_per_match"]
+
+    effective_required_matches = math.ceil(len(teams_list) / max(1, effective_max_teams)) if effective_max_teams else calc["required_matches"]
 
     teams_by_id = {t["id"]: t for t in teams_list}
 
@@ -3047,20 +3085,20 @@ async def generate_battle_royale_matches_admin(
         if not match_partitions:
             match_partitions = distribute_teams_into_matches(
                 teams=teams_list,
-                max_teams_per_match=calc["max_teams_per_match"],
-                required_matches=calc["required_matches"],
+                max_teams_per_match=effective_max_teams,
+                required_matches=effective_required_matches,
                 balanced=payload.balanced,
             )
     else:
         match_partitions = distribute_teams_into_matches(
             teams=teams_list,
-            max_teams_per_match=calc["max_teams_per_match"],
-            required_matches=calc["required_matches"],
+            max_teams_per_match=effective_max_teams,
+            required_matches=effective_required_matches,
             balanced=payload.balanced,
         )
 
-    stage_name = payload.stage_name or "Round 1"
-    round_name = payload.round_name or "Round 1"
+    stage_name = payload.stage_name or (f"Round {effective_round_num}")
+    round_name = payload.round_name or (f"Round {effective_round_num}")
 
     # Delete existing scheduled Battle Royale matches for this round before recreating
     await db.matches.delete_many({
@@ -3083,7 +3121,7 @@ async def generate_battle_royale_matches_admin(
             round_name=round_name,
             stage=round_name,
             match_type="BATTLE_ROYALE",
-            round_number=1,
+            round_number=effective_round_num,
             match_number=match_num,
             format="Battle Royale",
             series_format="BO1",
@@ -3114,6 +3152,12 @@ async def generate_battle_royale_matches_admin(
             "players_per_team": calc["players_per_team"],
         }}
     )
+
+    try:
+        from app.services.live_match_service import sync_live_match_for_tournament
+        await sync_live_match_for_tournament(tid, db)
+    except Exception as e:
+        pass
 
     return {
         "status": "success",
@@ -3726,6 +3770,20 @@ async def update_match_details_admin(
             update_fields["scheduled_time"] = dt.strftime("%b %d, %I:%M %p")
         except Exception:
             pass
+    if payload.lobby_code is not None or payload.room_id is not None:
+        val = (payload.room_id if payload.room_id is not None else payload.lobby_code or "").strip()
+        update_fields["room_id"] = val if val else None
+        update_fields["lobby_code"] = val if val else None
+    if payload.lobby_password is not None or payload.room_password is not None:
+        val = (payload.room_password if payload.room_password is not None else payload.lobby_password or "").strip()
+        update_fields["room_password"] = val if val else None
+        update_fields["lobby_password"] = val if val else None
+    if payload.server_region is not None:
+        update_fields["server_region"] = payload.server_region.strip()
+    if payload.custom_instructions is not None:
+        c_inst = payload.custom_instructions.strip()
+        update_fields["custom_instructions"] = c_inst if c_inst else None
+        update_fields["match_message"] = c_inst if c_inst else None
 
     if update_fields:
         old_roster_status = match.get("roster_status", "PUBLISHED")
@@ -3789,6 +3847,12 @@ async def update_match_details_admin(
         target=f"Match {id}",
         details=str(update_fields),
     )
+
+    try:
+        from app.services.live_match_service import sync_live_match_for_tournament
+        await sync_live_match_for_tournament(str(match.get("tournament_id")), db)
+    except Exception as e:
+        pass
 
     return {"status": "success", "message": "Match updated successfully", "updated": update_fields}
 
@@ -4113,6 +4177,12 @@ async def complete_match_admin(
         target=f"Match {match.id}",
         details=f"Scores: {score_a}-{score_b} | Winner: {winner_id}",
     )
+
+    try:
+        from app.services.live_match_service import sync_live_match_for_tournament
+        await sync_live_match_for_tournament(str(match.tournament_id), db)
+    except Exception as e:
+        pass
 
     return {
         "status": "success",
@@ -5232,6 +5302,7 @@ async def update_round_stream_admin(
 
 
 @router.patch("/matches/{id}/credentials")
+@router.put("/matches/{id}/credentials")
 async def update_match_credentials_admin(
     id: str,
     payload: MatchCredentialsUpdatePayload,
@@ -5274,6 +5345,11 @@ async def update_match_credentials_admin(
 
     if upd:
         await db.matches.update_one(m_query, {"$set": upd})
+        try:
+            from app.services.live_match_service import sync_live_match_for_tournament
+            await sync_live_match_for_tournament(str(match.get("tournament_id")), db)
+        except Exception:
+            pass
 
     return {
         "status": "success",
@@ -5316,6 +5392,10 @@ async def release_match_credentials_admin(
         "credentials_released_at": now,
         "credentials_released_by": admin_user.username,
         "join_info_enabled": True,
+        "room_id": room_val,
+        "room_password": pass_val,
+        "lobby_code": room_val,
+        "lobby_password": pass_val,
         "join_info": {
             "room_id": room_val,
             "room_password": pass_val,
@@ -5348,6 +5428,12 @@ async def release_match_credentials_admin(
         target=f"Match {mid}",
         details="Match credentials released and check-in opened for participants.",
     )
+
+    try:
+        from app.services.live_match_service import sync_live_match_for_tournament
+        await sync_live_match_for_tournament(str(match.get("tournament_id")), db)
+    except Exception:
+        pass
 
     return {
         "status": "success",
@@ -5462,8 +5548,11 @@ async def submit_battle_royale_results_admin(
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """
-    Section 11: Organizer submits official Battle Royale placements, kills, and scoring.
-    Computes total points and stores qualification decisions without auto-creating downstream matches.
+    Section 11 & Overhaul: Organizer submits official Battle Royale placements, kills, scoring,
+    and multi-team round qualifiers.
+    - Decouples match completion from tournament completion.
+    - Accurately advances confirmed qualifying teams into Round N+1.
+    - Idempotent and validates that selected qualifiers belong to this match.
     """
     from bson import ObjectId
     from app.models.base import generate_uuid, get_utc_now
@@ -5476,111 +5565,345 @@ async def submit_battle_royale_results_admin(
     if not match:
         raise HTTPException(status_code=404, detail="Match not found")
 
+    tid = str(match.get("tournament_id"))
+    tourn_query = {"$or": [{"_id": tid}, {"id": tid}, {"slug": tid}]}
+    if ObjectId.is_valid(tid):
+        tourn_query["$or"].append({"_id": ObjectId(tid)})
+    tourn = await db.tournaments.find_one(tourn_query)
+    if not tourn:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+
+    # Verify authorization: Must be super admin, admin, or tournament organizer
+    if admin_user.role not in ["SUPER_ADMIN", "ADMIN"]:
+        is_creator = str(tourn.get("created_by") or tourn.get("organizer_id")) == str(admin_user.id)
+        if not is_creator:
+            raise HTTPException(status_code=403, detail="Unauthorized: Only the tournament organizer or super admin can submit match results.")
+
+    # 1. Gather all participating teams in this match
+    match_teams = list(match.get("teams") or [])
+    match_team_ids = set()
+    for t in match_teams:
+        if isinstance(t, dict):
+            t_id = str(t.get("id") or t.get("_id") or t.get("team_id"))
+            if t_id:
+                match_team_ids.add(t_id)
+    for tid_item in match.get("team_ids") or []:
+        if tid_item:
+            match_team_ids.add(str(tid_item))
+
+    # Fallback to team_a_id / team_b_id if match_teams is empty
+    if not match_team_ids:
+        for fallback_id in [match.get("team_a_id"), match.get("team_b_id")]:
+            if fallback_id:
+                match_team_ids.add(str(fallback_id))
+
+    # 2. Resolve qualifier team IDs
+    raw_qualifier_ids = list(payload.qualifier_team_ids or [])
+    if not raw_qualifier_ids:
+        raw_qualifier_ids = [str(r.team_id) for r in payload.get_results() if r.qualified]
+
+    # Validate no duplicate qualifiers
+    if len(raw_qualifier_ids) != len(set(raw_qualifier_ids)):
+        raise HTTPException(status_code=400, detail="Duplicate team entries in qualifier selection.")
+
+    # Validate qualifiers belong to this match
+    if match_team_ids:
+        for q_id in raw_qualifier_ids:
+            if str(q_id) not in match_team_ids:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Team '{q_id}' does not belong to this match."
+                )
+
+    # Validate qualifier count matches if explicitly requested
+    if payload.qualifiers_count is not None and payload.qualifiers_count >= 0:
+        if len(raw_qualifier_ids) != payload.qualifiers_count:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Expected exactly {payload.qualifiers_count} qualifiers, but {len(raw_qualifier_ids)} were selected."
+            )
+
+    qualifier_set = set(str(q) for q in raw_qualifier_ids)
+
+    # 3. Process placements & scoring
     results_list = payload.get_results()
-    if not results_list:
-        raise HTTPException(status_code=400, detail="At least one team result must be provided.")
 
-    # Validate no duplicate teams
-    team_ids = [r.team_id for r in results_list]
-    if len(team_ids) != len(set(team_ids)):
-        raise HTTPException(status_code=400, detail="Duplicate team entries in results.")
-
-    # Validate unique placement ranks
-    placements = [r.placement for r in results_list]
-    if len(placements) != len(set(placements)):
-        raise HTTPException(status_code=400, detail="Each team must have a unique placement rank.")
-
-    # Standard Battle Royale Placement Matrix:
+    # Standard Battle Royale Placement Matrix (String keys required for BSON/MongoDB):
     default_placement_points = {
-        1: 10, 2: 6, 3: 5, 4: 4, 5: 3, 6: 2, 7: 1, 8: 1
+        "1": 10, "2": 6, "3": 5, "4": 4, "5": 3, "6": 2, "7": 1, "8": 1
     }
     pts_per_kill = 1
 
     processed_results = []
+    seen_result_teams = set()
     winner_team_id = None
-    tid = str(match.get("tournament_id"))
 
-    for r in results_list:
-        place = r.placement
-        kills = r.kills or 0
-        calc_place_pts = default_placement_points.get(place, 0)
-        calc_kill_pts = kills * pts_per_kill
+    if results_list:
+        for r in results_list:
+            r_tid = str(r.team_id)
+            if r_tid in seen_result_teams:
+                raise HTTPException(status_code=400, detail=f"Duplicate team result for team '{r_tid}'.")
+            if match_team_ids and r_tid not in match_team_ids:
+                raise HTTPException(status_code=400, detail=f"Team '{r_tid}' does not belong to this match.")
+            seen_result_teams.add(r_tid)
 
-        p_pts = r.placement_points if r.placement_points is not None else calc_place_pts
-        e_pts = r.elimination_points if r.elimination_points is not None else calc_kill_pts
-        t_pts = r.total_points if r.total_points is not None else (p_pts + e_pts)
+            place = r.placement or (len(processed_results) + 1)
+            kills = r.kills or 0
+            calc_place_pts = default_placement_points.get(str(place), default_placement_points.get(place, 0))
+            calc_kill_pts = kills * pts_per_kill
 
-        if place == 1:
-            winner_team_id = r.team_id
+            p_pts = r.placement_points if r.placement_points is not None else calc_place_pts
+            e_pts = r.elimination_points if r.elimination_points is not None else calc_kill_pts
+            t_pts = r.total_points if r.total_points is not None else (p_pts + e_pts)
 
-        entry = {
-            "team_id": r.team_id,
-            "team_name": r.team_name or str(r.team_id),
-            "placement": place,
-            "kills": kills,
-            "placement_points": p_pts,
-            "elimination_points": e_pts,
-            "total_points": t_pts,
-            "is_alive": False,
-            "qualified": bool(r.qualified),
-        }
-        processed_results.append(entry)
+            is_qual = r_tid in qualifier_set or bool(r.qualified)
 
-        # Upsert Qualification Record for this team
-        qual_status = "QUALIFIED" if r.qualified or place <= 4 else "ELIMINATED"
+            if place == 1:
+                winner_team_id = r_tid
+
+            processed_results.append({
+                "team_id": r_tid,
+                "team_name": r.team_name or str(r.team_id),
+                "placement": place,
+                "kills": kills,
+                "placement_points": p_pts,
+                "elimination_points": e_pts,
+                "total_points": t_pts,
+                "is_alive": False,
+                "qualified": is_qual,
+            })
+    else:
+        # Build results from match_teams if results_list omitted
+        for idx, t in enumerate(match_teams, start=1):
+            t_id = str(t.get("id") or t.get("_id") or t.get("team_id"))
+            is_qual = t_id in qualifier_set
+            processed_results.append({
+                "team_id": t_id,
+                "team_name": t.get("name") or t.get("team_name") or str(t_id),
+                "placement": idx,
+                "kills": 0,
+                "placement_points": default_placement_points.get(str(idx), 0),
+                "elimination_points": 0,
+                "total_points": default_placement_points.get(str(idx), 0),
+                "is_alive": False,
+                "qualified": is_qual,
+            })
+            if idx == 1:
+                winner_team_id = t_id
+
+    # If winner is not set and we have qualifiers
+    if not winner_team_id and raw_qualifier_ids:
+        winner_team_id = raw_qualifier_ids[0]
+
+    # Validate that on final round, winner is certified
+    if payload.is_final_round and not winner_team_id:
+        if processed_results:
+            winner_team_id = processed_results[0]["team_id"]
+        elif raw_qualifier_ids:
+            winner_team_id = raw_qualifier_ids[0]
+        else:
+            raise HTTPException(status_code=400, detail="Cannot finalize tournament without certifying a winning champion.")
+
+    # 4. Upsert records into db.tournament_qualifications
+    curr_round_num = match.get("round_number", 1)
+    curr_round_name = match.get("round_name") or f"Round {curr_round_num}"
+    match_id_str = str(match.get("_id", match.get("id")))
+
+    for entry in processed_results:
+        t_id = entry["team_id"]
+        is_qual = entry["qualified"] or (t_id in qualifier_set)
+        qual_status = "QUALIFIED" if is_qual else "ELIMINATED"
+
         qual_doc = {
             "tournament_id": tid,
-            "source_round": match.get("round_name", "Round 1"),
-            "source_round_number": match.get("round_number", 1),
-            "source_match_id": str(match.get("_id", match.get("id"))),
-            "participant_id": str(r.team_id),
-            "participant_name": r.team_name or str(r.team_id),
+            "source_round": curr_round_name,
+            "source_round_number": curr_round_num,
+            "source_match_id": match_id_str,
+            "participant_id": t_id,
+            "participant_name": entry["team_name"],
             "participant_type": "TEAM",
             "status": qual_status,
-            "placement": place,
-            "points": t_pts,
+            "placement": entry["placement"],
+            "points": entry["total_points"],
             "result_reference": entry,
             "updated_at": get_utc_now(),
         }
         await db.tournament_qualifications.update_one(
             {
                 "tournament_id": tid,
-                "source_match_id": str(match.get("_id", match.get("id"))),
-                "participant_id": str(r.team_id),
+                "source_match_id": match_id_str,
+                "participant_id": t_id,
             },
             {"$set": qual_doc, "$setOnInsert": {"id": generate_uuid(), "created_at": get_utc_now()}},
             upsert=True,
         )
 
-    # Sort results by placement
-    processed_results.sort(key=lambda x: x["placement"])
+    # 5. Multi-Round Progression (Advancing confirmed qualifiers into next round)
+    next_match_id = None
+    next_round_name = None
 
-    await db.matches.update_one(
-        m_query,
-        {
-            "$set": {
+    if payload.is_final_round:
+        # Final stage reached: Finalize tournament champion!
+        await db.tournaments.update_one(
+            {"$or": [{"_id": tid}, {"id": tid}, {"slug": tid}]},
+            {"$set": {
                 "status": "COMPLETED",
-                "placements": processed_results,
                 "winner_team_id": winner_team_id,
-                "scoring_matrix": payload.scoring_matrix or {"placement": default_placement_points, "kill": pts_per_kill},
-            }
-        }
-    )
+                "updated_at": get_utc_now(),
+            }}
+        )
+    else:
+        # Intermediate round completed: Tournament MUST REMAIN LIVE!
+        await db.tournaments.update_one(
+            {"$or": [{"_id": tid}, {"id": tid}, {"slug": tid}]},
+            {"$set": {"status": "LIVE", "updated_at": get_utc_now()}}
+        )
 
+        # Generate or update downstream round if advancing qualifiers
+        if payload.advance_to_next_round or raw_qualifier_ids:
+            next_round_num = curr_round_num + 1
+            next_round_name = payload.next_round_name or f"Round {next_round_num}"
+
+            # Gather qualifying team objects with original metadata
+            teams_by_id = {str(t.get("id") or t.get("_id") or t.get("team_id")): t for t in match_teams if isinstance(t, dict)}
+            advancing_teams = []
+            for qid in raw_qualifier_ids:
+                if qid in teams_by_id:
+                    advancing_teams.append(teams_by_id[qid])
+                else:
+                    t_doc = await db.teams.find_one({"$or": [{"_id": qid}, {"id": qid}]})
+                    if t_doc:
+                        advancing_teams.append({
+                            "id": str(t_doc.get("_id", t_doc.get("id"))),
+                            "name": t_doc.get("name", f"Team {qid}"),
+                            "captain_id": t_doc.get("captain_id"),
+                            "captain_username": t_doc.get("captain_username", "Captain"),
+                        })
+                    else:
+                        advancing_teams.append({
+                            "id": qid,
+                            "name": next((r["team_name"] for r in processed_results if r["team_id"] == qid), f"Team {qid}"),
+                        })
+
+            # Check if an existing downstream match for this tournament/round already exists (Idempotency)
+            existing_next = await db.matches.find_one({
+                "$or": [{"tournament_id": tid}, {"tournament_id": match.get("tournament_id")}],
+                "round_number": next_round_num,
+                "previous_match_ids": match_id_str,
+            })
+            if not existing_next:
+                existing_next = await db.matches.find_one({
+                    "$or": [{"tournament_id": tid}, {"tournament_id": match.get("tournament_id")}],
+                    "round_number": next_round_num,
+                    "format": "Battle Royale",
+                    "status": {"$in": ["SCHEDULED", "DRAFT"]},
+                })
+
+            if existing_next:
+                if existing_next.get("status") in ["LIVE", "COMPLETED"]:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Cannot modify qualifiers: downstream round match is already in progress or completed."
+                    )
+                next_match_id = str(existing_next.get("_id", existing_next.get("id")))
+                await db.matches.update_one(
+                    {"_id": existing_next["_id"]},
+                    {"$set": {
+                        "teams": advancing_teams,
+                        "team_ids": raw_qualifier_ids,
+                        "max_teams": len(advancing_teams),
+                        "stage_name": next_round_name,
+                        "round_name": next_round_name,
+                        "stage": next_round_name,
+                        "updated_at": get_utc_now(),
+                    }}
+                )
+            else:
+                next_match_id = generate_uuid()
+                new_match = Match(
+                    id=next_match_id,
+                    tournament_id=tid,
+                    stage_name=next_round_name,
+                    round_name=next_round_name,
+                    stage=next_round_name,
+                    match_type="BATTLE_ROYALE",
+                    round_number=next_round_num,
+                    match_number=1,
+                    format="Battle Royale",
+                    series_format="BO1",
+                    status="SCHEDULED",
+                    room_capacity=match.get("room_capacity", 100),
+                    players_per_team=match.get("players_per_team", 4),
+                    max_teams=len(advancing_teams),
+                    teams=advancing_teams,
+                    team_ids=raw_qualifier_ids,
+                    team_a_id=None,
+                    team_a_name=None,
+                    team_b_id=None,
+                    team_b_name=None,
+                    scheduled_time="TBD",
+                    server_region=match.get("server_region") or tourn.get("server_region", "AWS Mumbai (ap-south-1)"),
+                    previous_match_ids=[match_id_str],
+                )
+                await db.matches.insert_one(new_match.to_mongo())
+
+    # 6. Save current match updates
+    clean_scoring_matrix = None
+    if payload.scoring_matrix and isinstance(payload.scoring_matrix, dict):
+        clean_scoring_matrix = {}
+        for k, v in payload.scoring_matrix.items():
+            if isinstance(v, dict):
+                clean_scoring_matrix[str(k)] = {str(sub_k): sub_v for sub_k, sub_v in v.items()}
+            else:
+                clean_scoring_matrix[str(k)] = v
+    else:
+        clean_scoring_matrix = {"placement": default_placement_points, "kill": pts_per_kill}
+
+    match_update = {
+        "status": "COMPLETED",
+        "placements": processed_results,
+        "winner_team_id": winner_team_id,
+        "qualifier_team_ids": raw_qualifier_ids,
+        "qualifiers_count": len(raw_qualifier_ids),
+        "is_final_round": payload.is_final_round,
+        "scoring_matrix": clean_scoring_matrix,
+        "updated_at": get_utc_now(),
+    }
+    if next_match_id:
+        match_update["next_match_id"] = next_match_id
+        match_update["advancement_label"] = f"{next_round_name} Lobby"
+
+    await db.matches.update_one(m_query, {"$set": match_update})
+
+    # Record audit log
     await record_audit_log(
         db=db,
         operator=admin_user.username,
         role=admin_user.role,
         action="COMPLETE_BATTLE_ROYALE_MATCH",
         target=f"Match {id}",
-        details=f"BR results submitted. Winner: {winner_team_id}. {len(processed_results)} teams recorded.",
+        details=f"BR results submitted. Winner: {winner_team_id}. Qualifiers: {len(raw_qualifier_ids)}. Final round: {payload.is_final_round}.",
     )
+
+    try:
+        from app.services.live_match_service import sync_live_match_for_tournament
+        await sync_live_match_for_tournament(tid, db)
+    except Exception as e:
+        pass
 
     return {
         "status": "success",
-        "message": f"Battle Royale results saved successfully! {len(processed_results)} placements recorded.",
+        "message": (
+            f"Battle Royale results finalized! {len(raw_qualifier_ids)} qualifiers advanced to {next_round_name}."
+            if not payload.is_final_round
+            else f"Tournament grand final certified! Winner {winner_team_id} declared Champion."
+        ),
         "match_id": id,
         "winner_team_id": winner_team_id,
+        "qualifiers_count": len(raw_qualifier_ids),
+        "qualifier_team_ids": raw_qualifier_ids,
+        "is_final_round": payload.is_final_round,
+        "next_match_id": next_match_id,
         "placements": processed_results,
     }
 
