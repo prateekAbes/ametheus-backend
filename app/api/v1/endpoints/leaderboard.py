@@ -41,9 +41,13 @@ def record_in_time_range(doc: dict, start_dt: Optional[datetime], date_keys: Lis
 from fastapi import APIRouter, Depends, Query, HTTPException, status
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
-from app.api.deps import get_db, require_super_admin, require_organizer
+from app.api.deps import get_db, get_current_user, require_super_admin, require_organizer
 from app.models.user import User
 from app.schemas import LeaderboardEntryResponse
+from app.services.rating_service import (
+    get_or_create_player_rating,
+    get_player_rating_history,
+)
 
 async def get_super_admin_identifiers(db: AsyncIOMotorDatabase) -> set:
     """
@@ -844,10 +848,8 @@ async def get_leaderboard(
             matches_played = len(completed_matches)
             wins = sum(1 for m in completed_matches if m.get("winner_team_id") in team_ids)
             losses = matches_played - wins
-            # Real win rate — 0.0 if no matches played
             win_rate = round((wins / matches_played * 100), 1) if matches_played > 0 else 0.0
 
-            # Compute recent form and active streak
             recent = sorted(completed_matches, key=lambda m: str(m.get("completed_at", m.get("updated_at", ""))), reverse=True)
             form = ["W" if m.get("winner_team_id") in team_ids else "L" for m in recent[:5]]
             streak = 0
@@ -870,19 +872,38 @@ async def get_leaderboard(
                 payout_docs = [p for p in payout_docs if record_in_time_range(p, start_dt, ["paid_at", "created_at", "updated_at"])]
             real_earnings = sum(int(p.get("amount_paise", 0)) // 100 for p in payout_docs)
 
-            # Query real spending from approved payments (excluding wallet topups)
+            # Query real spending & wallet deposits
             spending_docs = await db.game_payments.find({
                 "$or": [
                     {"user_id": cap_id},
                     {"team_id": {"$in": team_ids}},
                 ],
                 "status": "APPROVED",
-                "payment_type": {"$ne": "WALLET_TOPUP"},
                 "is_dummy": {"$ne": True},
             }).to_list(length=100)
             if start_dt:
                 spending_docs = [p for p in spending_docs if record_in_time_range(p, start_dt, ["verified_at", "created_at", "updated_at"])]
-            real_spending = sum(int(p.get("amount_inr", 0)) or (int(p.get("amount_paise", 0)) // 100) for p in spending_docs)
+            entry_spending = sum(int(p.get("amount_inr", 0)) or (int(p.get("amount_paise", 0)) // 100) for p in spending_docs if p.get("payment_type") != "WALLET_TOPUP")
+            topup_amount = sum(int(p.get("amount_inr", 0)) or (int(p.get("amount_paise", 0)) // 100) for p in spending_docs if p.get("payment_type") == "WALLET_TOPUP")
+
+            ledger_debits = await db.wallet_ledger.find({
+                "user_id": cap_id,
+                "amount_paise": {"$lt": 0},
+                "is_dummy": {"$ne": True},
+            }).to_list(100)
+            ledger_spent = sum(abs(int(l.get("amount_paise", 0))) // 100 for l in ledger_debits if l.get("txn_type") in ["GAME_ENTRY_PAYMENT", "TOURNAMENT_ENTRY"])
+
+            ledger_topups = await db.wallet_ledger.find({
+                "user_id": cap_id,
+                "txn_type": "WALLET_TOPUP",
+                "amount_paise": {"$gt": 0},
+                "is_dummy": {"$ne": True},
+            }).to_list(100)
+            ledger_topup_amt = sum(int(l.get("amount_paise", 0)) // 100 for l in ledger_topups)
+
+            real_spending = max(entry_spending, ledger_spent)
+            wallet_deposits = max(topup_amount, ledger_topup_amt)
+            final_spending = real_spending if real_spending > 0 else wallet_deposits
 
             # Compute top 3 finishes from payouts and tournament finals
             payout_top3 = sum(
@@ -898,7 +919,6 @@ async def get_leaderboard(
             is_disbanded = bool(team.get("is_disbanded", False) or team.get("status") == "DISBANDED" or team.get("is_ineligible") or team.get("is_deleted_account"))
             team_status = "DISBANDED" if is_disbanded else "ACTIVE"
 
-            # Disbanded teams with zero matches and zero earnings MUST NEVER be displayed on competitive leaderboards
             if is_disbanded and matches_played == 0 and real_earnings == 0:
                 continue
 
@@ -908,6 +928,15 @@ async def get_leaderboard(
             logo_url = team_logo or cap_avatar or None
 
             player_id = str(captain.get("_id", captain.get("id"))) if (is_fragment and captain) else team_id
+
+            # Authoritative rating starting at 500 (NO hardcoded formula)
+            cap_rating_doc = await get_or_create_player_rating(
+                db,
+                user_id=str(cap_id),
+                game_id=str(gid or "all"),
+                game_slug=game_slug or "all",
+            )
+            authoritative_rating = int(cap_rating_doc.get("rating", 500))
 
             entries.append({
                 "rank": idx + 1,
@@ -926,9 +955,9 @@ async def get_leaderboard(
                 "matches_played": matches_played,
                 "wins": wins,
                 "losses": losses,
-                "rating": max(1000, 1500 + (wins * 25) - (losses * 10)),
+                "rating": authoritative_rating,
                 "earnings": real_earnings,
-                "spending": real_spending,
+                "spending": final_spending,
                 "streak": streak,
                 "top3": top3,
                 "form": form if form else ["-"],
@@ -936,6 +965,156 @@ async def get_leaderboard(
                 "category": game_cat,
                 "is_disbanded": is_disbanded,
                 "status": team_status,
+            })
+
+        # Also query registered non-admin solo users from db.users
+        captain_user_ids = {str(t.get("captain_id")) for t in db_teams if t.get("captain_id")}
+        all_db_users = await db.users.find({
+            "is_deleted": {"$ne": True},
+            "is_dummy": {"$ne": True},
+        }).to_list(length=500)
+
+        for u in all_db_users:
+            u_id = str(u.get("_id", u.get("id")))
+            u_role = str(u.get("role", "")).upper()
+            u_email = str(u.get("email", "")).lower()
+            u_clerk = str(u.get("clerk_user_id", "")).lower()
+            u_username = str(u.get("username", "")).strip().lower()
+
+            if (
+                u_id in admin_ids
+                or u_id.lower() in admin_ids
+                or u_email in admin_ids
+                or u_clerk in admin_ids
+                or u_username in admin_ids
+                or f"@{u_username}" in admin_ids
+                or u_role in ["SUPER_ADMIN", "ADMIN", "ROOT"]
+                or u_id in captain_user_ids
+            ):
+                continue
+
+            u_disp_name = (u.get("display_name") or "").strip()
+            u_orig_username = (u.get("username") or "").strip()
+            player_name = u_disp_name or u_orig_username or "Contender"
+            captain_user = f"@{u_orig_username}" if u_orig_username else "@contender"
+            avatar_url = u.get("avatar_url")
+
+            u_gid = target_game if (target_game and target_game != "all") else "all"
+            u_game_obj = await db.games.find_one({"$or": [{"_id": u_gid}, {"id": u_gid}, {"slug": u_gid}]}) if u_gid != "all" else None
+            u_game_slug = u_game_obj["slug"] if u_game_obj else (u_gid if u_gid != "all" else "all")
+            u_game_name = u_game_obj["name"] if u_game_obj else (u_gid if u_gid != "all" else "All Titles")
+            u_game_cat = u_game_obj.get("category", "pc") if u_game_obj else "pc"
+
+            # Authoritative rating starting at 500
+            rating_doc = await get_or_create_player_rating(db, u_id, u_game_slug, u_game_slug)
+            user_rating = int(rating_doc.get("rating", 500))
+
+            # Query matches for solo player
+            user_matches_cursor = db.matches.find({
+                "$and": [
+                    {"$or": [
+                        {"team_a_id": u_id},
+                        {"team_b_id": u_id},
+                    ]},
+                    {"status": "COMPLETED"},
+                    {"is_dummy": {"$ne": True}},
+                ]
+            })
+            completed_user_matches = await user_matches_cursor.to_list(length=100)
+            if start_dt:
+                completed_user_matches = [m for m in completed_user_matches if record_in_time_range(m, start_dt, ["completed_at", "updated_at", "created_at"])]
+
+            u_matches_played = len(completed_user_matches)
+            u_wins = sum(1 for m in completed_user_matches if m.get("winner_team_id") == u_id or m.get("winner_id") == u_id)
+            u_losses = u_matches_played - u_wins
+            u_win_rate = round((u_wins / u_matches_played * 100), 1) if u_matches_played > 0 else 0.0
+
+            u_recent = sorted(completed_user_matches, key=lambda m: str(m.get("completed_at", m.get("updated_at", ""))), reverse=True)
+            u_form = ["W" if (m.get("winner_team_id") == u_id or m.get("winner_id") == u_id) else "L" for m in u_recent[:5]]
+            u_streak = 0
+            for m in u_recent:
+                if m.get("winner_team_id") == u_id or m.get("winner_id") == u_id:
+                    u_streak += 1
+                else:
+                    break
+
+            # Payouts
+            u_payout_docs = await db.payouts.find({
+                "user_id": u_id,
+                "status": "PAID",
+                "is_dummy": {"$ne": True},
+            }).to_list(length=100)
+            if start_dt:
+                u_payout_docs = [p for p in u_payout_docs if record_in_time_range(p, start_dt, ["paid_at", "created_at", "updated_at"])]
+            u_real_earnings = sum(int(p.get("amount_paise", 0)) // 100 for p in u_payout_docs)
+
+            # Spending & Top-ups
+            u_spending_docs = await db.game_payments.find({
+                "user_id": u_id,
+                "status": "APPROVED",
+                "is_dummy": {"$ne": True},
+            }).to_list(length=100)
+            if start_dt:
+                u_spending_docs = [p for p in u_spending_docs if record_in_time_range(p, start_dt, ["verified_at", "created_at", "updated_at"])]
+            u_entry_spending = sum(int(p.get("amount_inr", 0)) or (int(p.get("amount_paise", 0)) // 100) for p in u_spending_docs if p.get("payment_type") != "WALLET_TOPUP")
+            u_topup_amount = sum(int(p.get("amount_inr", 0)) or (int(p.get("amount_paise", 0)) // 100) for p in u_spending_docs if p.get("payment_type") == "WALLET_TOPUP")
+
+            u_ledger_debits = await db.wallet_ledger.find({
+                "user_id": u_id,
+                "amount_paise": {"$lt": 0},
+                "is_dummy": {"$ne": True},
+            }).to_list(100)
+            u_ledger_spent = sum(abs(int(l.get("amount_paise", 0))) // 100 for l in u_ledger_debits if l.get("txn_type") in ["GAME_ENTRY_PAYMENT", "TOURNAMENT_ENTRY"])
+
+            u_ledger_topups = await db.wallet_ledger.find({
+                "user_id": u_id,
+                "txn_type": "WALLET_TOPUP",
+                "amount_paise": {"$gt": 0},
+                "is_dummy": {"$ne": True},
+            }).to_list(100)
+            u_ledger_topup_amt = sum(int(l.get("amount_paise", 0)) // 100 for l in u_ledger_topups)
+
+            u_real_spending = max(u_entry_spending, u_ledger_spent)
+            u_wallet_deposits = max(u_topup_amount, u_ledger_topup_amt)
+            u_final_spending = u_real_spending if u_real_spending > 0 else u_wallet_deposits
+
+            u_payout_top3 = sum(
+                1 for p in u_payout_docs
+                if any(rk in str(p.get("rank_or_placement", "")).lower() for rk in ["1st", "2nd", "3rd", "first", "second", "third", "winner", "runner", "top 3", "top3"])
+            )
+            u_finals_top3 = sum(
+                1 for m in completed_user_matches
+                if (m.get("winner_team_id") == u_id or m.get("winner_id") == u_id) and any(stg in str(m.get("stage", "") or m.get("round_name", "")).lower() for stg in ["final", "semi", "grand"])
+            )
+            u_top3 = max(u_payout_top3, u_finals_top3)
+
+            entries.append({
+                "rank": 1,
+                "id": u_id,
+                "name": player_name,
+                "tag": "SOLO",
+                "type": "player",
+                "game_slug": u_game_slug,
+                "game_name": u_game_name,
+                "captain": captain_user,
+                "username": u_orig_username or None,
+                "display_name": u_disp_name or None,
+                "logo_url": avatar_url,
+                "avatar_url": avatar_url,
+                "win_rate": u_win_rate,
+                "matches_played": u_matches_played,
+                "wins": u_wins,
+                "losses": u_losses,
+                "rating": user_rating,
+                "earnings": u_real_earnings,
+                "spending": u_final_spending,
+                "streak": u_streak,
+                "top3": u_top3,
+                "form": u_form if u_form else ["-"],
+                "is_verified": True,
+                "category": u_game_cat,
+                "is_disbanded": False,
+                "status": "ACTIVE",
             })
 
         # Also query custom leaderboard entries (admin-created entries only)
@@ -1041,7 +1220,7 @@ async def get_leaderboard(
                 "matches_played": int(c.get("matches_played", 0)),
                 "wins": int(c.get("wins", 0)),
                 "losses": int(c.get("losses", 0)),
-                "rating": int(c.get("rating", 1500)),
+                "rating": int(c.get("rating", 500)),
                 "earnings": int(c.get("earnings", 0)),
                 "spending": int(c.get("spending", 0)),
                 "streak": c_streak,
@@ -1152,3 +1331,47 @@ async def get_leaderboard(
         entries = entries[:limit]
 
     return [LeaderboardEntryResponse(**e) for e in entries]
+
+
+@router.get("/ratings/me")
+async def get_my_rating_history_endpoint(
+    game: Optional[str] = Query(None),
+    limit: int = Query(50),
+    current_user: User = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Returns the authenticated player's rating audit history across competitive games.
+    """
+    uid = str(current_user.id)
+    history = await get_player_rating_history(db, player_id=uid, game_id=game, limit=limit)
+    return {
+        "status": "success",
+        "user_id": uid,
+        "history": history,
+    }
+
+
+@router.get("/ratings/{user_id}")
+async def get_user_rating_history_endpoint(
+    user_id: str,
+    game: Optional[str] = Query(None),
+    limit: int = Query(50),
+    current_user: User = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Returns rating audit history for a specific player (authorized to the player or super admin).
+    """
+    cur_id = str(current_user.id)
+    cur_role = str(getattr(current_user, "role", "")).upper()
+    if cur_id != str(user_id) and cur_role not in ["SUPER_ADMIN", "ADMIN"]:
+        raise HTTPException(status_code=403, detail="Forbidden: Cannot view another player's rating audit history")
+
+    history = await get_player_rating_history(db, player_id=user_id, game_id=game, limit=limit)
+    return {
+        "status": "success",
+        "user_id": user_id,
+        "history": history,
+    }
+

@@ -45,6 +45,14 @@ from app.schemas import (
     MatchReminderRequest,
     CreateRoundPayload,
     WalletAuditSummaryResponse,
+    RatingAdjustmentBulkRequest,
+    RatingReversalRequest,
+    RatingAuditLogResponse,
+)
+from app.services.rating_service import (
+    get_rating_management_hierarchy,
+    apply_manual_rating_adjustment,
+    reverse_rating_adjustment,
 )
 from app.schemas.archive import (
     ArchiveFilterRequest,
@@ -4631,6 +4639,110 @@ async def unarchive_audit_log_convenience(
 ):
     ok = await unarchive_record(db, "audit_logs", id, admin_user)
     return {"status": "success", "message": "Audit log restored", "id": id}
+
+
+# --- RATING MANAGEMENT WORKFLOW ENDPOINTS ---
+
+@router.get("/rating-management/hierarchy")
+async def get_rating_hierarchy_endpoint(
+    admin_user: User = Depends(require_super_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Returns full hierarchy: Games -> Tournaments -> Rounds -> Matches -> Participants
+    for authoritative manual rating adjustments.
+    """
+    hierarchy = await get_rating_management_hierarchy(db)
+    return {"status": "success", "hierarchy": hierarchy}
+
+
+@router.post("/rating-management/adjust-bulk")
+async def adjust_ratings_bulk_endpoint(
+    payload: RatingAdjustmentBulkRequest,
+    admin_user: User = Depends(require_super_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Applies manual rating adjustments to multiple players atomically.
+    Exact integer adjustments only, with mandatory reason category and explanation.
+    """
+    if not payload.adjustments:
+        raise HTTPException(status_code=400, detail="No adjustments provided")
+
+    audit_logs = []
+    for adj in payload.adjustments:
+        log_doc = await apply_manual_rating_adjustment(
+            db=db,
+            admin_user=admin_user,
+            player_id=adj.player_id,
+            game_id=adj.game_id,
+            adjustment=adj.adjustment,
+            reason=adj.reason,
+            explanation=adj.explanation,
+            tournament_id=adj.tournament_id,
+            round_id=adj.round_id,
+            match_id=adj.match_id,
+        )
+        audit_logs.append(log_doc)
+
+    return {
+        "status": "success",
+        "message": f"Successfully applied {len(audit_logs)} rating adjustments",
+        "audit_logs": audit_logs,
+    }
+
+
+@router.post("/rating-management/reverse/{log_id}")
+async def reverse_rating_endpoint(
+    log_id: str,
+    payload: Optional[RatingReversalRequest] = None,
+    admin_user: User = Depends(require_super_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Applies a compensating transaction to reverse an earlier manual rating adjustment.
+    """
+    reversal_log = await reverse_rating_adjustment(
+        db=db,
+        admin_user=admin_user,
+        log_id=log_id,
+        reason=payload.reason if payload else None,
+    )
+    return {
+        "status": "success",
+        "message": "Rating adjustment successfully reversed",
+        "reversal_log": reversal_log,
+    }
+
+
+@router.get("/rating-management/audit-logs")
+async def get_rating_audit_logs_endpoint(
+    game_id: Optional[str] = None,
+    player_id: Optional[str] = None,
+    limit: int = 50,
+    skip: int = 0,
+    admin_user: User = Depends(require_super_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Returns immutable audit logs of rating adjustments.
+    """
+    query: Dict[str, Any] = {}
+    if game_id and game_id != "all":
+        query["$or"] = [{"game_id": game_id}, {"game_slug": game_id}]
+    if player_id:
+        query["player_id"] = player_id
+
+    total = await db.rating_audit_logs.count_documents(query)
+    cursor = db.rating_audit_logs.find(query).sort("created_at", -1).skip(skip).limit(limit)
+    logs = await cursor.to_list(limit)
+
+    return {
+        "status": "success",
+        "total": total,
+        "logs": logs,
+    }
+
 
 
 

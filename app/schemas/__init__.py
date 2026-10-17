@@ -729,7 +729,7 @@ class LeaderboardEntryResponse(BaseModel):
     matches_played: int = 0
     wins: int = 0
     losses: int = 0
-    rating: int = 1500
+    rating: int = 500
     earnings: Optional[Any] = 0
     spending: Optional[int] = 0
     streak: Optional[int] = 0
@@ -742,6 +742,48 @@ class LeaderboardEntryResponse(BaseModel):
     is_disbanded: Optional[bool] = False
     is_disqualified: Optional[bool] = False
     status: Optional[str] = "ACTIVE"
+    model_config = ConfigDict(from_attributes=True, extra="allow")
+
+# Rating Management Schemas
+class RatingAdjustmentItem(BaseModel):
+    player_id: str
+    game_id: str
+    adjustment: int
+    reason: str
+    explanation: str
+    tournament_id: Optional[str] = None
+    round_id: Optional[str] = None
+    match_id: Optional[str] = None
+
+class RatingAdjustmentBulkRequest(BaseModel):
+    adjustments: List[RatingAdjustmentItem]
+
+class RatingReversalRequest(BaseModel):
+    reason: Optional[str] = None
+
+class RatingAuditLogResponse(BaseModel):
+    id: str
+    player_id: str
+    player_username: Optional[str] = None
+    player_display_name: Optional[str] = None
+    game_id: str
+    game_slug: Optional[str] = None
+    game_name: Optional[str] = None
+    previous_rating: int
+    adjustment: int
+    new_rating: int
+    reason: str
+    explanation: str
+    admin_id: str
+    admin_username: str
+    tournament_id: Optional[str] = None
+    tournament_name: Optional[str] = None
+    round_id: Optional[str] = None
+    round_name: Optional[str] = None
+    match_id: Optional[str] = None
+    is_reversal: bool = False
+    original_log_id: Optional[str] = None
+    created_at: Optional[Any] = None
     model_config = ConfigDict(from_attributes=True, extra="allow")
 
 # Stage & Round Schemas
