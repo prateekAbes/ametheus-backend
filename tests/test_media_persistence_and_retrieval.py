@@ -232,6 +232,7 @@ async def test_game_poster_and_tournament_hero_banner_persistence(client, mock_d
         "roster_lock_time": "2026-12-01T17:00:00Z",
         "banner_url": "/api/v1/media/img_apex_tourn_card",
         "hero_banner_url": "/api/v1/media/img_apex_tourn_hero",
+        "status": "UPCOMING",
         "description": "Championship cup",
     }
     t_resp = await client.post("/api/v1/organizer/tournaments", json=tourn_create_payload)

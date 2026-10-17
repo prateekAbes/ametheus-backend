@@ -310,3 +310,128 @@ async def test_list_tournaments_search_filter(client, mock_db):
     assert res3.status_code == 200
     assert len(res3.json()) == 0
 
+
+@pytest.mark.asyncio
+async def test_tournament_creation_persistence_and_public_visibility(client, mock_db):
+    """Test tournament creation persists in DB with _id, id, registration_deadline and is visible in listings."""
+    await mock_db.games.insert_one({
+        "_id": "cs2",
+        "id": "cs2",
+        "slug": "cs2",
+        "name": "Counter-Strike 2",
+        "accent_color": "#DE9B35",
+    })
+
+    payload = {
+        "game_id": "cs2",
+        "title": "Ametheus Master Series 2026",
+        "format": "5v5 Single Elimination",
+        "prize_pool_inr": 75000,
+        "entry_fee_inr": 500,
+        "max_teams": 32,
+        "min_team_size": 5,
+        "max_team_size": 5,
+        "starts_at": "2026-11-15T15:00:00.000Z",
+        "roster_lock_time": "2026-11-15T14:00:00.000Z",
+        "whatsapp_group_url": "https://chat.whatsapp.com/sampleCS2Invite",
+        "community_link": "https://discord.gg/cs2ametheus",
+        "description": "Premier CS2 showdown on AMETHEUS.",
+    }
+
+    res = await client.post("/api/v1/organizer/tournaments", json=payload)
+    assert res.status_code == 201, f"Creation failed: {res.text}"
+    created = res.json()
+
+    assert created["status"] == "REGISTRATION_OPEN"
+    assert created["title"] == "Ametheus Master Series 2026"
+    tid = created["id"]
+    assert tid
+
+    # 1. Verify in database: both _id and id are present
+    db_tourn = await mock_db.tournaments.find_one({"$or": [{"_id": tid}, {"id": tid}]})
+    assert db_tourn is not None
+    assert str(db_tourn["_id"]) == tid
+    assert str(db_tourn["id"]) == tid
+    assert db_tourn["status"] == "REGISTRATION_OPEN"
+    assert db_tourn.get("registration_deadline") is not None
+
+    # 2. Verify in public listing
+    pub_res = await client.get("/api/v1/tournaments")
+    assert pub_res.status_code == 200
+    pub_list = pub_res.json()
+    assert any(t["id"] == tid for t in pub_list)
+
+    # 3. Verify in status=ALL listing
+    all_res = await client.get("/api/v1/tournaments?status=ALL")
+    assert all_res.status_code == 200
+    assert any(t["id"] == tid for t in all_res.json())
+
+    # 4. Verify in organizer my-tournaments listing
+    org_res = await client.get("/api/v1/organizer/my-tournaments")
+    assert org_res.status_code == 200
+    assert any(t["id"] == tid for t in org_res.json())
+
+
+@pytest.mark.asyncio
+async def test_tournament_creation_draft_isolation_and_publishing(client, mock_db):
+    """Test that DRAFT tournament is hidden from public but visible to admin, and becomes public when published."""
+    await mock_db.games.insert_one({
+        "_id": "bgmi",
+        "id": "bgmi",
+        "slug": "bgmi",
+        "name": "Battlegrounds Mobile India",
+        "accent_color": "#E56A10",
+    })
+
+    payload = {
+        "game_id": "bgmi",
+        "title": "Secret Draft Tournament 2026",
+        "status": "DRAFT",
+        "format": "Squad Battle Royale",
+        "prize_pool_inr": 100000,
+        "entry_fee_inr": 0,
+        "max_teams": 64,
+        "min_team_size": 4,
+        "max_team_size": 5,
+        "starts_at": "2026-12-20T10:00:00.000Z",
+        "roster_lock_time": "2026-12-20T09:00:00.000Z",
+        "description": "Unpublished tournament draft.",
+    }
+
+    res = await client.post("/api/v1/organizer/tournaments", json=payload)
+    assert res.status_code == 201
+    created = res.json()
+    tid = created["id"]
+    assert created["status"] == "DRAFT"
+
+    # 1. Verify in database: status is DRAFT
+    db_tourn = await mock_db.tournaments.find_one({"$or": [{"_id": tid}, {"id": tid}]})
+    assert db_tourn is not None
+    assert db_tourn["status"] == "DRAFT"
+
+    # 2. Public tournament listing must NOT include the draft tournament
+    pub_res = await client.get("/api/v1/tournaments")
+    assert pub_res.status_code == 200
+    assert not any(t["id"] == tid for t in pub_res.json())
+
+    # 3. Admin / Organizer query with include_drafts=true or status=DRAFT must include it
+    draft_res = await client.get("/api/v1/tournaments?status=DRAFT")
+    assert draft_res.status_code == 200
+    assert any(t["id"] == tid for t in draft_res.json())
+
+    org_res = await client.get("/api/v1/organizer/my-tournaments")
+    assert org_res.status_code == 200
+    assert any(t["id"] == tid for t in org_res.json())
+
+    # 4. Publish tournament
+    pub_action_res = await client.post(f"/api/v1/organizer/tournaments/{tid}/publish")
+    assert pub_action_res.status_code == 200
+
+    # 5. Now it MUST be in public listing as REGISTRATION_OPEN
+    pub_after_res = await client.get("/api/v1/tournaments")
+    assert pub_after_res.status_code == 200
+    found_after = next((t for t in pub_after_res.json() if t["id"] == tid), None)
+    assert found_after is not None
+    assert found_after["status"] == "REGISTRATION_OPEN"
+
+

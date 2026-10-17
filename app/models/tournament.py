@@ -146,7 +146,9 @@ class Tournament(BaseModel):
 
     def to_mongo(self) -> dict:
         d = self.model_dump()
-        d["_id"] = d.pop("id")
+        tid = d.get("id") or generate_uuid()
+        d["_id"] = tid
+        d["id"] = tid
         return d
 
     @classmethod
@@ -231,7 +233,9 @@ class TournamentRegistration(BaseModel):
 
     def to_mongo(self) -> dict:
         d = self.model_dump()
-        d["_id"] = d.pop("id")
+        tid = d.get("id") or generate_uuid()
+        d["_id"] = tid
+        d["id"] = tid
         return d
 
     @classmethod

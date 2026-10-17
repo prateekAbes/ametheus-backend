@@ -67,7 +67,7 @@ class TournamentCreatePayload(BaseModel):
     max_teams: int = 16
     min_team_size: Optional[int] = 1
     max_team_size: Optional[int] = 5
-    status: Optional[str] = "DRAFT"
+    status: Optional[str] = "REGISTRATION_OPEN"
     expected_start_date: Optional[str] = None
     registration_open_date: Optional[str] = None
     announcement_text: Optional[str] = None
@@ -248,6 +248,8 @@ async def create_tournament(
 
     prizes = payload.prizes if payload.prizes else [{"place": "1st", "amount": f"₹{payload.prize_pool_inr}"}]
 
+    init_status = payload.status or "REGISTRATION_OPEN"
+
     tourn = Tournament(
         slug=slug,
         game_id=gid,
@@ -255,9 +257,10 @@ async def create_tournament(
         title=payload.title.strip(),
         prize_pool_inr=payload.prize_pool_inr,
         entry_fee_inr=payload.entry_fee_inr,
-        status=payload.status or "DRAFT",
+        status=init_status,
         expected_start_date=payload.expected_start_date,
         registration_open_date=payload.registration_open_date,
+        registration_deadline=lock_dt,
         announcement_text=payload.announcement_text,
         starts_at=payload.starts_at,
         roster_lock_time=payload.roster_lock_time,
@@ -286,6 +289,7 @@ async def create_tournament(
     if payload.media_config is not None:
         tourn.media_config = payload.media_config
     tourn_doc = tourn.to_mongo()
+    tourn_doc["id"] = str(tourn_doc["_id"])
     await db.tournaments.insert_one(tourn_doc)
 
     return serialize_tournament_response(tourn_doc, game, 0)

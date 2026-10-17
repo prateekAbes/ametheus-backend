@@ -78,15 +78,23 @@ async def list_tournaments(
     game: Optional[str] = None,
     status: Optional[str] = None,
     search: Optional[str] = None,
+    include_drafts: Optional[bool] = False,
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     filter_query = {"is_dummy": {"$ne": True}}
     if status:
         stat_upper = status.upper()
-        if stat_upper == "LIVE":
+        if stat_upper == "ALL":
+            if include_drafts:
+                filter_query["status"] = {"$ne": "DELETED"}
+            else:
+                filter_query["status"] = {"$nin": ["DELETED", "HIDDEN", "DRAFT"]}
+        elif stat_upper == "DRAFT":
+            filter_query["status"] = "DRAFT"
+        elif stat_upper == "LIVE":
             filter_query["status"] = {"$in": ["LIVE", "ONGOING", "IN_PROGRESS"]}
         elif stat_upper in ["COMING_SOON", "UPCOMING"]:
-            filter_query["status"] = {"$in": ["COMING_SOON", "UPCOMING", "DRAFT"]}
+            filter_query["status"] = {"$in": ["COMING_SOON", "UPCOMING"]}
         elif stat_upper in ["REGISTRATION_OPEN", "OPEN"]:
             filter_query["status"] = {"$in": ["REGISTRATION_OPEN", "OPEN"]}
         elif stat_upper in ["REGISTRATION_CLOSED", "CLOSED"]:
@@ -94,7 +102,10 @@ async def list_tournaments(
         else:
             filter_query["status"] = status
     else:
-        filter_query["status"] = {"$nin": ["DELETED", "CANCELLED", "HIDDEN", "DRAFT"]}
+        if include_drafts:
+            filter_query["status"] = {"$nin": ["DELETED", "CANCELLED", "HIDDEN"]}
+        else:
+            filter_query["status"] = {"$nin": ["DELETED", "CANCELLED", "HIDDEN", "DRAFT"]}
 
     if search and search.strip():
         search_str = search.strip()
@@ -187,11 +198,13 @@ async def list_tournaments(
         raw_stat = str(t.get("status", "REGISTRATION_OPEN")).upper()
         if raw_stat in ["LIVE", "ONGOING", "IN_PROGRESS"]:
             norm_status = "LIVE"
-        elif raw_stat in ["DRAFT", "UPCOMING"]:
-            norm_status = "COMING_SOON"
-        elif raw_stat in ["CLOSED"]:
+        elif raw_stat == "DRAFT":
+            norm_status = "DRAFT"
+        elif raw_stat in ["COMING_SOON", "UPCOMING"]:
+            norm_status = "UPCOMING"
+        elif raw_stat in ["REGISTRATION_CLOSED", "CLOSED"]:
             norm_status = "REGISTRATION_CLOSED"
-        elif raw_stat in ["OPEN"]:
+        elif raw_stat in ["REGISTRATION_OPEN", "OPEN"]:
             norm_status = "REGISTRATION_OPEN"
         else:
             norm_status = raw_stat
@@ -573,11 +586,13 @@ async def get_tournament_by_slug(slug: str, db: AsyncIOMotorDatabase = Depends(g
     raw_stat = str(t.get("status", "REGISTRATION_OPEN")).upper()
     if raw_stat in ["LIVE", "ONGOING", "IN_PROGRESS"]:
         norm_status = "LIVE"
-    elif raw_stat in ["DRAFT", "UPCOMING"]:
-        norm_status = "COMING_SOON"
-    elif raw_stat in ["CLOSED"]:
+    elif raw_stat == "DRAFT":
+        norm_status = "DRAFT"
+    elif raw_stat in ["COMING_SOON", "UPCOMING"]:
+        norm_status = "UPCOMING"
+    elif raw_stat in ["REGISTRATION_CLOSED", "CLOSED"]:
         norm_status = "REGISTRATION_CLOSED"
-    elif raw_stat in ["OPEN"]:
+    elif raw_stat in ["REGISTRATION_OPEN", "OPEN"]:
         norm_status = "REGISTRATION_OPEN"
     else:
         norm_status = raw_stat
