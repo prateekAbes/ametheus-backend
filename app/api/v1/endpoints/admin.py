@@ -1,8 +1,8 @@
 import re
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 from datetime import datetime, timezone, timedelta
 from pydantic import BaseModel
-from fastapi import APIRouter, Depends, HTTPException, status, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, status, Request, Response, Query
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from app.api.deps import get_db, get_current_user, require_super_admin, require_organizer
 from app.models.user import User
@@ -48,6 +48,11 @@ from app.schemas import (
     RatingAdjustmentBulkRequest,
     RatingReversalRequest,
     RatingAuditLogResponse,
+    MatchCredentialsUpdatePayload,
+    BattleRoyaleTeamResult,
+    BattleRoyaleSubmitResultsPayload,
+    ParticipantRatingItem,
+    MatchRatingsSubmitPayload,
 )
 from app.services.rating_service import (
     get_rating_management_hierarchy,
@@ -263,6 +268,15 @@ async def get_my_assigned_tournaments(
     docs = await cursor.to_list(length=100)
     from app.core.database import docs_to_list
     return docs_to_list(docs)
+
+@router.delete("/tournaments/{id}")
+async def delete_tournament_admin_endpoint(
+    id: str,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    from app.api.v1.endpoints.organizer import delete_tournament
+    return await delete_tournament(id=id, organizer=admin_user, db=db)
 
 @router.post("/matches/{id}/verify-result")
 async def verify_match_result(
@@ -918,6 +932,247 @@ class CreateWinningPayoutPayload(BaseModel):
     destination: str = "WALLET"  # WALLET, UPI
     upi_id: Optional[str] = None
 
+def parse_payment_date_preset(
+    date_preset: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+) -> Tuple[Optional[datetime], Optional[datetime]]:
+    dp = (date_preset or "").upper().strip()
+    ist_tz = timezone(timedelta(hours=5, minutes=30))
+    now_ist = datetime.now(ist_tz)
+
+    if dp == "TODAY":
+        start_ist = datetime(now_ist.year, now_ist.month, now_ist.day, 0, 0, 0, tzinfo=ist_tz)
+        end_ist = datetime(now_ist.year, now_ist.month, now_ist.day, 23, 59, 59, 999999, tzinfo=ist_tz)
+        return start_ist.astimezone(timezone.utc), end_ist.astimezone(timezone.utc)
+
+    elif dp == "YESTERDAY":
+        y_ist = now_ist - timedelta(days=1)
+        start_ist = datetime(y_ist.year, y_ist.month, y_ist.day, 0, 0, 0, tzinfo=ist_tz)
+        end_ist = datetime(y_ist.year, y_ist.month, y_ist.day, 23, 59, 59, 999999, tzinfo=ist_tz)
+        return start_ist.astimezone(timezone.utc), end_ist.astimezone(timezone.utc)
+
+    elif dp == "LAST_7_DAYS":
+        start_utc = datetime.now(timezone.utc) - timedelta(days=7)
+        end_utc = datetime.now(timezone.utc)
+        return start_utc, end_utc
+
+    elif dp == "THIS_WEEK":
+        mon = now_ist - timedelta(days=now_ist.weekday())
+        start_ist = datetime(mon.year, mon.month, mon.day, 0, 0, 0, tzinfo=ist_tz)
+        end_ist = datetime.now(timezone.utc)
+        return start_ist.astimezone(timezone.utc), end_ist
+
+    elif dp == "LAST_WEEK":
+        mon = now_ist - timedelta(days=now_ist.weekday())
+        last_mon = mon - timedelta(days=7)
+        start_ist = datetime(last_mon.year, last_mon.month, last_mon.day, 0, 0, 0, tzinfo=ist_tz)
+        end_ist = datetime(mon.year, mon.month, mon.day, 0, 0, 0, tzinfo=ist_tz) - timedelta(microseconds=1)
+        return start_ist.astimezone(timezone.utc), end_ist.astimezone(timezone.utc)
+
+    elif dp == "THIS_MONTH":
+        start_ist = datetime(now_ist.year, now_ist.month, 1, 0, 0, 0, tzinfo=ist_tz)
+        end_ist = datetime.now(timezone.utc)
+        return start_ist.astimezone(timezone.utc), end_ist
+
+    elif dp == "LAST_MONTH":
+        if now_ist.month == 1:
+            start_ist = datetime(now_ist.year - 1, 12, 1, 0, 0, 0, tzinfo=ist_tz)
+            end_ist = datetime(now_ist.year, 1, 1, 0, 0, 0, tzinfo=ist_tz) - timedelta(microseconds=1)
+        else:
+            start_ist = datetime(now_ist.year, now_ist.month - 1, 1, 0, 0, 0, tzinfo=ist_tz)
+            end_ist = datetime(now_ist.year, now_ist.month, 1, 0, 0, 0, tzinfo=ist_tz) - timedelta(microseconds=1)
+        return start_ist.astimezone(timezone.utc), end_ist.astimezone(timezone.utc)
+
+    elif dp == "THIS_YEAR":
+        start_ist = datetime(now_ist.year, 1, 1, 0, 0, 0, tzinfo=ist_tz)
+        end_ist = datetime.now(timezone.utc)
+        return start_ist.astimezone(timezone.utc), end_ist
+
+    # CUSTOM or explicit start_date / end_date
+    s_dt: Optional[datetime] = None
+    e_dt: Optional[datetime] = None
+    if start_date:
+        try:
+            s_clean = start_date.strip().replace("Z", "+00:00")
+            if len(s_clean) == 10:  # YYYY-MM-DD
+                s_dt = datetime.fromisoformat(f"{s_clean}T00:00:00+05:30").astimezone(timezone.utc)
+            else:
+                s_dt = datetime.fromisoformat(s_clean)
+                if s_dt.tzinfo is None:
+                    s_dt = s_dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            pass
+    if end_date:
+        try:
+            e_clean = end_date.strip().replace("Z", "+00:00")
+            if len(e_clean) == 10:  # YYYY-MM-DD
+                e_dt = datetime.fromisoformat(f"{e_clean}T23:59:59.999999+05:30").astimezone(timezone.utc)
+            else:
+                e_dt = datetime.fromisoformat(e_clean)
+                if e_dt.tzinfo is None:
+                    e_dt = e_dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            pass
+
+    return s_dt, e_dt
+
+
+async def build_payments_query(
+    db: AsyncIOMotorDatabase,
+    status_filter: Optional[str] = None,
+    game_id: Optional[str] = None,
+    search: Optional[str] = None,
+    payment_type: Optional[str] = None,
+    tournament_id: Optional[str] = None,
+    team_id: Optional[str] = None,
+    date_preset: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    min_amount: Optional[float] = None,
+    max_amount: Optional[float] = None,
+    is_archived: bool = False,
+) -> Dict[str, Any]:
+    and_conditions: List[Dict[str, Any]] = [{"is_dummy": {"$ne": True}}]
+
+    # Archive segregation:
+    # Archived view shows approved, rejected, or explicitly archived payments.
+    # Active pending view shows strictly pending / unapproved / unrejected records.
+    if is_archived:
+        and_conditions.append({
+            "$or": [
+                {"is_archived": True},
+                {"status": {"$in": ["APPROVED", "REJECTED"]}},
+            ]
+        })
+    else:
+        and_conditions.append({
+            "is_archived": {"$ne": True},
+            "status": {"$nin": ["APPROVED", "REJECTED"]},
+        })
+
+    # Status filter
+    if status_filter and status_filter.upper() != "ALL":
+        sf = status_filter.upper()
+        if sf == "PENDING":
+            and_conditions.append({"status": {"$in": ["PENDING", "PENDING_VERIFICATION", "SUBMITTED", "INITIATED"]}})
+        elif sf == "APPROVED":
+            and_conditions.append({"status": "APPROVED"})
+        elif sf == "REJECTED":
+            and_conditions.append({"status": "REJECTED"})
+        elif sf == "ARCHIVED":
+            and_conditions.append({"is_archived": True})
+        else:
+            and_conditions.append({"status": sf})
+
+    # Payment type filter
+    if payment_type and payment_type.upper() != "ALL":
+        and_conditions.append({"payment_type": payment_type.upper()})
+
+    # Specific tournament / team / game filters
+    if tournament_id:
+        and_conditions.append({
+            "$or": [
+                {"tournament_id": tournament_id},
+                {"tournament_id": str(tournament_id)},
+            ]
+        })
+    if team_id:
+        and_conditions.append({"team_id": team_id})
+    if game_id:
+        and_conditions.append({"game_id": game_id})
+
+    # Amount range filters
+    amt_q: Dict[str, Any] = {}
+    if min_amount is not None:
+        try:
+            amt_q["$gte"] = float(min_amount)
+        except ValueError:
+            pass
+    if max_amount is not None:
+        try:
+            amt_q["$lte"] = float(max_amount)
+        except ValueError:
+            pass
+    if amt_q:
+        and_conditions.append({"amount_inr": amt_q})
+
+    # Date range filters
+    s_dt, e_dt = parse_payment_date_preset(date_preset, start_date, end_date)
+    if s_dt or e_dt:
+        date_q: Dict[str, Any] = {}
+        date_iso_q: Dict[str, Any] = {}
+        if s_dt:
+            date_q["$gte"] = s_dt
+            date_iso_q["$gte"] = s_dt.isoformat()
+        if e_dt:
+            date_q["$lte"] = e_dt
+            date_iso_q["$lte"] = e_dt.isoformat()
+
+        and_conditions.append({
+            "$or": [
+                {"created_at": date_q},
+                {"created_at": date_iso_q},
+            ]
+        })
+
+    # Comprehensive search across references, users, tournaments, VPAs
+    if search and search.strip():
+        s_pat = re.escape(search.strip())
+        rgx = {"$regex": s_pat, "$options": "i"}
+
+        matched_uids = []
+        try:
+            users_cursor = db.users.find(
+                {"$or": [{"username": rgx}, {"email": rgx}, {"display_name": rgx}]},
+                {"_id": 1, "id": 1, "clerk_user_id": 1}
+            ).limit(40)
+            users_matched = await users_cursor.to_list(length=40)
+            for u in users_matched:
+                if u.get("_id"): matched_uids.append(str(u["_id"]))
+                if u.get("id"): matched_uids.append(str(u["id"]))
+                if u.get("clerk_user_id"): matched_uids.append(str(u["clerk_user_id"]))
+        except Exception:
+            pass
+
+        matched_tids = []
+        try:
+            tourn_cursor = db.tournaments.find(
+                {"$or": [{"title": rgx}, {"name": rgx}, {"slug": rgx}]},
+                {"_id": 1, "id": 1, "slug": 1}
+            ).limit(40)
+            tourns_matched = await tourn_cursor.to_list(length=40)
+            for t in tourns_matched:
+                if t.get("_id"): matched_tids.append(str(t["_id"]))
+                if t.get("id"): matched_tids.append(str(t["id"]))
+                if t.get("slug"): matched_tids.append(str(t["slug"]))
+        except Exception:
+            pass
+
+        search_or: List[Dict[str, Any]] = [
+            {"utr": rgx},
+            {"id": rgx},
+            {"_id": rgx},
+            {"user_id": rgx},
+            {"team_name": rgx},
+            {"team_id": rgx},
+            {"tournament_id": rgx},
+            {"game_name": rgx},
+            {"sender_upi_id": rgx},
+            {"upi_id": rgx},
+            {"notes": rgx},
+            {"description": rgx},
+        ]
+        if matched_uids:
+            search_or.append({"user_id": {"$in": matched_uids}})
+        if matched_tids:
+            search_or.append({"tournament_id": {"$in": matched_tids}})
+
+        and_conditions.append({"$or": search_or})
+
+    return {"$and": and_conditions} if len(and_conditions) > 1 else and_conditions[0]
+
+
 @router.get("/payments")
 async def list_admin_payments(
     status_filter: Optional[str] = None,
@@ -926,65 +1181,55 @@ async def list_admin_payments(
     payment_type: Optional[str] = None,
     tournament_id: Optional[str] = None,
     team_id: Optional[str] = None,
+    date_preset: Optional[str] = None,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
+    min_amount: Optional[float] = None,
+    max_amount: Optional[float] = None,
+    sort_by: Optional[str] = "NEWEST",
+    page: int = Query(1, ge=1),
+    limit: int = Query(50, ge=1, le=500),
     is_archived: bool = False,
+    with_meta: bool = False,
     admin_user: User = Depends(require_super_admin),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
-    query = {"is_dummy": {"$ne": True}}
-    if is_archived:
-        query["is_archived"] = True
-    else:
-        query["is_archived"] = {"$ne": True}
+    import math
+    query = await build_payments_query(
+        db=db,
+        status_filter=status_filter,
+        game_id=game_id,
+        search=search,
+        payment_type=payment_type,
+        tournament_id=tournament_id,
+        team_id=team_id,
+        date_preset=date_preset,
+        start_date=start_date,
+        end_date=end_date,
+        min_amount=min_amount,
+        max_amount=max_amount,
+        is_archived=is_archived,
+    )
 
-    if status_filter and status_filter.upper() != "ALL":
-        sf = status_filter.upper()
-        if sf == "PENDING":
-            query["status"] = {"$in": ["PENDING", "PENDING_VERIFICATION", "SUBMITTED", "INITIATED"]}
-        else:
-            query["status"] = sf
+    sort_spec = [("created_at", -1)]
+    if sort_by:
+        sb = sort_by.upper().strip()
+        if sb == "OLDEST":
+            sort_spec = [("created_at", 1)]
+        elif sb == "AMOUNT_DESC":
+            sort_spec = [("amount_inr", -1), ("created_at", -1)]
+        elif sb == "AMOUNT_ASC":
+            sort_spec = [("amount_inr", 1), ("created_at", -1)]
+        elif sb == "RECENTLY_PROCESSED":
+            sort_spec = [("verified_at", -1), ("archived_at", -1), ("created_at", -1)]
+        elif sb == "OLDEST_PENDING":
+            sort_spec = [("created_at", 1)]
 
-    if payment_type and payment_type.upper() != "ALL":
-        query["payment_type"] = payment_type.upper()
+    skip = (page - 1) * limit
+    total = await db.game_payments.count_documents(query)
 
-    if tournament_id:
-        query["tournament_id"] = tournament_id
-
-    if team_id:
-        query["team_id"] = team_id
-
-    if game_id:
-        query["game_id"] = game_id
-
-    if start_date or end_date:
-        date_q = {}
-        if start_date:
-            try:
-                date_q["$gte"] = datetime.fromisoformat(start_date.replace("Z", "+00:00"))
-            except Exception:
-                pass
-        if end_date:
-            try:
-                date_q["$lte"] = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
-            except Exception:
-                pass
-        if date_q:
-            query["created_at"] = date_q
-
-    if search and search.strip():
-        s_pat = re.escape(search.strip())
-        query["$or"] = [
-            {"utr": {"$regex": s_pat, "$options": "i"}},
-            {"user_id": {"$regex": s_pat, "$options": "i"}},
-            {"tournament_id": {"$regex": s_pat, "$options": "i"}},
-            {"team_name": {"$regex": s_pat, "$options": "i"}},
-            {"team_id": {"$regex": s_pat, "$options": "i"}},
-            {"id": {"$regex": s_pat, "$options": "i"}},
-        ]
-
-    cursor = db.game_payments.find(query).sort("created_at", -1)
-    docs = await cursor.to_list(length=300)
+    cursor = db.game_payments.find(query).sort(sort_spec).skip(skip).limit(limit)
+    docs = await cursor.to_list(length=limit)
 
     user_ids = [str(d.get("user_id")) for d in docs if d.get("user_id")]
     u_map = {}
@@ -996,18 +1241,39 @@ async def list_admin_payments(
             if u.get("clerk_user_id"):
                 u_map[str(u["clerk_user_id"])] = u
 
+    tourn_ids = [str(d.get("tournament_id")) for d in docs if d.get("tournament_id")]
+    t_map = {}
+    if tourn_ids:
+        tourns = await db.tournaments.find({"$or": [{"_id": {"$in": tourn_ids}}, {"id": {"$in": tourn_ids}}, {"slug": {"$in": tourn_ids}}]}).to_list(len(tourn_ids) + 10)
+        for t in tourns:
+            tid = str(t.get("_id", t.get("id")))
+            t_map[tid] = t
+            if t.get("slug"):
+                t_map[t["slug"]] = t
+
+    def _format_iso(val: Any) -> Optional[str]:
+        if not val:
+            return None
+        if hasattr(val, "isoformat"):
+            return val.isoformat()
+        return str(val)
+
     for d in docs:
         d["id"] = str(d.get("_id", d.get("id")))
         d.pop("_id", None)
-        d["is_archived"] = bool(d.get("is_archived", False))
-        if d.get("archived_at") and hasattr(d["archived_at"], "isoformat"):
-            d["archived_at"] = d["archived_at"].isoformat()
-        if d.get("created_at") and hasattr(d["created_at"], "isoformat"):
-            d["created_at"] = d["created_at"].isoformat()
-        if d.get("updated_at") and hasattr(d["updated_at"], "isoformat"):
-            d["updated_at"] = d["updated_at"].isoformat()
-        if d.get("verified_at") and hasattr(d["verified_at"], "isoformat"):
-            d["verified_at"] = d["verified_at"].isoformat()
+        d["is_archived"] = bool(d.get("is_archived", False) or d.get("status") in ["APPROVED", "REJECTED"])
+        d["archived_at"] = _format_iso(d.get("archived_at"))
+        d["created_at"] = _format_iso(d.get("created_at"))
+        d["updated_at"] = _format_iso(d.get("updated_at"))
+        d["verified_at"] = _format_iso(d.get("verified_at"))
+        d["approved_at"] = _format_iso(d.get("approved_at") or (d.get("verified_at") if d.get("status") == "APPROVED" else None))
+        d["rejected_at"] = _format_iso(d.get("rejected_at") or (d.get("verified_at") if d.get("status") == "REJECTED" else None))
+
+        if not d.get("approved_by") and d.get("status") == "APPROVED":
+            d["approved_by"] = d.get("verified_by")
+        if not d.get("rejected_by") and d.get("status") == "REJECTED":
+            d["rejected_by"] = d.get("verified_by")
+
         uid = str(d.get("user_id", ""))
         if uid in u_map:
             u_info = u_map[uid]
@@ -1017,7 +1283,129 @@ async def list_admin_payments(
                 d["user_name"] = u_info.get("display_name") or u_info.get("username")
             if not d.get("user_username"):
                 d["user_username"] = u_info.get("username")
+
+        tid = str(d.get("tournament_id", ""))
+        if tid in t_map:
+            t_info = t_map[tid]
+            if not d.get("tournament_title"):
+                d["tournament_title"] = t_info.get("title")
+            if not d.get("game_name"):
+                d["game_name"] = t_info.get("game_name")
+
+    if with_meta:
+        return {
+            "items": docs,
+            "total": total,
+            "page": page,
+            "limit": limit,
+            "pages": max(1, math.ceil(total / limit)),
+        }
     return docs
+
+
+@router.get("/payments/summary")
+async def get_admin_payments_summary(
+    status_filter: Optional[str] = None,
+    game_id: Optional[str] = None,
+    search: Optional[str] = None,
+    payment_type: Optional[str] = None,
+    tournament_id: Optional[str] = None,
+    team_id: Optional[str] = None,
+    date_preset: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    min_amount: Optional[float] = None,
+    max_amount: Optional[float] = None,
+    is_archived: bool = False,
+    admin_user: User = Depends(require_super_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    query = await build_payments_query(
+        db=db,
+        status_filter=status_filter,
+        game_id=game_id,
+        search=search,
+        payment_type=payment_type,
+        tournament_id=tournament_id,
+        team_id=team_id,
+        date_preset=date_preset,
+        start_date=start_date,
+        end_date=end_date,
+        min_amount=min_amount,
+        max_amount=max_amount,
+        is_archived=is_archived,
+    )
+
+    pipeline = [
+        {"$match": query},
+        {
+            "$group": {
+                "_id": None,
+                "matching_count": {"$sum": 1},
+                "total_volume_inr": {"$sum": {"$ifNull": ["$amount_inr", 0]}},
+                "pending_count": {
+                    "$sum": {
+                        "$cond": [
+                            {"$in": ["$status", ["PENDING", "PENDING_VERIFICATION", "SUBMITTED", "INITIATED"]]},
+                            1,
+                            0,
+                        ]
+                    }
+                },
+                "pending_volume_inr": {
+                    "$sum": {
+                        "$cond": [
+                            {"$in": ["$status", ["PENDING", "PENDING_VERIFICATION", "SUBMITTED", "INITIATED"]]},
+                            {"$ifNull": ["$amount_inr", 0]},
+                            0,
+                        ]
+                    }
+                },
+                "approved_count": {
+                    "$sum": {"$cond": [{"$eq": ["$status", "APPROVED"]}, 1, 0]}
+                },
+                "approved_volume_inr": {
+                    "$sum": {
+                        "$cond": [
+                            {"$eq": ["$status", "APPROVED"]},
+                            {"$ifNull": ["$amount_inr", 0]},
+                            0,
+                        ]
+                    }
+                },
+                "rejected_count": {
+                    "$sum": {"$cond": [{"$eq": ["$status", "REJECTED"]}, 1, 0]}
+                },
+                "rejected_volume_inr": {
+                    "$sum": {
+                        "$cond": [
+                            {"$eq": ["$status", "REJECTED"]},
+                            {"$ifNull": ["$amount_inr", 0]},
+                            0,
+                        ]
+                    }
+                },
+            }
+        }
+    ]
+
+    cursor = db.game_payments.aggregate(pipeline)
+    res_list = await cursor.to_list(length=1)
+    if res_list:
+        res = res_list[0]
+        res.pop("_id", None)
+        return res
+    return {
+        "matching_count": 0,
+        "total_volume_inr": 0.0,
+        "pending_count": 0,
+        "pending_volume_inr": 0.0,
+        "approved_count": 0,
+        "approved_volume_inr": 0.0,
+        "rejected_count": 0,
+        "rejected_volume_inr": 0.0,
+    }
+
 
 @router.post("/payments/{payment_id}/approve")
 async def approve_payment(
@@ -1026,6 +1414,8 @@ async def approve_payment(
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     from bson import ObjectId
+    from datetime import datetime, timezone
+
     p_query = {"$or": [{"_id": payment_id}, {"id": payment_id}]}
     if ObjectId.is_valid(payment_id):
         p_query["$or"].append({"_id": ObjectId(payment_id)})
@@ -1034,8 +1424,31 @@ async def approve_payment(
     if not payment:
         raise HTTPException(status_code=404, detail="Payment record not found")
 
+    now = datetime.now(timezone.utc)
+    now_iso = now.isoformat()
+
+    # Idempotency: If already approved, ensure archived and return success
     if payment.get("status") == "APPROVED":
-        return {"status": "success", "message": "Payment was already approved"}
+        if not payment.get("is_archived"):
+            await db.game_payments.update_one(
+                {"_id": payment["_id"]},
+                {
+                    "$set": {
+                        "is_archived": True,
+                        "archived_at": now_iso,
+                        "archived_by": admin_user.username,
+                        "archive_reason": f"Payment approved by {admin_user.username}",
+                    }
+                }
+            )
+        return {"status": "success", "message": "Payment was already approved", "payment_id": payment_id, "new_status": "APPROVED"}
+
+    # Business rule: Cannot approve an already rejected payment
+    if payment.get("status") == "REJECTED":
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot approve an already rejected payment. Please issue a new payment request if required.",
+        )
 
     if not payment.get("utr") or not str(payment.get("utr")).strip():
         raise HTTPException(
@@ -1043,11 +1456,8 @@ async def approve_payment(
             detail="Cannot approve payment without a valid submitted UTR reference.",
         )
 
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc)
-
-    # Transition from any valid pending status to APPROVED
-    valid_statuses = ["PENDING", "PENDING_VERIFICATION", "SUBMITTED"]
+    # Transition from any valid pending status to APPROVED and auto-archive
+    valid_statuses = ["PENDING", "PENDING_VERIFICATION", "SUBMITTED", "INITIATED"]
     update_res = await db.game_payments.update_one(
         {"_id": payment["_id"], "status": {"$in": valid_statuses}},
         {
@@ -1055,6 +1465,12 @@ async def approve_payment(
                 "status": "APPROVED",
                 "verified_by": admin_user.username,
                 "verified_at": now,
+                "approved_by": admin_user.username,
+                "approved_at": now,
+                "is_archived": True,
+                "archived_at": now_iso,
+                "archived_by": admin_user.username,
+                "archive_reason": f"Payment approved by {admin_user.username}",
             }
         }
     )
@@ -1136,10 +1552,11 @@ async def approve_payment(
         role="SUPER_ADMIN",
         action="APPROVE_PAYMENT",
         target=f"Payment {payment_id} (₹{payment.get('amount_inr')})",
-        details=f"Approved by {admin_user.username} (UTR: {payment.get('utr')})",
+        details=f"Approved and archived by {admin_user.username} (UTR: {payment.get('utr')})",
     )
 
-    return {"status": "success", "message": "Payment verified and approved successfully."}
+    return {"status": "success", "message": "Payment verified, approved, and archived successfully.", "payment_id": payment_id, "new_status": "APPROVED"}
+
 
 @router.post("/payments/{payment_id}/reject")
 async def reject_payment(
@@ -1159,8 +1576,23 @@ async def reject_payment(
     if not payment:
         raise HTTPException(status_code=404, detail="Payment record not found")
 
-    # Idempotency: Prevent duplicate rejection
+    now_utc = datetime.now(timezone.utc)
+    now_iso = now_utc.isoformat()
+
+    # Idempotency: Prevent duplicate rejection and ensure archived
     if payment.get("status") == "REJECTED":
+        if not payment.get("is_archived"):
+            await db.game_payments.update_one(
+                {"_id": payment["_id"]},
+                {
+                    "$set": {
+                        "is_archived": True,
+                        "archived_at": now_iso,
+                        "archived_by": admin_user.username,
+                        "archive_reason": f"Payment rejected by {admin_user.username}",
+                    }
+                }
+            )
         return {"status": "success", "message": "Payment is already rejected.", "payment_id": payment_id, "new_status": "REJECTED"}
 
     # Business rule: Cannot reject already approved payments
@@ -1171,9 +1603,8 @@ async def reject_payment(
         )
 
     reason = payload.rejection_reason or "Invalid transaction details"
-    now_utc = datetime.now(timezone.utc)
 
-    # Atomic transition to REJECTED
+    # Atomic transition to REJECTED and auto-archive
     update_res = await db.game_payments.update_one(
         {"_id": payment["_id"], "status": {"$ne": "REJECTED"}},
         {
@@ -1182,6 +1613,12 @@ async def reject_payment(
                 "rejection_reason": reason,
                 "verified_by": admin_user.username,
                 "verified_at": now_utc,
+                "rejected_by": admin_user.username,
+                "rejected_at": now_utc,
+                "is_archived": True,
+                "archived_at": now_iso,
+                "archived_by": admin_user.username,
+                "archive_reason": f"Payment rejected by {admin_user.username}: {reason}",
             }
         }
     )
@@ -1247,7 +1684,7 @@ async def reject_payment(
             role="SUPER_ADMIN",
             action="REJECT_PAYMENT",
             target=f"Payment {payment_id}",
-            details=f"Rejected: {reason}",
+            details=f"Rejected and archived by {admin_user.username}: {reason}",
         )
     except Exception as e:
         import logging
@@ -1255,7 +1692,7 @@ async def reject_payment(
 
     return {
         "status": "success",
-        "message": "Payment rejected successfully.",
+        "message": "Payment rejected and archived successfully.",
         "payment_id": payment_id,
         "new_status": "REJECTED",
     }
@@ -4570,11 +5007,47 @@ async def get_tournament_rounds_rosters(
     m_cursor = db.matches.find({
         "$or": [{"tournament_id": tid}, {"tournament_id": tslug}]
     }).sort([("round_number", 1), ("match_number", 1), ("order", 1)])
-    raw_matches = await m_cursor.to_list(length=200)
+    raw_matches = await m_cursor.to_list(length=300)
 
     paired_team_ids = set()
     rounds_map: Dict[str, Any] = {}
+    round_streams = tourn.get("round_streams") or {}
 
+    # Initialize rounds from stages if present
+    for stg in (tourn.get("stages") or []):
+        for sr in (stg.get("rounds") or []):
+            r_name = sr.get("round_name") or sr.get("name")
+            r_num = sr.get("round_number") or sr.get("round_order") or 1
+            s_url = sr.get("stream_url") or sr.get("live_stream_url") or round_streams.get(r_name)
+            if r_name and r_name not in rounds_map:
+                rounds_map[r_name] = {
+                    "round_number": r_num,
+                    "round_name": r_name,
+                    "stream_url": s_url,
+                    "live_stream_url": s_url,
+                    "format": sr.get("format") or tourn.get("format", "Knockout"),
+                    "series_format": sr.get("series_format", "BO1"),
+                    "matches": [],
+                }
+
+    # Initialize rounds from custom_rounds if present
+    for idx, cr_name in enumerate(tourn.get("custom_rounds") or [], start=1):
+        s_url = round_streams.get(cr_name)
+        if cr_name not in rounds_map:
+            rounds_map[cr_name] = {
+                "round_number": idx,
+                "round_name": cr_name,
+                "stream_url": s_url,
+                "live_stream_url": s_url,
+                "format": tourn.get("format", "Knockout"),
+                "series_format": tourn.get("series_format", "BO1"),
+                "matches": [],
+            }
+        elif s_url and not rounds_map[cr_name].get("stream_url"):
+            rounds_map[cr_name]["stream_url"] = s_url
+            rounds_map[cr_name]["live_stream_url"] = s_url
+
+    # Populate matches into rounds_map
     for m_doc in raw_matches:
         m = Match.from_mongo(m_doc)
         r_num = m.round_number or 1
@@ -4587,12 +5060,25 @@ async def get_tournament_rounds_rosters(
         for tid_extra in (m.team_ids or []):
             paired_team_ids.add(str(tid_extra))
 
+        r_stream = round_streams.get(r_name)
         if r_name not in rounds_map:
             rounds_map[r_name] = {
                 "round_number": r_num,
                 "round_name": r_name,
+                "stream_url": r_stream,
+                "live_stream_url": r_stream,
+                "format": m.format or tourn.get("format", "Knockout"),
+                "series_format": m.series_format or "BO1",
                 "matches": [],
             }
+        elif r_stream and not rounds_map[r_name].get("stream_url"):
+            rounds_map[r_name]["stream_url"] = r_stream
+            rounds_map[r_name]["live_stream_url"] = r_stream
+
+        # Inherit round stream if not explicitly overridden on match
+        if rounds_map[r_name].get("stream_url") and not m.youtube_live_url:
+            m.youtube_live_url = rounds_map[r_name]["stream_url"]
+            m.live_link = rounds_map[r_name]["stream_url"]
 
         rounds_map[r_name]["matches"].append(m.model_dump())
 
@@ -4616,6 +5102,7 @@ async def get_tournament_rounds_rosters(
             "community_link": tourn.get("community_link"),
             "server_region": tourn.get("server_region", "AWS Mumbai (ap-south-1)"),
             "custom_rounds": tourn.get("custom_rounds") or [],
+            "round_streams": round_streams,
         },
         "registered_teams": registered_teams,
         "unpaired_teams": unpaired_teams,
@@ -4632,13 +5119,21 @@ async def update_tournament_stream(
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     from bson import ObjectId
-    t_query = {"$or": [{"id": tournament_id}, {"_id": tournament_id}]}
+    t_query = {"$or": [{"id": tournament_id}, {"_id": tournament_id}, {"slug": tournament_id}]}
     if ObjectId.is_valid(tournament_id):
         t_query["$or"].append({"_id": ObjectId(tournament_id)})
 
+    url = payload.get_url()
+    if url:
+        url = url.strip()
+        if url and not (url.startswith("http://") or url.startswith("https://")):
+            url = f"https://{url}"
+    else:
+        url = None
+
     res = await db.tournaments.update_one(
         t_query,
-        {"$set": {"live_stream_url": payload.live_stream_url}}
+        {"$set": {"live_stream_url": url}}
     )
     if res.matched_count == 0:
         raise HTTPException(status_code=404, detail="Tournament not found")
@@ -4646,7 +5141,613 @@ async def update_tournament_stream(
     return {
         "status": "success",
         "message": "Tournament live stream URL updated",
-        "live_stream_url": payload.live_stream_url
+        "live_stream_url": url,
+        "stream_url": url,
+    }
+
+
+@router.patch("/tournaments/{tournament_id}/rounds/{round_name}/stream")
+async def update_round_stream_admin(
+    tournament_id: str,
+    round_name: str,
+    payload: TournamentStreamUpdatePayload,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Section 5: Round-level broadcast management.
+    A broadcast URL belongs to a round, not to every individual match.
+    Updates round_streams[round_name] on the tournament and cascades to all matches in this round.
+    """
+    from bson import ObjectId
+    t_query = {"$or": [{"id": tournament_id}, {"_id": tournament_id}, {"slug": tournament_id}]}
+    if ObjectId.is_valid(tournament_id):
+        t_query["$or"].append({"_id": ObjectId(tournament_id)})
+
+    tourn = await db.tournaments.find_one(t_query)
+    if not tourn:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+
+    tid = str(tourn.get("_id", tourn.get("id")))
+    tslug = tourn.get("slug", tid)
+
+    raw_url = payload.get_url()
+    url = None
+    if raw_url:
+        trimmed = raw_url.strip()
+        if trimmed:
+            if not (trimmed.startswith("http://") or trimmed.startswith("https://")):
+                url = f"https://{trimmed}"
+            else:
+                url = trimmed
+
+    # 1. Update round_streams dict on tournament
+    await db.tournaments.update_one(
+        {"_id": tourn["_id"]},
+        {"$set": {f"round_streams.{round_name}": url}}
+    )
+
+    # 2. Update matching stage rounds if present
+    stages = tourn.get("stages") or []
+    updated_stages = False
+    for stg in stages:
+        for sr in (stg.get("rounds") or []):
+            if (sr.get("round_name") or sr.get("name")) == round_name:
+                sr["stream_url"] = url
+                sr["live_stream_url"] = url
+                updated_stages = True
+    if updated_stages:
+        await db.tournaments.update_one(
+            {"_id": tourn["_id"]},
+            {"$set": {"stages": stages}}
+        )
+
+    # 3. Cascade round-level stream URL to all matches in this round
+    await db.matches.update_many(
+        {
+            "$or": [{"tournament_id": tid}, {"tournament_id": tslug}],
+            "$or": [{"round_name": round_name}, {"stage": round_name}],
+        },
+        {"$set": {"live_link": url, "youtube_live_url": url}}
+    )
+
+    return {
+        "status": "success",
+        "message": f'Broadcast URL for round "{round_name}" updated successfully.',
+        "round_name": round_name,
+        "stream_url": url,
+    }
+
+
+@router.patch("/matches/{id}/credentials")
+async def update_match_credentials_admin(
+    id: str,
+    payload: MatchCredentialsUpdatePayload,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Section 7: Organizer enters or edits match room credentials.
+    Credentials remain unreleased until explicit release action.
+    """
+    from bson import ObjectId
+    m_query = {"$or": [{"_id": id}, {"id": id}]}
+    if ObjectId.is_valid(id):
+        m_query["$or"].append({"_id": ObjectId(id)})
+
+    match = await db.matches.find_one(m_query)
+    if not match:
+        raise HTTPException(status_code=404, detail="Match not found")
+
+    upd: Dict[str, Any] = {}
+    if payload.room_id is not None:
+        upd["room_id"] = payload.room_id.strip()
+        upd["lobby_code"] = payload.room_id.strip()
+    if payload.lobby_code is not None:
+        upd["lobby_code"] = payload.lobby_code.strip()
+        if "room_id" not in upd:
+            upd["room_id"] = payload.lobby_code.strip()
+    if payload.room_password is not None:
+        upd["room_password"] = payload.room_password.strip()
+        upd["lobby_password"] = payload.room_password.strip()
+    if payload.lobby_password is not None:
+        upd["lobby_password"] = payload.lobby_password.strip()
+        if "room_password" not in upd:
+            upd["room_password"] = payload.lobby_password.strip()
+    if payload.custom_instructions is not None:
+        upd["custom_instructions"] = payload.custom_instructions.strip()
+        upd["match_message"] = payload.custom_instructions.strip()
+    if payload.server_region is not None:
+        upd["server_region"] = payload.server_region.strip()
+
+    if upd:
+        await db.matches.update_one(m_query, {"$set": upd})
+
+    return {
+        "status": "success",
+        "message": "Match credentials saved (unreleased).",
+        "match_id": id,
+        "credentials_released": match.get("credentials_released", False),
+    }
+
+
+@router.post("/matches/{id}/release-credentials")
+async def release_match_credentials_admin(
+    id: str,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Section 7 & 8: Explicitly releases credentials and opens check-in window.
+    Credentials become accessible to eligible match participants.
+    """
+    from bson import ObjectId
+    from app.models.base import get_utc_now
+    from app.services.match_notification_service import send_match_reminder
+
+    m_query = {"$or": [{"_id": id}, {"id": id}]}
+    if ObjectId.is_valid(id):
+        m_query["$or"].append({"_id": ObjectId(id)})
+
+    match = await db.matches.find_one(m_query)
+    if not match:
+        raise HTTPException(status_code=404, detail="Match not found")
+
+    mid = str(match.get("_id", match.get("id")))
+    now = get_utc_now()
+
+    room_val = match.get("room_id") or match.get("lobby_code") or ""
+    pass_val = match.get("room_password") or match.get("lobby_password") or ""
+
+    upd: Dict[str, Any] = {
+        "credentials_released": True,
+        "credentials_released_at": now,
+        "credentials_released_by": admin_user.username,
+        "join_info_enabled": True,
+        "join_info": {
+            "room_id": room_val,
+            "room_password": pass_val,
+            "lobby_code": room_val,
+            "password": pass_val,
+        },
+    }
+    # Open check-in if not already live or completed
+    if match.get("status") in ["SCHEDULED", "DRAFT", None]:
+        upd["status"] = "CHECK_IN_OPEN"
+
+    await db.matches.update_one(m_query, {"$set": upd})
+
+    # Notify participants
+    try:
+        await send_match_reminder(
+            match_id=mid,
+            reminder_type="FIFTEEN_MINUTES",
+            db=db,
+            custom_message="Match credentials have been released! Captain check-in is now open.",
+        )
+    except Exception as e:
+        print(f"[Release Credentials Notification]: {e}")
+
+    await record_audit_log(
+        db=db,
+        operator=admin_user.username,
+        role=admin_user.role,
+        action="RELEASE_CREDENTIALS",
+        target=f"Match {mid}",
+        details="Match credentials released and check-in opened for participants.",
+    )
+
+    return {
+        "status": "success",
+        "message": "Credentials released and check-in window opened successfully.",
+        "match_id": mid,
+        "credentials_released": True,
+        "status": upd.get("status", match.get("status")),
+    }
+
+
+@router.get("/tournaments/{tournament_id}/qualified-contenders")
+async def get_qualified_contenders_admin(
+    tournament_id: str,
+    source_round: Optional[str] = Query(None),
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Section 10: Returns eligible qualified contenders from earlier rounds for manual next-round formation.
+    """
+    from bson import ObjectId
+    t_query = {"$or": [{"id": tournament_id}, {"_id": tournament_id}, {"slug": tournament_id}]}
+    if ObjectId.is_valid(tournament_id):
+        t_query["$or"].append({"_id": ObjectId(tournament_id)})
+
+    tourn = await db.tournaments.find_one(t_query)
+    if not tourn:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+
+    tid = str(tourn.get("_id", tourn.get("id")))
+    tslug = tourn.get("slug", tid)
+
+    q_filter: Dict[str, Any] = {
+        "$or": [{"tournament_id": tid}, {"tournament_id": tslug}],
+        "status": "QUALIFIED",
+    }
+    if source_round:
+        q_filter["source_round"] = source_round
+
+    cursor = db.tournament_qualifications.find(q_filter)
+    docs = await cursor.to_list(length=300)
+
+    res = []
+    seen = set()
+    for d in docs:
+        pid = d.get("participant_id")
+        if pid and pid not in seen:
+            seen.add(pid)
+            res.append({
+                "participant_id": pid,
+                "participant_name": d.get("participant_name") or str(pid),
+                "source_round": d.get("source_round"),
+                "source_round_number": d.get("source_round_number", 1),
+                "source_match_id": d.get("source_match_id"),
+                "status": d.get("status"),
+                "points": d.get("points"),
+                "placement": d.get("placement"),
+            })
+
+    return {
+        "status": "success",
+        "tournament_id": tid,
+        "qualified_contenders": res,
+        "contenders": res,
+        "total_qualified": len(res),
+        "count": len(res),
+    }
+
+
+@router.patch("/matches/{id}/alive-status")
+async def update_match_alive_status_admin(
+    id: str,
+    payload: Dict[str, Any],
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Section 11: Real-time operational tracking of alive vs eliminated teams in Battle Royale.
+    """
+    from bson import ObjectId
+    m_query = {"$or": [{"_id": id}, {"id": id}]}
+    if ObjectId.is_valid(id):
+        m_query["$or"].append({"_id": ObjectId(id)})
+
+    match = await db.matches.find_one(m_query)
+    if not match:
+        raise HTTPException(status_code=404, detail="Match not found")
+
+    team_id = payload.get("team_id")
+    is_alive = payload.get("is_alive", True)
+    if not team_id:
+        raise HTTPException(status_code=400, detail="team_id is required")
+
+    alive_map = dict(match.get("alive_status") or {})
+    alive_map[str(team_id)] = bool(is_alive)
+
+    await db.matches.update_one(m_query, {"$set": {"alive_status": alive_map}})
+
+    return {
+        "status": "success",
+        "team_id": str(team_id),
+        "is_alive": bool(is_alive),
+        "alive_status": alive_map,
+    }
+
+
+@router.post("/matches/{id}/battle-royale-results")
+async def submit_battle_royale_results_admin(
+    id: str,
+    payload: BattleRoyaleSubmitResultsPayload,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Section 11: Organizer submits official Battle Royale placements, kills, and scoring.
+    Computes total points and stores qualification decisions without auto-creating downstream matches.
+    """
+    from bson import ObjectId
+    from app.models.base import generate_uuid, get_utc_now
+
+    m_query = {"$or": [{"_id": id}, {"id": id}]}
+    if ObjectId.is_valid(id):
+        m_query["$or"].append({"_id": ObjectId(id)})
+
+    match = await db.matches.find_one(m_query)
+    if not match:
+        raise HTTPException(status_code=404, detail="Match not found")
+
+    results_list = payload.get_results()
+    if not results_list:
+        raise HTTPException(status_code=400, detail="At least one team result must be provided.")
+
+    # Validate no duplicate teams
+    team_ids = [r.team_id for r in results_list]
+    if len(team_ids) != len(set(team_ids)):
+        raise HTTPException(status_code=400, detail="Duplicate team entries in results.")
+
+    # Validate unique placement ranks
+    placements = [r.placement for r in results_list]
+    if len(placements) != len(set(placements)):
+        raise HTTPException(status_code=400, detail="Each team must have a unique placement rank.")
+
+    # Standard Battle Royale Placement Matrix:
+    default_placement_points = {
+        1: 10, 2: 6, 3: 5, 4: 4, 5: 3, 6: 2, 7: 1, 8: 1
+    }
+    pts_per_kill = 1
+
+    processed_results = []
+    winner_team_id = None
+    tid = str(match.get("tournament_id"))
+
+    for r in results_list:
+        place = r.placement
+        kills = r.kills or 0
+        calc_place_pts = default_placement_points.get(place, 0)
+        calc_kill_pts = kills * pts_per_kill
+
+        p_pts = r.placement_points if r.placement_points is not None else calc_place_pts
+        e_pts = r.elimination_points if r.elimination_points is not None else calc_kill_pts
+        t_pts = r.total_points if r.total_points is not None else (p_pts + e_pts)
+
+        if place == 1:
+            winner_team_id = r.team_id
+
+        entry = {
+            "team_id": r.team_id,
+            "team_name": r.team_name or str(r.team_id),
+            "placement": place,
+            "kills": kills,
+            "placement_points": p_pts,
+            "elimination_points": e_pts,
+            "total_points": t_pts,
+            "is_alive": False,
+            "qualified": bool(r.qualified),
+        }
+        processed_results.append(entry)
+
+        # Upsert Qualification Record for this team
+        qual_status = "QUALIFIED" if r.qualified or place <= 4 else "ELIMINATED"
+        qual_doc = {
+            "tournament_id": tid,
+            "source_round": match.get("round_name", "Round 1"),
+            "source_round_number": match.get("round_number", 1),
+            "source_match_id": str(match.get("_id", match.get("id"))),
+            "participant_id": str(r.team_id),
+            "participant_name": r.team_name or str(r.team_id),
+            "participant_type": "TEAM",
+            "status": qual_status,
+            "placement": place,
+            "points": t_pts,
+            "result_reference": entry,
+            "updated_at": get_utc_now(),
+        }
+        await db.tournament_qualifications.update_one(
+            {
+                "tournament_id": tid,
+                "source_match_id": str(match.get("_id", match.get("id"))),
+                "participant_id": str(r.team_id),
+            },
+            {"$set": qual_doc, "$setOnInsert": {"id": generate_uuid(), "created_at": get_utc_now()}},
+            upsert=True,
+        )
+
+    # Sort results by placement
+    processed_results.sort(key=lambda x: x["placement"])
+
+    await db.matches.update_one(
+        m_query,
+        {
+            "$set": {
+                "status": "COMPLETED",
+                "placements": processed_results,
+                "winner_team_id": winner_team_id,
+                "scoring_matrix": payload.scoring_matrix or {"placement": default_placement_points, "kill": pts_per_kill},
+            }
+        }
+    )
+
+    await record_audit_log(
+        db=db,
+        operator=admin_user.username,
+        role=admin_user.role,
+        action="COMPLETE_BATTLE_ROYALE_MATCH",
+        target=f"Match {id}",
+        details=f"BR results submitted. Winner: {winner_team_id}. {len(processed_results)} teams recorded.",
+    )
+
+    return {
+        "status": "success",
+        "message": f"Battle Royale results saved successfully! {len(processed_results)} placements recorded.",
+        "match_id": id,
+        "winner_team_id": winner_team_id,
+        "placements": processed_results,
+    }
+
+
+@router.get("/matches/{match_id}/ratings")
+async def get_match_ratings_admin(
+    match_id: str,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Section 14: Returns participants and existing manual post-match ratings.
+    """
+    from bson import ObjectId
+    m_query = {"$or": [{"_id": match_id}, {"id": match_id}]}
+    if ObjectId.is_valid(match_id):
+        m_query["$or"].append({"_id": ObjectId(match_id)})
+
+    match = await db.matches.find_one(m_query)
+    if not match:
+        raise HTTPException(status_code=404, detail="Match not found")
+
+    ratings_list = match.get("participant_ratings") or []
+    rated_map = {r["participant_id"]: r for r in ratings_list}
+
+    participants = []
+    # Team A
+    if match.get("team_a_id"):
+        tid = match["team_a_id"]
+        tname = match.get("team_a_name") or "Team A"
+        participants.append({
+            "participant_id": tid,
+            "user_id": tid,
+            "name": tname,
+            "team_name": tname,
+            "is_winner": (tid == match.get("winner_team_id")),
+            "rating": rated_map.get(tid, {}).get("rating"),
+            "notes": rated_map.get(tid, {}).get("notes"),
+            "rated": tid in rated_map,
+        })
+    # Team B
+    if match.get("team_b_id"):
+        tid = match["team_b_id"]
+        tname = match.get("team_b_name") or "Team B"
+        participants.append({
+            "participant_id": tid,
+            "user_id": tid,
+            "name": tname,
+            "team_name": tname,
+            "is_winner": (tid == match.get("winner_team_id")),
+            "rating": rated_map.get(tid, {}).get("rating"),
+            "notes": rated_map.get(tid, {}).get("notes"),
+            "rated": tid in rated_map,
+        })
+    # Multi-teams
+    for t_obj in (match.get("teams") or []):
+        tid = t_obj.get("id") or t_obj.get("team_id")
+        tname = t_obj.get("name") or t_obj.get("team_name")
+        if tid and not any(p["participant_id"] == tid for p in participants):
+            participants.append({
+                "participant_id": tid,
+                "user_id": tid,
+                "name": tname or str(tid),
+                "team_name": tname or str(tid),
+                "is_winner": (tid == match.get("winner_team_id")),
+                "rating": rated_map.get(tid, {}).get("rating"),
+                "notes": rated_map.get(tid, {}).get("notes"),
+                "rated": tid in rated_map,
+            })
+
+    return {
+        "status": "success",
+        "match_id": match_id,
+        "is_completed": (match.get("status") == "COMPLETED"),
+        "participants": participants,
+        "ratings": ratings_list,
+        "rating_scale": "1-10",
+    }
+
+
+@router.post("/matches/{match_id}/ratings")
+async def submit_match_ratings_admin(
+    match_id: str,
+    payload: MatchRatingsSubmitPayload,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Section 14: Manual post-match player ratings assigned by authorized organizers.
+    Strictly manual, no automated Elo recalculation.
+    """
+    from bson import ObjectId
+    from app.models.base import generate_uuid, get_utc_now
+
+    m_query = {"$or": [{"_id": match_id}, {"id": match_id}]}
+    if ObjectId.is_valid(match_id):
+        m_query["$or"].append({"_id": ObjectId(match_id)})
+
+    match = await db.matches.find_one(m_query)
+    if not match:
+        raise HTTPException(status_code=404, detail="Match not found")
+
+    if match.get("status") != "COMPLETED":
+        raise HTTPException(
+            status_code=400,
+            detail="Participant ratings can only be assigned after the match result is finalized/completed.",
+        )
+
+    for r in payload.ratings:
+        if r.rating < 1 or r.rating > 10:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid rating {r.rating}. Ratings must be between 1 and 10.",
+            )
+
+    now = get_utc_now()
+    existing_ratings = list(match.get("participant_ratings") or [])
+    ratings_dict = {r["participant_id"]: r for r in existing_ratings if "participant_id" in r}
+
+    for item in payload.ratings:
+        pid = item.participant_id or item.user_id or generate_uuid()
+        entry = {
+            "participant_id": pid,
+            "user_id": item.user_id or pid,
+            "username": item.username,
+            "team_name": item.team_name,
+            "team_id": item.team_id,
+            "rating": item.rating,
+            "notes": item.notes or item.review,
+            "review": item.review or item.notes,
+            "rated_by": admin_user.username,
+            "rated_at": now.isoformat(),
+        }
+        ratings_dict[pid] = entry
+
+        # Persist to match_ratings collection
+        await db.match_ratings.update_one(
+            {
+                "match_id": match_id,
+                "participant_id": pid,
+            },
+            {
+                "$set": {
+                    "match_id": match_id,
+                    "tournament_id": match.get("tournament_id"),
+                    "participant_id": pid,
+                    "user_id": item.user_id or pid,
+                    "rating": item.rating,
+                    "notes": item.notes or item.review,
+                    "review": item.review or item.notes,
+                    "rated_by": admin_user.username,
+                    "updated_at": now,
+                },
+                "$setOnInsert": {
+                    "id": generate_uuid(),
+                    "created_at": now,
+                },
+            },
+            upsert=True,
+        )
+
+    updated_ratings = list(ratings_dict.values())
+    await db.matches.update_one(m_query, {"$set": {"participant_ratings": updated_ratings}})
+
+    await record_audit_log(
+        db=db,
+        operator=admin_user.username,
+        role=admin_user.role,
+        action="SUBMIT_MATCH_RATINGS",
+        target=f"Match {match_id}",
+        details=f"Assigned ratings for {len(payload.ratings)} participants on scale {payload.rating_scale}.",
+    )
+
+    return {
+        "status": "success",
+        "message": f"Successfully assigned ratings for {len(payload.ratings)} participants.",
+        "match_id": match_id,
+        "total_rated": len(updated_ratings),
+        "ratings": updated_ratings,
     }
 
 

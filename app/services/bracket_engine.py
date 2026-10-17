@@ -782,6 +782,84 @@ async def generate_tournament_bracket(
         # Default: Single Elimination
         return await build_single_elimination_bracket(tournament, db)
 
+async def record_match_qualification(
+    db: AsyncIOMotorDatabase,
+    tournament_id: str,
+    completed_match: Match,
+    winner_team_id: str,
+    winner_name: str,
+):
+    from app.models.base import generate_uuid, get_utc_now
+    tourn = await db.tournaments.find_one({"$or": [{"_id": tournament_id}, {"id": tournament_id}, {"slug": tournament_id}]})
+    game_id = tourn.get("game_id") if tourn else None
+
+    # Identify loser ID & name
+    loser_id = None
+    loser_name = None
+    if str(winner_team_id) == str(completed_match.team_a_id):
+        loser_id = completed_match.team_b_id
+        loser_name = completed_match.team_b_name
+    elif str(winner_team_id) == str(completed_match.team_b_id):
+        loser_id = completed_match.team_a_id
+        loser_name = completed_match.team_a_name
+
+    # 1. Upsert Winner Qualification
+    winner_q = {
+        "tournament_id": str(tournament_id),
+        "game_id": str(game_id or ""),
+        "source_round": completed_match.round_name or f"Round {completed_match.round_number}",
+        "source_round_number": completed_match.round_number or 1,
+        "source_match_id": str(completed_match.id),
+        "participant_id": str(winner_team_id),
+        "participant_name": winner_name,
+        "participant_type": "TEAM",
+        "status": "QUALIFIED",
+        "result_reference": {
+            "score_a": completed_match.score_a,
+            "score_b": completed_match.score_b,
+            "winner_team_id": str(winner_team_id),
+        },
+        "updated_at": get_utc_now(),
+    }
+    await db.tournament_qualifications.update_one(
+        {
+            "tournament_id": str(tournament_id),
+            "source_match_id": str(completed_match.id),
+            "participant_id": str(winner_team_id),
+        },
+        {"$set": winner_q, "$setOnInsert": {"id": generate_uuid(), "created_at": get_utc_now()}},
+        upsert=True,
+    )
+
+    # 2. Upsert Loser Qualification (marked ELIMINATED)
+    if loser_id:
+        loser_q = {
+            "tournament_id": str(tournament_id),
+            "game_id": str(game_id or ""),
+            "source_round": completed_match.round_name or f"Round {completed_match.round_number}",
+            "source_round_number": completed_match.round_number or 1,
+            "source_match_id": str(completed_match.id),
+            "participant_id": str(loser_id),
+            "participant_name": loser_name or str(loser_id),
+            "participant_type": "TEAM",
+            "status": "ELIMINATED",
+            "result_reference": {
+                "score_a": completed_match.score_a,
+                "score_b": completed_match.score_b,
+                "winner_team_id": str(winner_team_id),
+            },
+            "updated_at": get_utc_now(),
+        }
+        await db.tournament_qualifications.update_one(
+            {
+                "tournament_id": str(tournament_id),
+                "source_match_id": str(completed_match.id),
+                "participant_id": str(loser_id),
+            },
+            {"$set": loser_q, "$setOnInsert": {"id": generate_uuid(), "created_at": get_utc_now()}},
+            upsert=True,
+        )
+
 async def advance_bracket_match(
     tournament_id: str,
     completed_match: Match,
@@ -827,7 +905,18 @@ async def advance_bracket_match(
     if not winner_name:
         winner_name = str(winner_team_id)
 
-    # 2. Determine downstream match and slot
+    # 2. Record Qualification in tournament_qualifications (Strict Manual Progression Rule)
+    # The system records winner as QUALIFIED and loser as ELIMINATED.
+    # The organizer manually creates the next round and selects eligible participants.
+    await record_match_qualification(
+        db=db,
+        tournament_id=tournament_id,
+        completed_match=completed_match,
+        winner_team_id=winner_team_id,
+        winner_name=winner_name,
+    )
+
+    # 3. Determine if organizer already created an existing downstream match slot
     next_match_doc = None
     is_team_a = True
 
@@ -852,7 +941,7 @@ async def advance_bracket_match(
             next_match_doc = downstream
             is_team_a = (downstream.get("slot_a_source_match_id") == completed_match.id)
 
-    # Case C: Standard round-advancement pair
+    # Case C: Check if organizer already created the match in next round
     if not next_match_doc:
         next_round_num = (completed_match.round_number or 1) + 1
         m_num = completed_match.match_number or 1
@@ -865,40 +954,8 @@ async def advance_bracket_match(
             "round_number": next_round_num,
             "match_number": next_match_num,
         })
-
-        if not next_match_doc and completed_match.round_number:
-            tourn_doc = await db.tournaments.find_one({"$or": [{"_id": tournament_id}, {"id": tournament_id}, {"slug": tournament_id}]})
-            c_rounds = tourn_doc.get("custom_rounds") or [] if tourn_doc else []
-            r_label = f"Round {next_round_num}"
-            if next_round_num <= len(c_rounds):
-                r_label = c_rounds[next_round_num - 1]
-            else:
-                r_label = get_round_name(next_round_num, max(next_round_num + 1, 3))
-
-            feeder_other = (m_num + 1) if (m_num % 2 != 0) else (m_num - 1)
-            new_downstream_match = Match(
-                tournament_id=str(tournament_id),
-                round_name=r_label,
-                round_number=next_round_num,
-                match_number=next_match_num,
-                stage=r_label,
-                match_type="MATCH",
-                format="BO3" if "final" in r_label.lower() else "BO1",
-                series_format="BO3" if "final" in r_label.lower() else "BO1",
-                status="SCHEDULED",
-                roster_status="PUBLISHED",
-                team_a_id=winner_team_id if is_team_a else None,
-                team_a_name=winner_name if is_team_a else None,
-                team_a_placeholder=None if is_team_a else f"Winner of Match {feeder_other}",
-                slot_a_source_match_id=completed_match.id if is_team_a else None,
-                team_b_id=winner_team_id if not is_team_a else None,
-                team_b_name=winner_name if not is_team_a else None,
-                team_b_placeholder=None if not is_team_a else f"Winner of Match {feeder_other}",
-                slot_b_source_match_id=completed_match.id if not is_team_a else None,
-                previous_match_ids=[completed_match.id],
-            )
-            await db.matches.insert_one(new_downstream_match.to_mongo())
-            next_match_doc = await db.matches.find_one({"_id": new_downstream_match.id})
+        # NOTE: Do NOT automatically create new_downstream_match if it does not exist!
+        # The organizer manually creates each subsequent round and its matches.
 
     next_match = None
     if next_match_doc:

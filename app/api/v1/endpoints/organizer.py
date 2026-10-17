@@ -511,13 +511,27 @@ async def delete_tournament(
     # 1. Cascade delete all dependent matches (including in-progress LIVE matches)
     await db.matches.delete_many(t_filter)
 
-    # 2. Delete all registrations
+    # 2. Delete all tournament-specific registrations
     await db.tournament_registrations.delete_many(t_filter)
 
-    # 3. Delete tournament document
+    # 3. Delete tournament-specific match requests
+    await db.organizer_match_requests.delete_many(t_filter)
+
+    # 4. If this tournament was featured on the homepage, clear the feature
+    if tourn.get("is_featured"):
+        await db.tournaments.update_many({"is_featured": True}, {"$set": {"is_featured": False}})
+
+    # 5. Financial audit safety: preserve payments and wallet accounting history,
+    # while marking tournament as permanently deleted
+    await db.game_payments.update_many(
+        t_filter,
+        {"$set": {"tournament_deleted": True}}
+    )
+
+    # 6. Permanently delete tournament document
     await db.tournaments.delete_one({"_id": tourn["_id"]})
 
-    # 4. Broadcast deletion event
+    # 7. Broadcast deletion event
     try:
         await ws_manager.broadcast({
             "type": "TOURNAMENT_DELETED",
@@ -533,8 +547,13 @@ async def delete_tournament(
         role=organizer.role,
         action="DELETE_TOURNAMENT",
         target=f"Tournament {tourn.get('title')} ({id})",
+        details=f"Permanently deleted tournament '{tourn.get('title')}' and purged dependent matches/registrations by {organizer.username}",
     )
-    return {"status": "success", "message": f"Tournament '{tourn.get('title')}' successfully deleted"}
+    return {
+        "status": "success",
+        "message": f"Tournament '{tourn.get('title')}' successfully deleted",
+        "tournament_id": tid_str,
+    }
 
 @router.post("/tournaments/{id}/close-registration")
 async def close_tournament_registration(

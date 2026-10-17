@@ -53,6 +53,17 @@ class Match(BaseModel):
     server_region: str = "AWS Mumbai (ap-south-1)"
     lobby_code: Optional[str] = None
     lobby_password: Optional[str] = None
+    room_id: Optional[str] = None
+    room_password: Optional[str] = None
+    credentials_released: bool = False
+    credentials_released_at: Optional[datetime] = None
+    credentials_released_by: Optional[str] = None
+    custom_instructions: Optional[str] = None
+    check_ins: list[dict] = Field(default_factory=list)
+    alive_status: dict[str, bool] = Field(default_factory=dict)
+    placements: list[dict] = Field(default_factory=list)
+    scoring_matrix: Optional[dict] = None
+    participant_ratings: list[dict] = Field(default_factory=list)
     join_info_enabled: bool = False
     join_info: Optional[dict[str, str]] = None  # Game-specific: party_id, room_id, password, join_link, etc.
     match_message: Optional[str] = None  # Custom match instructions from admin
@@ -109,6 +120,16 @@ class Match(BaseModel):
             d["teams"] = []
         if "team_ids" not in d or d["team_ids"] is None:
             d["team_ids"] = []
+        if "check_ins" not in d or d["check_ins"] is None:
+            d["check_ins"] = []
+        if "alive_status" not in d or d["alive_status"] is None:
+            d["alive_status"] = {}
+        if "placements" not in d or d["placements"] is None:
+            d["placements"] = []
+        if "participant_ratings" not in d or d["participant_ratings"] is None:
+            d["participant_ratings"] = []
+        if "credentials_released" not in d:
+            d["credentials_released"] = False
         if "roster_status" not in d or not d["roster_status"]:
             d["roster_status"] = "PUBLISHED"
         if "notified_captains" not in d or d["notified_captains"] is None:

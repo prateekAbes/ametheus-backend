@@ -21,6 +21,8 @@ class StageRound(BaseModel):
     rules_notes: Optional[str] = None
     scheduled_date: Optional[str] = None
     scheduled_time: Optional[str] = None
+    stream_url: Optional[str] = None
+    live_stream_url: Optional[str] = None
     match_ids: List[str] = Field(default_factory=list)
 
     def model_post_init(self, __context: Any) -> None:
@@ -30,13 +32,22 @@ class StageRound(BaseModel):
             self.round_name = self.name
         if not self.name and self.round_name:
             self.name = self.round_name
+        if not self.stream_url and self.live_stream_url:
+            self.stream_url = self.live_stream_url
+        elif not self.live_stream_url and self.stream_url:
+            self.live_stream_url = self.stream_url
         if self.round_order == 1 and self.round_number != 1:
             self.round_order = self.round_number
         elif self.round_number == 1 and self.round_order != 1:
             self.round_number = self.round_order
 
     def to_mongo(self) -> dict:
-        return self.model_dump()
+        d = self.model_dump()
+        if not d.get("stream_url") and d.get("live_stream_url"):
+            d["stream_url"] = d["live_stream_url"]
+        if not d.get("live_stream_url") and d.get("stream_url"):
+            d["live_stream_url"] = d["stream_url"]
+        return d
 
 class TournamentStage(BaseModel):
     id: str = Field(default_factory=generate_uuid)
@@ -122,6 +133,7 @@ class Tournament(BaseModel):
     prizes: List[Any] = Field(default_factory=list)
     bracket_rounds: List[Any] = Field(default_factory=list)
     custom_rounds: List[str] = Field(default_factory=list)
+    round_streams: Dict[str, str] = Field(default_factory=dict)
     community_platform: Optional[str] = None  # "DISCORD" | "WHATSAPP" | None
     community_link: Optional[str] = None      # invite link URL
     whatsapp_group_url: Optional[str] = None  # dedicated WhatsApp group invite URL

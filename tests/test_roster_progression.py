@@ -173,21 +173,32 @@ async def test_winner_automatic_next_round_progression(client, mock_db):
     )
     assert complete_resp.status_code == 200
 
-    # Verify Round 2 Match 1 was auto-created or populated with Team Alpha in Slot A
+    # Verify Round 2 Match was NOT auto-created (manual progression model)
     r2_m1 = await mock_db.matches.find_one({
         "tournament_id": "t1",
         "round_number": 2,
-        "match_number": 1,
     })
-    assert r2_m1 is not None
-    assert r2_m1["team_a_id"] == "team_alpha"
-    assert r2_m1["team_a_name"] == "Team Alpha"
+    assert r2_m1 is None, "Downstream match must not be auto-created"
 
-    # Verify Round 1 match records next_match_id link
+    # Verify Round 1 match records completed status and winner
     r1_doc = await mock_db.matches.find_one({"_id": "m_r1_1"})
     assert r1_doc["status"] == "COMPLETED"
     assert r1_doc["winner_team_id"] == "team_alpha"
-    assert r1_doc.get("next_match_id") == str(r2_m1["_id"])
+
+    # Verify qualification records
+    winner_qual = await mock_db.tournament_qualifications.find_one({
+        "tournament_id": "t1",
+        "participant_id": "team_alpha",
+    })
+    assert winner_qual is not None
+    assert winner_qual["status"] == "QUALIFIED"
+
+    loser_qual = await mock_db.tournament_qualifications.find_one({
+        "tournament_id": "t1",
+        "participant_id": "team_bravo",
+    })
+    assert loser_qual is not None
+    assert loser_qual["status"] == "ELIMINATED"
 
 
 @pytest.mark.asyncio

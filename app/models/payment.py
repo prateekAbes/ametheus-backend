@@ -18,7 +18,9 @@ class UpiAccount(BaseModel):
 
     def to_mongo(self) -> dict:
         d = self.model_dump()
-        d["_id"] = d.pop("id")
+        tid = d.get("id") or generate_uuid()
+        d["_id"] = tid
+        d["id"] = tid
         return d
 
     @classmethod
@@ -59,6 +61,11 @@ class GamePayment(BaseModel):
     rejection_reason: Optional[str] = None
     verified_by: Optional[str] = None
     verified_at: Optional[datetime] = None
+    approved_by: Optional[str] = None
+    approved_at: Optional[datetime] = None
+    rejected_by: Optional[str] = None
+    rejected_at: Optional[datetime] = None
+    tournament_deleted: Optional[bool] = None
     is_dummy: bool = False
     is_archived: bool = False
     archived_at: Optional[datetime] = None
@@ -69,7 +76,9 @@ class GamePayment(BaseModel):
 
     def to_mongo(self) -> dict:
         d = self.model_dump()
-        d["_id"] = d.pop("id")
+        tid = d.get("id") or generate_uuid()
+        d["_id"] = tid
+        d["id"] = tid
         # Do not persist null utr so unsubmitted payments don't conflict in indexes
         if d.get("utr") is None:
             d.pop("utr", None)
@@ -103,7 +112,9 @@ class WalletLedger(BaseModel):
 
     def to_mongo(self) -> dict:
         d = self.model_dump()
-        d["_id"] = d.pop("id")
+        tid = d.get("id") or generate_uuid()
+        d["_id"] = tid
+        d["id"] = tid
         return d
 
     @classmethod

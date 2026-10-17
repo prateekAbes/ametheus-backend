@@ -648,6 +648,8 @@ class MatchReminderRequest(BaseModel):
 class CreateRoundPayload(BaseModel):
     round_name: str
     series_format: Optional[str] = "BO1"
+    stream_url: Optional[str] = None
+    live_stream_url: Optional[str] = None
 
 class AdminMatchScheduleUpdate(BaseModel):
     scheduled_at: Optional[str] = None
@@ -826,6 +828,8 @@ class StageRoundCreate(BaseModel):
     rules_notes: Optional[str] = None
     scheduled_date: Optional[str] = None
     scheduled_time: Optional[str] = None
+    stream_url: Optional[str] = None
+    live_stream_url: Optional[str] = None
 
 class StageRoundUpdate(BaseModel):
     name: Optional[str] = None
@@ -838,6 +842,8 @@ class StageRoundUpdate(BaseModel):
     rules_notes: Optional[str] = None
     scheduled_date: Optional[str] = None
     scheduled_time: Optional[str] = None
+    stream_url: Optional[str] = None
+    live_stream_url: Optional[str] = None
 
 class StageMatchCreate(BaseModel):
     team_a_id: Optional[str] = None
@@ -861,7 +867,52 @@ class MatchSwapPayload(BaseModel):
     reason: Optional[str] = None
 
 class TournamentStreamUpdatePayload(BaseModel):
-    live_stream_url: str
+    live_stream_url: Optional[str] = None
+    stream_url: Optional[str] = None
+
+    def get_url(self) -> Optional[str]:
+        return self.stream_url if self.stream_url is not None else self.live_stream_url
+
+class MatchCredentialsUpdatePayload(BaseModel):
+    room_id: Optional[str] = None
+    room_password: Optional[str] = None
+    lobby_code: Optional[str] = None
+    lobby_password: Optional[str] = None
+    custom_instructions: Optional[str] = None
+    server_region: Optional[str] = None
+
+class BattleRoyaleTeamResult(BaseModel):
+    team_id: str
+    team_name: Optional[str] = None
+    placement: int
+    kills: int = 0
+    placement_points: Optional[int] = None
+    elimination_points: Optional[int] = None
+    total_points: Optional[int] = None
+    is_alive: bool = False
+    qualified: bool = False
+
+class BattleRoyaleSubmitResultsPayload(BaseModel):
+    results: Optional[List[BattleRoyaleTeamResult]] = None
+    team_results: Optional[List[BattleRoyaleTeamResult]] = None
+    scoring_matrix: Optional[Dict[str, Any]] = None
+
+    def get_results(self) -> List[BattleRoyaleTeamResult]:
+        return self.team_results or self.results or []
+
+class ParticipantRatingItem(BaseModel):
+    participant_id: Optional[str] = None
+    user_id: Optional[str] = None
+    username: Optional[str] = None
+    team_name: Optional[str] = None
+    team_id: Optional[str] = None
+    rating: float  # 1 to 10
+    notes: Optional[str] = None
+    review: Optional[str] = None
+
+class MatchRatingsSubmitPayload(BaseModel):
+    ratings: List[ParticipantRatingItem]
+    rating_scale: str = "1-10"
 
 class WalletAuditSummaryResponse(BaseModel):
     total_wallet_pool_inr: float
