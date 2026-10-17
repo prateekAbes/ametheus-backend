@@ -215,4 +215,88 @@ async def test_tournament_registration_lifecycle_end_to_end(mock_db, make_client
             "team_id": "team_bravo",
         })
         assert init2_res.status_code == 200
-        assert init2_res.json()["payment_id"] is not None
+        p2_id = init2_res.json()["payment_id"]
+        assert p2_id is not None
+
+        # User 2 submits UTR AND payment screenshot proof
+        utr2_res = await client2.post("/api/v1/tournaments/apex-invitational/submit-upi-utr", json={
+            "payment_id": p2_id,
+            "utr": "987654321098",
+            "screenshot_url": "/api/v1/media/proof_screenshot_123.png",
+        })
+        assert utr2_res.status_code == 200
+
+        # Check status contains screenshot_url
+        status2_res = await client2.get("/api/v1/tournaments/apex-invitational/registration-status")
+        assert status2_res.status_code == 200
+        s2_data = status2_res.json()
+        assert s2_data["registration"]["screenshot_url"] == "/api/v1/media/proof_screenshot_123.png"
+
+    # SCENARIO E: Admin can inspect screenshot_url in pending payments and approve
+    async with make_client(admin) as client_admin:
+        pay_list = await client_admin.get("/api/v1/admin/payments?status_filter=PENDING")
+        assert pay_list.status_code == 200
+        p2_record = next(p for p in pay_list.json() if p["id"] == p2_id)
+        assert p2_record["screenshot_url"] == "/api/v1/media/proof_screenshot_123.png"
+
+        # Approve Team 2
+        appr2_res = await client_admin.post(f"/api/v1/admin/payments/{p2_id}/approve")
+        assert appr2_res.status_code == 200
+
+    # User 2 tests /community-link alias as confirmed participant
+    async with make_client(user2) as client2:
+        comm_alias_res = await client2.get("/api/v1/tournaments/apex-invitational/community-link")
+        assert comm_alias_res.status_code == 200
+        c_alias_data = comm_alias_res.json()
+        assert c_alias_data["community_link"] == "https://chat.whatsapp.com/SecretInviteGroup123"
+        assert c_alias_data["whatsapp_group_url"] == "https://chat.whatsapp.com/SecretInviteGroup123"
+        assert "instructions" in c_alias_data
+
+
+@pytest.mark.asyncio
+async def test_size_0_team_size_prevention_and_game_fallbacks(mock_db, make_client):
+    """
+    Verify that tournaments with min_team_size: 0 or missing values never display 0,
+    and safely derive size from the underlying game or esports defaults.
+    """
+    await mock_db.games.insert_one({
+        "_id": "bgmi",
+        "id": "bgmi",
+        "slug": "bgmi",
+        "name": "Battlegrounds Mobile India",
+        "is_team_game": True,
+        "min_team_size": 4,
+        "max_team_size": 5,
+    })
+
+    # Tournament with legacy/erroneous min_team_size: 0
+    await mock_db.tournaments.insert_one({
+        "_id": "bgmi-championship",
+        "id": "bgmi-championship",
+        "slug": "bgmi-championship",
+        "title": "BGMI Battle Cup",
+        "game_id": "bgmi",
+        "game_slug": "bgmi",
+        "min_team_size": 0,  # Legacy bad data
+        "max_team_size": 0,  # Legacy bad data
+        "status": "REGISTRATION_OPEN",
+        "max_teams": 16,
+    })
+
+    user = User(id="cap_user", email="cap@test.gg", username="bgmi_captain", role="PLAYER")
+    async with make_client(user) as client:
+        # Check list endpoint
+        list_res = await client.get("/api/v1/tournaments?game=bgmi")
+        assert list_res.status_code == 200
+        tourns = list_res.json()
+        assert len(tourns) == 1
+        assert tourns[0]["min_team_size"] == 4  # Safely fell back to game's 4, never 0
+        assert tourns[0]["max_team_size"] == 5
+
+        # Check detail endpoint
+        detail_res = await client.get("/api/v1/tournaments/bgmi-championship")
+        assert detail_res.status_code == 200
+        d_data = detail_res.json()
+        assert d_data["min_team_size"] == 4
+        assert d_data["max_team_size"] == 5
+

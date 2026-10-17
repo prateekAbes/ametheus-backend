@@ -12,6 +12,7 @@ class UserBase(BaseModel):
     avatar_url: Optional[str] = None
     avatar_source: Optional[str] = None
     google_avatar_url: Optional[str] = None
+    equipped_crest_id: Optional[str] = None
     riot_id: Optional[str] = None
     steam_id: Optional[str] = None
     preferences: Optional[Dict[str, Any]] = None
@@ -242,6 +243,7 @@ class UpiAccountUpdate(BaseModel):
     upi_id: Optional[str] = None
     payee_name: Optional[str] = None
     qr_url: Optional[str] = None
+    qr_code_url: Optional[str] = None
     display_name: Optional[str] = None
     status: Optional[str] = None
 
@@ -251,6 +253,7 @@ class UpiAccountResponse(BaseModel):
     upi_id: str
     payee_name: str
     qr_url: Optional[str] = None
+    qr_code_url: Optional[str] = None
     display_name: Optional[str] = None
     status: str = "ACTIVE"
     payment_count: int = 0
@@ -439,6 +442,8 @@ class SubmitTournamentUtrRequest(BaseModel):
 
 class TournamentRegistrationStatusResponse(BaseModel):
     is_registered: bool
+    status: Optional[str] = None
+    payment_status: Optional[str] = None
     registration: Optional[Dict[str, Any]] = None
     team: Optional[Dict[str, Any]] = None
     position: Optional[int] = None

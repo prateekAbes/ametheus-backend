@@ -221,6 +221,9 @@ class TournamentRegistration(BaseModel):
     wallet_txn_id: Optional[str] = None
     game_id: Optional[str] = None
     in_game_id: Optional[str] = None
+    screenshot_url: Optional[str] = None
+    rejection_reason: Optional[str] = None
+    position: Optional[int] = None
     check_in_status: str = "PENDING"  # PENDING, CHECKED_IN
     registered_at: datetime = Field(default_factory=get_utc_now)
     created_at: datetime = Field(default_factory=get_utc_now)

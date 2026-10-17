@@ -197,8 +197,27 @@ async def list_tournaments(
             norm_status = raw_stat
 
         is_solo_game = bool(game_obj and (not game_obj.get("is_team_game", True) or game_obj.get("slug") == "chess"))
-        calc_min_size = 1 if is_solo_game else max(1, int(t.get("min_team_size") or 1))
-        calc_max_size = 1 if is_solo_game else max(calc_min_size, int(t.get("max_team_size") or 5))
+        raw_min = t.get("min_team_size") or t.get("required_team_size")
+        game_min = game_obj.get("min_team_size") if game_obj else None
+        if is_solo_game:
+            calc_min_size = 1
+        elif raw_min and int(raw_min) > 0:
+            calc_min_size = int(raw_min)
+        elif game_min and int(game_min) > 0:
+            calc_min_size = int(game_min)
+        else:
+            calc_min_size = 1
+
+        raw_max = t.get("max_team_size")
+        game_max = game_obj.get("max_team_size") if game_obj else None
+        if is_solo_game:
+            calc_max_size = 1
+        elif raw_max and int(raw_max) >= calc_min_size:
+            calc_max_size = int(raw_max)
+        elif game_max and int(game_max) >= calc_min_size:
+            calc_max_size = int(game_max)
+        else:
+            calc_max_size = max(calc_min_size, 5)
 
         response.append(
             TournamentResponse(
@@ -446,9 +465,26 @@ async def get_tournament_by_slug(slug: str, db: AsyncIOMotorDatabase = Depends(g
     # Auto-derive min/max team size for solo titles (e.g. Chess) and handle legacy/missing values safely
     is_solo_game = bool(game_obj and (not game_obj.get("is_team_game", True) or game_obj.get("slug") == "chess"))
     raw_min = t.get("min_team_size") or t.get("required_team_size")
-    min_team_size = 1 if is_solo_game else max(1, int(raw_min) if raw_min else 1)
+    game_min = game_obj.get("min_team_size") if game_obj else None
+    if is_solo_game:
+        min_team_size = 1
+    elif raw_min and int(raw_min) > 0:
+        min_team_size = int(raw_min)
+    elif game_min and int(game_min) > 0:
+        min_team_size = int(game_min)
+    else:
+        min_team_size = 1
+
     raw_max = t.get("max_team_size")
-    max_team_size = 1 if is_solo_game else max(min_team_size, int(raw_max) if raw_max else 5)
+    game_max = game_obj.get("max_team_size") if game_obj else None
+    if is_solo_game:
+        max_team_size = 1
+    elif raw_max and int(raw_max) >= min_team_size:
+        max_team_size = int(raw_max)
+    elif game_max and int(game_max) >= min_team_size:
+        max_team_size = int(game_max)
+    else:
+        max_team_size = max(min_team_size, 5)
 
     # 1. Bracket rounds: if empty, auto-assemble from matches
     if not bracket:
@@ -834,10 +870,26 @@ async def register_team_for_tournament(
 
     # 5b. Roster bounds check
     tourn_min = tourn.get("min_team_size") or tourn.get("required_team_size")
-    min_size = int(tourn_min) if tourn_min is not None else 1
+    game_min = game_obj.get("min_team_size") if game_obj else None
+    if is_solo_game:
+        min_size = 1
+    elif tourn_min and int(tourn_min) > 0:
+        min_size = int(tourn_min)
+    elif game_min and int(game_min) > 0:
+        min_size = int(game_min)
+    else:
+        min_size = 1
 
     tourn_max = tourn.get("max_team_size")
-    max_size = int(tourn_max) if tourn_max is not None else max(min_size, 5)
+    game_max = game_obj.get("max_team_size") if game_obj else None
+    if is_solo_game:
+        max_size = 1
+    elif tourn_max and int(tourn_max) >= min_size:
+        max_size = int(tourn_max)
+    elif game_max and int(game_max) >= min_size:
+        max_size = int(game_max)
+    else:
+        max_size = max(min_size, 5)
 
     members = team.get("members", [])
     members_count = len(members)
@@ -981,7 +1033,14 @@ async def get_registration_status(
             })
 
     if not reg:
-        return TournamentRegistrationStatusResponse(is_registered=False, registration=None, team=None, position=None)
+        return TournamentRegistrationStatusResponse(
+            is_registered=False,
+            status=None,
+            payment_status=None,
+            registration=None,
+            team=None,
+            position=None,
+        )
 
     reg_dict = dict(reg)
     reg_dict["id"] = str(reg_dict.get("_id", reg_dict.get("id")))
@@ -990,6 +1049,20 @@ async def get_registration_status(
         reg_dict["created_at"] = reg_dict["created_at"].isoformat()
     if reg_dict.get("registered_at") and hasattr(reg_dict["registered_at"], "isoformat"):
         reg_dict["registered_at"] = reg_dict["registered_at"].isoformat()
+
+    # Look up payment record for screenshot_url / rejection_reason / utr / fee_paid if missing
+    p_id = reg_dict.get("payment_id")
+    if p_id:
+        p_doc = await db.game_payments.find_one({"$or": [{"_id": p_id}, {"id": p_id}]})
+        if p_doc:
+            if not reg_dict.get("screenshot_url") and p_doc.get("screenshot_url"):
+                reg_dict["screenshot_url"] = p_doc.get("screenshot_url")
+            if not reg_dict.get("rejection_reason") and p_doc.get("rejection_reason"):
+                reg_dict["rejection_reason"] = p_doc.get("rejection_reason")
+            if not reg_dict.get("utr") and p_doc.get("utr"):
+                reg_dict["utr"] = p_doc.get("utr")
+            if "fee_paid" not in reg_dict and p_doc.get("amount_inr") is not None:
+                reg_dict["fee_paid"] = p_doc.get("amount_inr")
 
     # Calculate position if confirmed
     position = None
@@ -1089,6 +1162,8 @@ async def get_registration_status(
 
     return TournamentRegistrationStatusResponse(
         is_registered=True,
+        status=reg_dict.get("status", "CONFIRMED" if reg_dict.get("payment_status") in ["PAID", "FREE"] else "PENDING"),
+        payment_status=reg_dict.get("payment_status"),
         registration=reg_dict,
         team=team_payload,
         position=position,
@@ -1188,6 +1263,46 @@ async def register_tournament_direct_upi(
             raise HTTPException(
                 status_code=400,
                 detail="Your team is registered for a different competitive title than this tournament",
+            )
+
+        # Roster bounds check
+        tourn_min = tourn.get("min_team_size") or tourn.get("required_team_size")
+        game_min = game_obj.get("min_team_size") if game_obj else None
+        if is_solo_game:
+            min_size = 1
+        elif tourn_min and int(tourn_min) > 0:
+            min_size = int(tourn_min)
+        elif game_min and int(game_min) > 0:
+            min_size = int(game_min)
+        else:
+            min_size = 1
+
+        tourn_max = tourn.get("max_team_size")
+        game_max = game_obj.get("max_team_size") if game_obj else None
+        if is_solo_game:
+            max_size = 1
+        elif tourn_max and int(tourn_max) >= min_size:
+            max_size = int(tourn_max)
+        elif game_max and int(game_max) >= min_size:
+            max_size = int(game_max)
+        else:
+            max_size = max(min_size, 5)
+
+        members = team.get("members", [])
+        members_count = len(members)
+        cap_id = team.get("captain_id")
+        if cap_id and not any((m.get("user_id") if isinstance(m, dict) else getattr(m, "user_id", None)) == cap_id for m in members):
+            members_count += 1
+
+        if members_count < min_size:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Your team has {members_count} member(s), but this tournament requires a minimum of {min_size} players. Please recruit {min_size - members_count} more player(s) before registering.",
+            )
+        if members_count > max_size:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Your team has {members_count} member(s), but this tournament allows a maximum of {max_size} players.",
             )
 
         existing_reg = await db.tournament_registrations.find_one({
@@ -1427,6 +1542,7 @@ async def submit_tournament_upi_utr(
             payment_status="PENDING_VERIFICATION",
             payment_id=payment.id if hasattr(payment, "id") else str(payment.get("_id")),
             utr=clean_utr,
+            screenshot_url=payload.screenshot_url,
             order_id=f"upi_tourn_{uuid.uuid4().hex[:10]}",
             check_in_status="PENDING",
         )
@@ -1436,6 +1552,7 @@ async def submit_tournament_upi_utr(
         reg_id = str(reg.get("_id", reg.get("id")))
         update_doc = {
             "utr": clean_utr,
+            "screenshot_url": payload.screenshot_url,
             "payment_status": "PENDING_VERIFICATION",
             "payment_id": payment.id if hasattr(payment, "id") else str(payment.get("_id")),
         }
@@ -1558,6 +1675,7 @@ async def get_team_journey_endpoint(
 
 
 @router.get("/{id}/community")
+@router.get("/{id}/community-link")
 async def get_tournament_community_link(
     id: str,
     current_user: User = Depends(get_current_user),
@@ -1577,13 +1695,26 @@ async def get_tournament_community_link(
 
     platform = tourn.get("community_platform") or "WHATSAPP"
     link = tourn.get("community_link") or tourn.get("whatsapp_group_url")
+    instructions = tourn.get("participant_instructions") or tourn.get("instructions") or "Custom Lobby Room ID, Password, Bracket calls, Coin toss, and real-time referee communications will be broadcasted exclusively in this channel."
 
     if not link:
-        return {"community_platform": platform, "community_link": None}
+        return {
+            "community_platform": platform,
+            "community_link": None,
+            "whatsapp_group_url": None,
+            "instructions": instructions,
+            "tournament_title": tourn.get("title", "Tournament"),
+        }
 
     # Admins and organizers can always view
     if current_user.role in ["SUPER_ADMIN", "ORGANIZER"]:
-        return {"community_platform": platform, "community_link": link}
+        return {
+            "community_platform": platform,
+            "community_link": link,
+            "whatsapp_group_url": link,
+            "instructions": instructions,
+            "tournament_title": tourn.get("title", "Tournament"),
+        }
 
     # Check tournament assignment for scoped admins
     assign_check = await db.tournament_admin_assignments.find_one({
@@ -1591,7 +1722,13 @@ async def get_tournament_community_link(
         "tournament_id": {"$in": [tid, tslug]},
     })
     if assign_check:
-        return {"community_platform": platform, "community_link": link}
+        return {
+            "community_platform": platform,
+            "community_link": link,
+            "whatsapp_group_url": link,
+            "instructions": instructions,
+            "tournament_title": tourn.get("title", "Tournament"),
+        }
 
     # Check if current user is a confirmed participant (solo or team member)
     valid_user_ids = [str(current_user.id)]
@@ -1625,6 +1762,54 @@ async def get_tournament_community_link(
             detail="Community link is restricted to confirmed participants of this tournament.",
         )
 
-    return {"community_platform": platform, "community_link": link}
+    # Gating rule: Strictly hide community / WhatsApp link from participants while registration remains open.
+    # Registration is officially closed if:
+    # 1. Admin/organizer marked status as closed/ongoing/live/completed
+    tourn_status = str(tourn.get("status", "")).upper()
+    is_status_closed = tourn_status in ["REGISTRATION_CLOSED", "CLOSED", "ONGOING", "LIVE", "COMPLETED"]
+
+    # 2. Registration deadline has passed
+    is_deadline_passed = False
+    reg_deadline = tourn.get("registration_deadline")
+    if reg_deadline:
+        reg_deadline_dt = None
+        if isinstance(reg_deadline, str):
+            try:
+                reg_deadline_dt = datetime.fromisoformat(reg_deadline.replace("Z", "+00:00"))
+            except Exception:
+                reg_deadline_dt = None
+        elif isinstance(reg_deadline, datetime):
+            reg_deadline_dt = reg_deadline
+
+        if reg_deadline_dt:
+            if reg_deadline_dt.tzinfo is None:
+                reg_deadline_dt = reg_deadline_dt.replace(tzinfo=timezone.utc)
+            now_utc = datetime.now(timezone.utc)
+            is_deadline_passed = (now_utc >= reg_deadline_dt)
+
+    # 3. Maximum participant capacity (slot limit) has been reached
+    max_teams_val = int(tourn.get("max_teams", 16))
+    confirmed_count = await db.tournament_registrations.count_documents({
+        "tournament_id": {"$in": [tid, tslug]},
+        "payment_status": {"$in": ["PAID", "FREE"]},
+        "status": {"$nin": ["CANCELLED", "REFUNDED"]},
+    })
+    is_capacity_full = (confirmed_count >= max_teams_val)
+
+    is_registration_closed = is_status_closed or is_deadline_passed or is_capacity_full
+
+    if not is_registration_closed:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Tournament registration is currently open. The official WhatsApp group link will unlock automatically once registration officially closes.",
+        )
+
+    return {
+        "community_platform": platform,
+        "community_link": link,
+        "whatsapp_group_url": link,
+        "instructions": instructions,
+        "tournament_title": tourn.get("title", "Tournament"),
+    }
 
 

@@ -56,6 +56,7 @@ class UserSyncRequest(BaseModel):
     avatar_url: Optional[str] = None
     avatar_source: Optional[str] = None
     google_avatar_url: Optional[str] = None
+    equipped_crest_id: Optional[str] = None
     has_chosen_username: Optional[bool] = None
 
 @router.get("/check-username")
@@ -149,7 +150,7 @@ async def sync_clerk_user(
     if user_by_clerk and user_by_email and str(user_by_clerk["_id"]) != str(user_by_email["_id"]):
         # Merge duplicate accounts: preserve custom uploaded avatar and profile data
         merge_updates = {}
-        for k in ["avatar_url", "avatar_source", "google_avatar_url", "display_name", "username", "username_lower", "has_chosen_username", "riot_id", "steam_id", "preferences", "privacy_settings"]:
+        for k in ["avatar_url", "avatar_source", "google_avatar_url", "equipped_crest_id", "display_name", "username", "username_lower", "has_chosen_username", "riot_id", "steam_id", "preferences", "privacy_settings"]:
             val = user_by_clerk.get(k)
             if val is not None and not user_by_email.get(k):
                 merge_updates[k] = val
@@ -455,6 +456,7 @@ class UserProfileUpdateRequest(BaseModel):
     avatar_url: Optional[str] = None
     avatar_source: Optional[str] = None
     google_avatar_url: Optional[str] = None
+    equipped_crest_id: Optional[str] = None
     preferences: Optional[dict] = None
     privacy_settings: Optional[dict] = None
 
@@ -525,6 +527,19 @@ async def update_user_profile(
     if payload.google_avatar_url is not None:
         update_data["google_avatar_url"] = payload.google_avatar_url.strip()
         current_user.google_avatar_url = update_data["google_avatar_url"]
+    if payload.equipped_crest_id is not None:
+        clean_crest_id = payload.equipped_crest_id.strip() if payload.equipped_crest_id else None
+        update_data["equipped_crest_id"] = clean_crest_id
+        current_user.equipped_crest_id = clean_crest_id
+    elif payload.avatar_source == "CREST" and payload.avatar_url:
+        matched_crest = await db.crests.find_one({"image_url": payload.avatar_url})
+        if matched_crest:
+            cid = str(matched_crest.get("id") or matched_crest["_id"])
+            update_data["equipped_crest_id"] = cid
+            current_user.equipped_crest_id = cid
+    elif payload.avatar_source in ["GOOGLE", "UPLOADED", "DEFAULT"]:
+        update_data["equipped_crest_id"] = None
+        current_user.equipped_crest_id = None
     if payload.preferences is not None:
         update_data["preferences"] = payload.preferences
         current_user.preferences = payload.preferences

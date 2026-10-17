@@ -18,6 +18,9 @@ def serialize_upi_account(d: dict) -> dict:
     item["id"] = doc_id
     if "_id" in item:
         item["_id"] = str(item["_id"])
+    qr = item.get("qr_url") or item.get("qr_code_url")
+    item["qr_url"] = qr
+    item["qr_code_url"] = qr
     created_at = item.get("created_at")
     if created_at is not None:
         if hasattr(created_at, "isoformat"):
@@ -118,6 +121,7 @@ async def upload_standalone_qr_base64(
         "filename": filename,
     }
 
+@router.put("/{id}", response_model=UpiAccountResponse)
 @router.patch("/{id}", response_model=UpiAccountResponse)
 async def update_upi_account(
     id: str,
@@ -129,7 +133,33 @@ async def update_upi_account(
     if not acc:
         raise HTTPException(status_code=404, detail="UPI account not found")
 
-    update_dict = {k: v for k, v in payload.model_dump(exclude_unset=True).items() if v is not None}
+    update_dict = {}
+    if payload.upi_id is not None:
+        clean_upi = payload.upi_id.strip()
+        if not clean_upi or "@" not in clean_upi or len(clean_upi) < 3:
+            raise HTTPException(status_code=400, detail="Invalid UPI VPA handle. Must contain '@' and be at least 3 characters.")
+        update_dict["upi_id"] = clean_upi
+
+    if payload.payee_name is not None:
+        clean_name = payload.payee_name.strip()
+        if not clean_name:
+            raise HTTPException(status_code=400, detail="Payee name cannot be empty.")
+        update_dict["payee_name"] = clean_name
+
+    if payload.display_name is not None:
+        update_dict["display_name"] = payload.display_name.strip() or None
+
+    target_qr = payload.qr_url if payload.qr_url is not None else payload.qr_code_url
+    if target_qr is not None:
+        update_dict["qr_url"] = target_qr.strip() or None
+        update_dict["qr_code_url"] = target_qr.strip() or None
+
+    if payload.status is not None:
+        clean_status = payload.status.strip().upper()
+        if clean_status not in ["ACTIVE", "INACTIVE"]:
+            raise HTTPException(status_code=400, detail="Status must be either ACTIVE or INACTIVE.")
+        update_dict["status"] = clean_status
+
     if update_dict:
         await db.upi_accounts.update_one({"_id": acc["_id"]}, {"$set": update_dict})
 
