@@ -559,8 +559,9 @@ async def update_user_profile(
 
         target_mongo_id = target_user_doc["_id"]
 
-        update_res = await db.users.update_one(
-            {"_id": target_mongo_id},
+        # Synchronize all matching document records in MongoDB
+        update_res = await db.users.update_many(
+            {"$or": query_clauses},
             {"$set": update_data}
         )
         if update_res.matched_count == 0:
