@@ -54,6 +54,8 @@ class UserSyncRequest(BaseModel):
     username: str
     display_name: Optional[str] = None
     avatar_url: Optional[str] = None
+    avatar_source: Optional[str] = None
+    google_avatar_url: Optional[str] = None
     has_chosen_username: Optional[bool] = None
 
 @router.get("/check-username")
@@ -147,7 +149,7 @@ async def sync_clerk_user(
     if user_by_clerk and user_by_email and str(user_by_clerk["_id"]) != str(user_by_email["_id"]):
         # Merge duplicate accounts: preserve custom uploaded avatar and profile data
         merge_updates = {}
-        for k in ["avatar_url", "display_name", "username", "username_lower", "has_chosen_username", "riot_id", "steam_id", "preferences", "privacy_settings"]:
+        for k in ["avatar_url", "avatar_source", "google_avatar_url", "display_name", "username", "username_lower", "has_chosen_username", "riot_id", "steam_id", "preferences", "privacy_settings"]:
             val = user_by_clerk.get(k)
             if val is not None and not user_by_email.get(k):
                 merge_updates[k] = val
@@ -169,14 +171,35 @@ async def sync_clerk_user(
             "email": clean_email,
             "updated_at": now,
         }
+        # Record incoming Google avatar if available
+        incoming_google_avatar = payload.google_avatar_url or (
+            payload.avatar_url if payload.avatar_url and not str(payload.avatar_url).startswith("/api/v1/media/") and not str(payload.avatar_url).startswith("/assets/crests/") else None
+        )
+        if incoming_google_avatar:
+            update_fields["google_avatar_url"] = incoming_google_avatar.strip()
+
         # Only populate display_name if not already present in the user's database record
         if not user_doc.get("display_name") and payload.display_name:
             update_fields["display_name"] = payload.display_name.strip()
-        # Only populate avatar_url if not already present or if incoming is an explicitly uploaded media path
-        if not user_doc.get("avatar_url") and payload.avatar_url:
-            update_fields["avatar_url"] = payload.avatar_url.strip()
+
+        # Avatar assignment & preservation rules:
+        # Rule 1: If user already has an avatar_url, NEVER overwrite it with an incoming Google profile picture.
+        # Rule 2: If user does not have an avatar_url, assign a random gaming avatar from active crests collection.
+        # Rule 3: If an explicit avatar_source is passed (e.g. from profile update or user explicitly choosing GOOGLE / CREST / UPLOADED), respect it.
+        # Rule 4: If payload has an uploaded media path (/api/v1/media/), respect it as UPLOADED.
+        if not user_doc.get("avatar_url"):
+            from app.services.avatar_service import get_random_default_avatar
+            chosen_avatar, avatar_source = await get_random_default_avatar(db)
+            update_fields["avatar_url"] = chosen_avatar
+            update_fields["avatar_source"] = avatar_source
+        elif payload.avatar_source:
+            update_fields["avatar_source"] = payload.avatar_source.strip().upper()
+            if payload.avatar_url:
+                update_fields["avatar_url"] = payload.avatar_url.strip()
         elif payload.avatar_url and str(payload.avatar_url).startswith("/api/v1/media/"):
             update_fields["avatar_url"] = payload.avatar_url.strip()
+            update_fields["avatar_source"] = "UPLOADED"
+
         # Enforce authoritative role
         if is_super_admin:
             update_fields["role"] = "SUPER_ADMIN"
@@ -265,6 +288,12 @@ async def sync_clerk_user(
 
     initial_role = "SUPER_ADMIN" if is_super_admin else ("ORGANIZER" if token_role in ["ORGANIZER", "TOURNAMENT_ADMIN"] else "PLAYER")
 
+    from app.services.avatar_service import get_random_default_avatar
+    chosen_avatar, avatar_source = await get_random_default_avatar(db)
+    google_pic = payload.google_avatar_url or (
+        payload.avatar_url if payload.avatar_url and not str(payload.avatar_url).startswith("/api/v1/media/") and not str(payload.avatar_url).startswith("/assets/crests/") else None
+    )
+
     # Application fields set ONLY upon initial insertion
     set_on_insert_fields = {
         "role": initial_role,
@@ -273,7 +302,9 @@ async def sync_clerk_user(
         "has_chosen_username": has_chosen,
         "needs_username": not has_chosen,
         "display_name": (payload.display_name or "").strip() or clean_username,
-        "avatar_url": payload.avatar_url,
+        "avatar_url": chosen_avatar,
+        "avatar_source": avatar_source,
+        "google_avatar_url": google_pic,
         "riot_id": None,
         "steam_id": None,
         "inr_balance_paise": 0,
@@ -289,6 +320,8 @@ async def sync_clerk_user(
         "email": clean_email,
         "updated_at": now,
     }
+    if google_pic:
+        set_fields["google_avatar_url"] = google_pic
     if is_super_admin:
         set_fields["role"] = "SUPER_ADMIN"
 
@@ -420,6 +453,8 @@ class UserProfileUpdateRequest(BaseModel):
     riot_id: Optional[str] = None
     steam_id: Optional[str] = None
     avatar_url: Optional[str] = None
+    avatar_source: Optional[str] = None
+    google_avatar_url: Optional[str] = None
     preferences: Optional[dict] = None
     privacy_settings: Optional[dict] = None
 
@@ -484,6 +519,12 @@ async def update_user_profile(
     if payload.avatar_url is not None:
         update_data["avatar_url"] = payload.avatar_url.strip()
         current_user.avatar_url = update_data["avatar_url"]
+    if payload.avatar_source is not None:
+        update_data["avatar_source"] = payload.avatar_source.strip().upper()
+        current_user.avatar_source = update_data["avatar_source"]
+    if payload.google_avatar_url is not None:
+        update_data["google_avatar_url"] = payload.google_avatar_url.strip()
+        current_user.google_avatar_url = update_data["google_avatar_url"]
     if payload.preferences is not None:
         update_data["preferences"] = payload.preferences
         current_user.preferences = payload.preferences
@@ -692,16 +733,27 @@ async def delete_user_account(
                     "$set": {
                         "status": "DISBANDED",
                         "is_disbanded": True,
+                        "is_ineligible": True,
+                        "is_deleted_account": True,
                         "disbanded_at": datetime.now(timezone.utc),
                         "disbanded_by": current_user.username or "deleted_user",
                     }
                 },
             )
 
-    # 3c. Delete user notifications
+    # 3c. Clean up custom leaderboard entries for deleted user
+    await db.custom_leaderboard_entries.delete_many({
+        "$or": [
+            {"captain_id": {"$in": user_ids_to_clean}},
+            {"user_id": {"$in": user_ids_to_clean}},
+            {"entity_id": {"$in": user_ids_to_clean}},
+        ]
+    })
+
+    # 3d. Delete user notifications
     await db.notifications.delete_many({"user_id": {"$in": user_ids_to_clean}})
 
-    # 3d. Invalidate user sessions
+    # 3e. Invalidate user sessions
     await db.user_sessions.delete_many({
         "$or": [
             {"user_id": {"$in": user_ids_to_clean}},

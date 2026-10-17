@@ -10,11 +10,13 @@ def get_time_range_start(time_range: Optional[str]) -> Optional[datetime]:
     tr = time_range.lower().strip()
     now = datetime.now(timezone.utc)
     if tr in ["week", "7d", "weekly"]:
-        return now - timedelta(days=7)
+        days_since_monday = now.weekday()
+        return (now - timedelta(days=days_since_monday)).replace(hour=0, minute=0, second=0, microsecond=0)
     elif tr in ["month", "30d", "monthly"]:
         return now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     elif tr in ["season", "quarter", "90d"]:
-        return now - timedelta(days=90)
+        quarter_start_month = ((now.month - 1) // 3) * 3 + 1
+        return now.replace(month=quarter_start_month, day=1, hour=0, minute=0, second=0, microsecond=0)
     return None
 
 def record_in_time_range(doc: dict, start_dt: Optional[datetime], date_keys: List[str]) -> bool:
@@ -42,6 +44,46 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 from app.api.deps import get_db, require_super_admin, require_organizer
 from app.models.user import User
 from app.schemas import LeaderboardEntryResponse
+
+async def get_super_admin_identifiers(db: AsyncIOMotorDatabase) -> set:
+    """
+    Fetches all identifying attributes of users with an authoritative role of SUPER_ADMIN
+    or hardcoded super admin emails.
+    Returns a set of lowercase strings (IDs, UUIDs, Clerk IDs, emails, usernames)
+    used to strictly purge Super Admin accounts from all leaderboard calculations,
+    rankings, podiums, search results, and statistics.
+    """
+    from app.core.config import settings
+    admin_emails = {"pk.4081988@gmail.com", "admin@ametheus.gg"}
+    if getattr(settings, "SUPER_ADMIN_EMAIL", None):
+        admin_emails.add(settings.SUPER_ADMIN_EMAIL.lower())
+
+    admin_users = await db.users.find({
+        "$or": [
+            {"role": {"$in": ["SUPER_ADMIN", "super_admin", "ADMIN", "admin", "SUPERADMIN", "superadmin", "ROOT", "root"]}},
+            {"email": {"$in": list(admin_emails)}},
+        ]
+    }).to_list(1000)
+
+    admin_ids = set()
+    for e in admin_emails:
+        admin_ids.add(e.lower())
+
+    for u in admin_users:
+        for key in ["_id", "id", "clerk_user_id"]:
+            val = u.get(key)
+            if val:
+                s = str(val).strip()
+                admin_ids.add(s)
+                admin_ids.add(s.lower())
+        if u.get("email"):
+            admin_ids.add(str(u["email"]).strip().lower())
+        if u.get("username"):
+            un = str(u["username"]).strip().lower()
+            admin_ids.add(un)
+            admin_ids.add(f"@{un}")
+
+    return admin_ids
 
 router = APIRouter()
 
@@ -191,6 +233,7 @@ async def get_leaderboard_stats(
     """Retrieve platform overview statistics for leaderboard header (calculated dynamically from real DB data)."""
     doc = await db.platform_settings.find_one({"_id": "leaderboard_stats"}) or {}
     start_dt = get_time_range_start(time_range)
+    admin_ids = await get_super_admin_identifiers(db)
 
     # Real counts from database:
     active_tournaments = await db.tournaments.find(
@@ -243,23 +286,80 @@ async def get_leaderboard_stats(
                     elif isinstance(p, str):
                         contender_user_ids.add(p)
 
+        # Strictly exclude Super Admin accounts from contender calculations
+        contender_user_ids = {uid for uid in contender_user_ids if uid not in admin_ids and uid.lower() not in admin_ids}
         real_contenders = len(contender_user_ids)
 
-    real_squads = await db.teams.count_documents({
+    # Real squads: active, non-disbanded squads with a valid, non-admin captain in db.users
+    all_teams_cursor = db.teams.find({
         "is_dummy": {"$ne": True},
         "is_disbanded": {"$ne": True},
         "status": {"$ne": "DISBANDED"},
+        "is_ineligible": {"$ne": True},
+        "is_deleted_account": {"$ne": True},
     })
+    all_teams_for_count = await all_teams_cursor.to_list(2000)
 
-    # Real total awarded prizes from completed payouts
+    eligible_teams = []
+    for t in all_teams_for_count:
+        cap_id = t.get("captain_id")
+        if not cap_id or str(cap_id).lower() in admin_ids or str(cap_id) in admin_ids:
+            continue
+        captain = await db.users.find_one({
+            "$or": [{"_id": cap_id}, {"id": cap_id}, {"clerk_user_id": str(cap_id)}],
+            "is_deleted": {"$ne": True},
+        })
+        if not captain:
+            continue
+        cap_role = str(captain.get("role", "")).upper()
+        cap_email = str(captain.get("email", "")).lower()
+        cap_uid = str(captain.get("_id", captain.get("id", ""))).lower()
+        cap_un = str(captain.get("username", "")).lower()
+        if (
+            cap_role in ["SUPER_ADMIN", "ADMIN", "ROOT"]
+            or cap_email in admin_ids
+            or cap_uid in admin_ids
+            or cap_un in admin_ids
+        ):
+            continue
+        eligible_teams.append(t)
+
+    real_squads = len(eligible_teams)
+
+    # Real total awarded prizes from completed payouts (strictly excluding Super Admin payouts)
     paid_payouts = await db.payouts.find({"status": "PAID", "is_dummy": {"$ne": True}}).to_list(500)
+    paid_payouts = [p for p in paid_payouts if str(p.get("user_id", "")).lower() not in admin_ids]
     if start_dt:
         paid_payouts = [p for p in paid_payouts if record_in_time_range(p, start_dt, ["paid_at", "created_at", "updated_at"])]
     total_prizes = sum(int(p.get("amount_paise", 0)) // 100 for p in paid_payouts)
 
-    teams_count = await db.teams.count_documents({"is_dummy": {"$ne": True}})
-    custom_count = await db.custom_leaderboard_entries.count_documents({"is_dummy": {"$ne": True}})
-    ranked_players_count = teams_count + custom_count
+    custom_docs_for_count = await db.custom_leaderboard_entries.find({
+        "is_dummy": {"$ne": True},
+        "is_disbanded": {"$ne": True},
+        "status": {"$ne": "DISBANDED"},
+    }).to_list(1000)
+    eligible_custom = []
+    for c in custom_docs_for_count:
+        cap_id = c.get("captain_id") or c.get("user_id")
+        if cap_id and (str(cap_id).lower() in admin_ids or str(cap_id) in admin_ids):
+            continue
+        captain = await db.users.find_one({
+            "$or": [{"_id": cap_id}, {"id": cap_id}, {"clerk_user_id": str(cap_id)}],
+            "is_deleted": {"$ne": True},
+        }) if cap_id else None
+        if cap_id and not captain:
+            continue
+        if captain:
+            cap_role = str(captain.get("role", "")).upper()
+            cap_email = str(captain.get("email", "")).lower()
+            if cap_role in ["SUPER_ADMIN", "ADMIN", "ROOT"] or cap_email in admin_ids:
+                continue
+        name_clean = str(c.get("name", "")).strip().lower()
+        if name_clean in admin_ids or name_clean in ["adhjahdj", "fbjbjfha"]:
+            continue
+        eligible_custom.append(c)
+
+    ranked_players_count = real_squads + len(eligible_custom)
 
     all_completed_matches = await db.matches.find({"status": "COMPLETED", "is_dummy": {"$ne": True}}).to_list(1000)
     if start_dt:
@@ -277,7 +377,7 @@ async def get_leaderboard_stats(
 
     active_streaks_count = 0
     try:
-        sample_teams = await db.teams.find({"is_dummy": {"$ne": True}}, {"_id": 1, "id": 1}).to_list(200)
+        sample_teams = eligible_teams[:200]
         for t in sample_teams:
             t_ids = [str(t.get("_id", t.get("id")))]
             if "id" in t and str(t["id"]) not in t_ids:
@@ -298,11 +398,11 @@ async def get_leaderboard_stats(
     except Exception:
         active_streaks_count = 0
 
-    total_awarded_str = doc.get("total_awarded_prizes") or prize_paid_out_str
+    total_awarded_str = prize_paid_out_str
     active_contenders_str = str(real_contenders)
-    verified_squads_str = doc.get("verified_squads") or str(real_squads)
-    top_team_earnings_str = doc.get("top_team_earnings") or "₹0"
-    top_team_name_str = doc.get("top_team_name") or ""
+    verified_squads_str = str(real_squads)
+    top_team_earnings_str = f"${max((int(t.get('earnings', 0)) for t in eligible_teams), default=0):,.0f}"
+    top_team_name_str = eligible_teams[0].get("name", "") if eligible_teams else ""
 
     return LeaderboardStatsSchema(
         total_awarded_prizes=total_awarded_str,
@@ -357,6 +457,15 @@ async def create_leaderboard_entry(
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """Admin endpoint to add a contender or team directly onto the leaderboard."""
+    admin_ids = await get_super_admin_identifiers(db)
+    cap_clean = (payload.captain or "").replace("@", "").strip().lower()
+    name_clean = payload.name.strip().lower()
+    if cap_clean in admin_ids or f"@{cap_clean}" in admin_ids or name_clean in admin_ids:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Super Admin accounts cannot be added to competitive leaderboards.",
+        )
+
     entry_id = f"custom_lb_{uuid.uuid4().hex[:8]}"
     doc = {
         "_id": entry_id,
@@ -580,6 +689,7 @@ async def get_leaderboard(
     """
     entries: List[dict] = []
     start_dt = get_time_range_start(time_range)
+    admin_ids = await get_super_admin_identifiers(db)
 
     # Check category definition
     cat_doc = None
@@ -625,10 +735,18 @@ async def get_leaderboard(
     min_matches = cat_doc.get("min_matches", 0) if cat_doc else 0
 
     try:
-        cursor = db.teams.find({"is_dummy": {"$ne": True}})
-        db_teams = await cursor.to_list(length=100)
+        cursor = db.teams.find({
+            "is_dummy": {"$ne": True},
+            "is_ineligible": {"$ne": True},
+            "is_deleted_account": {"$ne": True},
+        })
+        db_teams = await cursor.to_list(length=200)
 
         for idx, team in enumerate(db_teams):
+            cap_id = team.get("captain_id")
+            if not cap_id or str(cap_id).lower() in admin_ids or str(cap_id) in admin_ids:
+                continue
+
             team_id = str(team.get("_id", team.get("id")))
             team_ids = [team_id]
             if "id" in team and str(team["id"]) not in team_ids:
@@ -642,15 +760,34 @@ async def get_leaderboard(
             game_name = game_obj["name"] if game_obj else None
             game_cat = game_obj.get("category", "pc") if game_obj else "pc"
 
-            cap_id = team.get("captain_id")
             captain = await db.users.find_one({
                 "$or": [
                     {"_id": cap_id},
                     {"id": cap_id},
                     {"clerk_user_id": str(cap_id)},
-                ]
-            }) if cap_id else None
-            captain_user = "@captain"
+                ],
+                "is_deleted": {"$ne": True},
+            })
+
+            # If captain is in db.users, strictly exclude any Super Admin / Admin accounts
+            if captain:
+                cap_role = str(captain.get("role", "")).upper()
+                cap_email = str(captain.get("email", "")).lower()
+                cap_uid = str(captain.get("_id", captain.get("id", ""))).lower()
+                cap_clerk = str(captain.get("clerk_user_id", "")).lower()
+                cap_username = str(captain.get("username", "")).strip().lower()
+
+                if (
+                    cap_role in ["SUPER_ADMIN", "ADMIN", "ROOT"]
+                    or cap_email in admin_ids
+                    or cap_uid in admin_ids
+                    or cap_clerk in admin_ids
+                    or cap_username in admin_ids
+                    or f"@{cap_username}" in admin_ids
+                ):
+                    continue
+
+            captain_user = team.get("captain", "@captain")
             captain_username = ""
             captain_display_name = ""
             if captain:
@@ -663,6 +800,9 @@ async def get_leaderboard(
                     captain_display_name = (captain.get("display_name") or "").strip()
                     if captain_username:
                         captain_user = f"@{captain_username}"
+
+            if (captain_username and captain_username.lower() in admin_ids) or (captain_user and captain_user.lower() in admin_ids):
+                continue
 
             raw_team_name = (team.get("name") or "Team").strip()
             team_tag = (team.get("tag") or "TM").strip().upper()
@@ -730,17 +870,18 @@ async def get_leaderboard(
                 payout_docs = [p for p in payout_docs if record_in_time_range(p, start_dt, ["paid_at", "created_at", "updated_at"])]
             real_earnings = sum(int(p.get("amount_paise", 0)) // 100 for p in payout_docs)
 
-            # Query real spending from approved payments
+            # Query real spending from approved payments (excluding wallet topups)
             spending_docs = await db.game_payments.find({
                 "$or": [
                     {"user_id": cap_id},
                     {"team_id": {"$in": team_ids}},
                 ],
                 "status": "APPROVED",
+                "payment_type": {"$ne": "WALLET_TOPUP"},
                 "is_dummy": {"$ne": True},
             }).to_list(length=100)
             if start_dt:
-                spending_docs = [p for p in spending_docs if record_in_time_range(p, start_dt, ["created_at", "updated_at"])]
+                spending_docs = [p for p in spending_docs if record_in_time_range(p, start_dt, ["verified_at", "created_at", "updated_at"])]
             real_spending = sum(int(p.get("amount_inr", 0)) or (int(p.get("amount_paise", 0)) // 100) for p in spending_docs)
 
             # Compute top 3 finishes from payouts and tournament finals
@@ -754,8 +895,12 @@ async def get_leaderboard(
             )
             top3 = max(payout_top3, finals_top3)
 
-            is_disbanded = bool(team.get("is_disbanded", False) or team.get("status") == "DISBANDED")
+            is_disbanded = bool(team.get("is_disbanded", False) or team.get("status") == "DISBANDED" or team.get("is_ineligible") or team.get("is_deleted_account"))
             team_status = "DISBANDED" if is_disbanded else "ACTIVE"
+
+            # Disbanded teams with zero matches and zero earnings MUST NEVER be displayed on competitive leaderboards
+            if is_disbanded and matches_played == 0 and real_earnings == 0:
+                continue
 
             cap_avatar = captain.get("avatar_url") if captain else None
             team_logo = team.get("logo_url")
@@ -794,20 +939,50 @@ async def get_leaderboard(
             })
 
         # Also query custom leaderboard entries (admin-created entries only)
-        custom_cursor = db.custom_leaderboard_entries.find({"is_dummy": {"$ne": True}})
+        custom_cursor = db.custom_leaderboard_entries.find({
+            "is_dummy": {"$ne": True},
+            "is_disbanded": {"$ne": True},
+            "status": {"$ne": "DISBANDED"},
+        })
         custom_docs = await custom_cursor.to_list(length=100)
         for c in custom_docs:
             c_id = str(c.get("_id", c.get("id")))
             cap_id = c.get("captain_id") or c.get("user_id")
+            if cap_id and (str(cap_id).lower() in admin_ids or str(cap_id) in admin_ids):
+                continue
+
             captain = await db.users.find_one({
                 "$or": [
                     {"_id": cap_id},
                     {"id": cap_id},
                     {"clerk_user_id": str(cap_id)},
-                ]
+                ],
+                "is_deleted": {"$ne": True},
             }) if cap_id else None
+
+            # If a captain was specified but user was deleted, skip
+            if cap_id and not captain:
+                continue
+
+            # Strictly exclude super admin accounts
+            if captain:
+                cap_role = str(captain.get("role", "")).upper()
+                cap_email = str(captain.get("email", "")).lower()
+                cap_uid = str(captain.get("_id", captain.get("id", ""))).lower()
+                cap_un = str(captain.get("username", "")).lower()
+                if (
+                    cap_role in ["SUPER_ADMIN", "ADMIN", "ROOT"]
+                    or cap_email in admin_ids
+                    or cap_uid in admin_ids
+                    or cap_un in admin_ids
+                ):
+                    continue
+
             raw_c_name = (c.get("name") or "Team").strip()
             c_tag = (c.get("tag") or "TM").strip().upper()
+            if raw_c_name.lower() in admin_ids or raw_c_name.lower() in ["adhjahdj", "fbjbjfha"]:
+                continue
+
             c_username = ""
             c_display_name = ""
             captain_user = c.get("captain", "@captain")
@@ -816,6 +991,9 @@ async def get_leaderboard(
                 c_display_name = (captain.get("display_name") or "").strip()
                 if c_username:
                     captain_user = f"@{c_username}"
+
+            if (c_username and c_username.lower() in admin_ids) or (captain_user and captain_user.lower() in admin_ids) or (raw_c_name and raw_c_name.lower() in admin_ids):
+                continue
 
             is_c_fragment = (
                 len(raw_c_name) <= 3
@@ -878,6 +1056,29 @@ async def get_leaderboard(
         print(f"[Leaderboard DB Query Notice]: {e}")
 
     # NOTE: No mock/fallback data augmentation. Empty DB = empty leaderboard.
+
+    # Final strict server-side guarantee: Exclude any entry affiliated with a Super Admin or deleted account
+    clean_entries = []
+    for e in entries:
+        e_id = str(e.get("id", "")).strip().lower()
+        e_cap = str(e.get("captain", "")).strip().lower().replace("@", "")
+        e_user = str(e.get("username", "")).strip().lower()
+        e_disp = str(e.get("display_name", "")).strip().lower()
+        e_name = str(e.get("name", "")).strip().lower()
+        if (
+            e_id in admin_ids
+            or e_cap in admin_ids
+            or f"@{e_cap}" in admin_ids
+            or (e_user and (e_user in admin_ids or f"@{e_user}" in admin_ids))
+            or (e_disp and e_disp in admin_ids)
+            or (e_name and e_name in admin_ids)
+            or e_disp in ["super_admin", "superadmin", "admin"]
+            or e_name in ["super_admin", "superadmin", "admin", "adhjahdj", "fbjbjfha"]
+            or (e.get("status") == "DISBANDED" and int(e.get("matches_played", 0)) == 0 and int(e.get("earnings", 0)) == 0)
+        ):
+            continue
+        clean_entries.append(e)
+    entries = clean_entries
 
     # Apply search filter if specified
     if search:

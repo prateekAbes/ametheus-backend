@@ -11,6 +11,8 @@ class User(BaseModel):
     username_lower: Optional[str] = None
     display_name: Optional[str] = None
     avatar_url: Optional[str] = None
+    avatar_source: Optional[str] = None  # "DEFAULT", "CREST", "GOOGLE", "UPLOADED"
+    google_avatar_url: Optional[str] = None
     role: str = "PLAYER"
     riot_id: Optional[str] = None
     steam_id: Optional[str] = None

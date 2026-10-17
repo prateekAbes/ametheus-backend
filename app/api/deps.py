@@ -91,6 +91,10 @@ async def get_current_user(
             clean_user_lower = candidate.lower()
             has_chosen = False
 
+        from app.services.avatar_service import get_random_default_avatar
+        chosen_avatar, avatar_source = await get_random_default_avatar(db)
+        google_pic = payload.get("picture")
+
         set_on_insert_fields = {
             "role": initial_role,
             "username": clean_user,
@@ -98,7 +102,9 @@ async def get_current_user(
             "has_chosen_username": has_chosen,
             "needs_username": not has_chosen,
             "display_name": payload.get("name") or clean_user or "Contender",
-            "avatar_url": payload.get("picture"),
+            "avatar_url": chosen_avatar,
+            "avatar_source": avatar_source,
+            "google_avatar_url": google_pic,
             "riot_id": None,
             "steam_id": None,
             "inr_balance_paise": 0,
@@ -112,6 +118,8 @@ async def get_current_user(
             "email": user_email,
             "updated_at": now,
         }
+        if google_pic:
+            set_fields["google_avatar_url"] = google_pic
         if is_super_admin:
             set_fields["role"] = "SUPER_ADMIN"
 

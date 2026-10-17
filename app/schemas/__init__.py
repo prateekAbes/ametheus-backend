@@ -10,6 +10,8 @@ class UserBase(BaseModel):
     display_name: Optional[str] = None
     clerk_user_id: Optional[str] = None
     avatar_url: Optional[str] = None
+    avatar_source: Optional[str] = None
+    google_avatar_url: Optional[str] = None
     riot_id: Optional[str] = None
     steam_id: Optional[str] = None
     preferences: Optional[Dict[str, Any]] = None
