@@ -18,6 +18,10 @@ class LeaderboardStatsSchema(BaseModel):
     verified_squads: str = "0"
     top_team_earnings: str = "₹0"
     top_team_name: str = ""
+    ranked_players: int = 0
+    matches_played: int = 0
+    prize_paid_out: str = "₹0"
+    active_streaks: int = 0
 
 class LeaderboardStatsUpdate(BaseModel):
     total_awarded_prizes: Optional[str] = None
@@ -216,7 +220,36 @@ async def get_leaderboard_stats(db: AsyncIOMotorDatabase = Depends(get_db)):
     paid_payouts = await db.payouts.find({"status": "PAID", "is_dummy": {"$ne": True}}).to_list(500)
     total_prizes = sum(int(p.get("amount_paise", 0)) // 100 for p in paid_payouts)
 
-    total_awarded_str = doc.get("total_awarded_prizes") or (f"₹{total_prizes:,}" if total_prizes > 0 else "₹0")
+    teams_count = await db.teams.count_documents({"is_dummy": {"$ne": True}})
+    custom_count = await db.custom_leaderboard_entries.count_documents({"is_dummy": {"$ne": True}})
+    ranked_players_count = teams_count + custom_count
+
+    total_matches_count = await db.matches.count_documents({"status": "COMPLETED", "is_dummy": {"$ne": True}})
+    prize_paid_out_str = f"₹{total_prizes:,}" if total_prizes > 0 else "₹0"
+
+    active_streaks_count = 0
+    try:
+        sample_teams = await db.teams.find({"is_dummy": {"$ne": True}}, {"_id": 1, "id": 1}).to_list(200)
+        for t in sample_teams:
+            t_ids = [str(t.get("_id", t.get("id")))]
+            if "id" in t and str(t["id"]) not in t_ids:
+                t_ids.append(str(t["id"]))
+            last_match = await db.matches.find_one(
+                {
+                    "$and": [
+                        {"$or": [{"team_a_id": {"$in": t_ids}}, {"team_b_id": {"$in": t_ids}}]},
+                        {"status": "COMPLETED"},
+                        {"is_dummy": {"$ne": True}},
+                    ]
+                },
+                sort=[("completed_at", -1), ("updated_at", -1)]
+            )
+            if last_match and last_match.get("winner_team_id") in t_ids:
+                active_streaks_count += 1
+    except Exception:
+        active_streaks_count = 0
+
+    total_awarded_str = doc.get("total_awarded_prizes") or prize_paid_out_str
     active_contenders_str = str(real_contenders)
     verified_squads_str = doc.get("verified_squads") or str(real_squads)
     top_team_earnings_str = doc.get("top_team_earnings") or "₹0"
@@ -228,6 +261,10 @@ async def get_leaderboard_stats(db: AsyncIOMotorDatabase = Depends(get_db)):
         verified_squads=verified_squads_str,
         top_team_earnings=top_team_earnings_str,
         top_team_name=top_team_name_str,
+        ranked_players=ranked_players_count,
+        matches_played=total_matches_count,
+        prize_paid_out=prize_paid_out_str,
+        active_streaks=active_streaks_count,
     )
 
 @router.patch("/stats", response_model=LeaderboardStatsSchema)
@@ -505,6 +542,12 @@ async def get_leaderboard(
             sort_metric = "win_rate"
         elif norm_m in ["wins", "most_match_wins"]:
             sort_metric = "wins"
+        elif norm_m in ["streak", "win_streak", "active_streaks"]:
+            sort_metric = "streak"
+        elif norm_m in ["matches", "matches_played"]:
+            sort_metric = "matches_played"
+        elif norm_m in ["top3", "top_3", "top_three"]:
+            sort_metric = "top3"
         elif norm_m in ["spending", "highest_spending"]:
             sort_metric = "spending"
         elif norm_m in ["earnings", "top_earnings"]:
@@ -513,7 +556,7 @@ async def get_leaderboard(
             sort_metric = "rating"
     elif cat_doc:
         sort_metric = cat_doc.get("sort_metric", "rating")
-    elif category in ["win_rate", "wins", "spending", "earnings"]:
+    elif category in ["win_rate", "wins", "streak", "matches", "top3", "spending", "earnings"]:
         sort_metric = category
 
     target_game = "all"
@@ -593,9 +636,15 @@ async def get_leaderboard(
             # Real win rate — 0.0 if no matches played
             win_rate = round((wins / matches_played * 100), 1) if matches_played > 0 else 0.0
 
-            # Compute recent form from last 5 completed matches
-            recent = sorted(completed_matches, key=lambda m: str(m.get("completed_at", m.get("updated_at", ""))), reverse=True)[:5]
-            form = ["W" if m.get("winner_team_id") in team_ids else "L" for m in recent]
+            # Compute recent form and active streak
+            recent = sorted(completed_matches, key=lambda m: str(m.get("completed_at", m.get("updated_at", ""))), reverse=True)
+            form = ["W" if m.get("winner_team_id") in team_ids else "L" for m in recent[:5]]
+            streak = 0
+            for m in recent:
+                if m.get("winner_team_id") in team_ids:
+                    streak += 1
+                else:
+                    break
 
             # Query real earnings from verified payouts
             payout_docs = await db.payouts.find({
@@ -618,6 +667,17 @@ async def get_leaderboard(
                 "is_dummy": {"$ne": True},
             }).to_list(length=100)
             real_spending = sum(int(p.get("amount_inr", 0)) or (int(p.get("amount_paise", 0)) // 100) for p in spending_docs)
+
+            # Compute top 3 finishes from payouts and tournament finals
+            payout_top3 = sum(
+                1 for p in payout_docs
+                if any(rk in str(p.get("rank_or_placement", "")).lower() for rk in ["1st", "2nd", "3rd", "first", "second", "third", "winner", "runner", "top 3", "top3"])
+            )
+            finals_top3 = sum(
+                1 for m in completed_matches
+                if m.get("winner_team_id") in team_ids and any(stg in str(m.get("stage", "") or m.get("round_name", "")).lower() for stg in ["final", "semi", "grand"])
+            )
+            top3 = max(payout_top3, finals_top3)
 
             is_disbanded = bool(team.get("is_disbanded", False) or team.get("status") == "DISBANDED")
             team_status = "DISBANDED" if is_disbanded else "ACTIVE"
@@ -645,6 +705,8 @@ async def get_leaderboard(
                 "rating": max(1000, 1500 + (wins * 25) - (losses * 10)),
                 "earnings": real_earnings,
                 "spending": real_spending,
+                "streak": streak,
+                "top3": top3,
                 "form": form if form else ["-"],
                 "is_verified": True,
                 "category": game_cat,
@@ -672,6 +734,16 @@ async def get_leaderboard(
                 if c_name.lower().startswith("player_") or c_name.lower().startswith("user_"):
                     c_name = captain["username"]
             c_avatar = c.get("avatar_url") or (captain.get("avatar_url") if captain else None) or c.get("logo_url")
+
+            c_streak = int(c.get("streak", 0))
+            if not c_streak and c.get("form"):
+                for f in c.get("form", []):
+                    if f == "W":
+                        c_streak += 1
+                    else:
+                        break
+            c_top3 = int(c.get("top3", 0))
+
             entries.append({
                 "rank": 1,
                 "id": c_id,
@@ -690,6 +762,8 @@ async def get_leaderboard(
                 "rating": int(c.get("rating", 1500)),
                 "earnings": int(c.get("earnings", 0)),
                 "spending": int(c.get("spending", 0)),
+                "streak": c_streak,
+                "top3": c_top3,
                 "form": c.get("form", []),
                 "is_verified": bool(c.get("is_verified", False)),
                 "category": c.get("category", "pc"),
@@ -746,7 +820,7 @@ async def get_leaderboard(
     except Exception as e:
         print(f"[Leaderboard Disqualification Filter Notice]: {e}")
 
-    # Dynamic metric sorting with deterministic tie-breaking (rating -> wins -> win_rate)
+    # Dynamic metric sorting with deterministic tie-breaking
     if sort_metric == "win_rate":
         entries.sort(key=lambda x: (x["win_rate"], x["wins"], x["rating"]), reverse=True)
     elif sort_metric == "spending":
@@ -755,8 +829,12 @@ async def get_leaderboard(
         entries.sort(key=lambda x: (x["earnings"], x["wins"], x["rating"]), reverse=True)
     elif sort_metric == "wins":
         entries.sort(key=lambda x: (x["wins"], x["win_rate"], x["rating"]), reverse=True)
+    elif sort_metric == "streak":
+        entries.sort(key=lambda x: (x.get("streak", 0), x["wins"], x["rating"]), reverse=True)
     elif sort_metric == "matches_played":
         entries.sort(key=lambda x: (x["matches_played"], x["wins"], x["rating"]), reverse=True)
+    elif sort_metric == "top3":
+        entries.sort(key=lambda x: (x.get("top3", 0), x["wins"], x["rating"]), reverse=True)
     else:  # rating
         entries.sort(key=lambda x: (x["rating"], x["wins"], x["win_rate"]), reverse=True)
 

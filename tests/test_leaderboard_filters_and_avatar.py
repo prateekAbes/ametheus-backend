@@ -91,7 +91,7 @@ async def test_leaderboard_metrics_and_platform_filters(client, mock_db):
     })
 
     # Completed matches:
-    # Team Ace: 4 matches, 3 wins (75% win rate)
+    # Team Ace: 4 matches, 3 wins then 1 loss (loss is latest -> streak 0)
     for i in range(3):
         await mock_db.matches.insert_one({
             "_id": f"m_ace_win_{i}",
@@ -99,6 +99,7 @@ async def test_leaderboard_metrics_and_platform_filters(client, mock_db):
             "team_b_id": "t3",
             "winner_team_id": "t1",
             "status": "COMPLETED",
+            "completed_at": f"2026-10-10T10:0{i}:00Z",
         })
     await mock_db.matches.insert_one({
         "_id": "m_ace_loss",
@@ -106,9 +107,10 @@ async def test_leaderboard_metrics_and_platform_filters(client, mock_db):
         "team_b_id": "other",
         "winner_team_id": "other",
         "status": "COMPLETED",
+        "completed_at": "2026-10-12T10:00:00Z",
     })
 
-    # Team Blaze: 2 matches, 2 wins (100% win rate)
+    # Team Blaze: 2 matches, 2 wins (100% win rate, streak 2)
     for i in range(2):
         await mock_db.matches.insert_one({
             "_id": f"m_blz_win_{i}",
@@ -116,6 +118,7 @@ async def test_leaderboard_metrics_and_platform_filters(client, mock_db):
             "team_b_id": "other",
             "winner_team_id": "t2",
             "status": "COMPLETED",
+            "completed_at": f"2026-10-11T10:0{i}:00Z",
         })
 
     # Payments: Team Cypher spent ₹3,000, Team Ace spent ₹1,000
@@ -179,3 +182,25 @@ async def test_leaderboard_metrics_and_platform_filters(client, mock_db):
     data_pc_wins = res_pc_wins.json()
     assert len(data_pc_wins) == 2
     assert data_pc_wins[0]["name"] == "Team Ace"
+
+    # 7. Win Streak Metric: Blaze won 2 in a row -> streak 2
+    res_streak = await client.get("/api/v1/leaderboard?metric=streak")
+    assert res_streak.status_code == 200
+    data_streak = res_streak.json()
+    assert data_streak[0]["name"] == "Team Blaze"
+    assert data_streak[0]["streak"] == 2
+
+    # 8. Matches Played Metric: Ace played 4 matches
+    res_matches = await client.get("/api/v1/leaderboard?metric=matches")
+    assert res_matches.status_code == 200
+    data_matches = res_matches.json()
+    assert data_matches[0]["name"] == "Team Ace"
+    assert data_matches[0]["matches_played"] == 4
+
+    # 9. Platform Stats Endpoint
+    res_stats = await client.get("/api/v1/leaderboard/stats")
+    assert res_stats.status_code == 200
+    stats = res_stats.json()
+    assert stats["ranked_players"] == 3
+    assert stats["matches_played"] == 6
+    assert stats["active_streaks"] == 1
