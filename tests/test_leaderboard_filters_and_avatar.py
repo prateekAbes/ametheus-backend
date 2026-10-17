@@ -204,3 +204,27 @@ async def test_leaderboard_metrics_and_platform_filters(client, mock_db):
     assert stats["ranked_players"] == 3
     assert stats["matches_played"] == 6
     assert stats["active_streaks"] == 1
+
+    # 10. Time Range Filtering on Leaderboard and Stats
+    res_week = await client.get("/api/v1/leaderboard?time_range=week")
+    assert res_week.status_code == 200
+    res_week_stats = await client.get("/api/v1/leaderboard/stats?time_range=week")
+    assert res_week_stats.status_code == 200
+
+    # 11. Fragment name resolution (ADX tag should resolve to captain's username/display_name)
+    await mock_db.teams.insert_one({
+        "_id": "t_adx",
+        "id": "t_adx",
+        "name": "ADX",
+        "tag": "ADX",
+        "game_id": "game_val",
+        "captain_id": "u1",
+        "status": "ACTIVE",
+    })
+    res_frag = await client.get("/api/v1/leaderboard?metric=overall")
+    assert res_frag.status_code == 200
+    adx_entry = next((e for e in res_frag.json() if e["id"] == "u1" or e.get("tag") == "ADX"), None)
+    assert adx_entry is not None
+    # Must resolve to the captain's username "ace_player", NEVER the fragment "ADX"
+    assert adx_entry["name"] == "ace_player"
+    assert adx_entry["username"] == "ace_player"

@@ -1,8 +1,41 @@
 import re
 import uuid
 from typing import List, Optional
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pydantic import BaseModel, Field
+
+def get_time_range_start(time_range: Optional[str]) -> Optional[datetime]:
+    if not time_range or time_range.lower().strip() in ["all_time", "all", ""]:
+        return None
+    tr = time_range.lower().strip()
+    now = datetime.now(timezone.utc)
+    if tr in ["week", "7d", "weekly"]:
+        return now - timedelta(days=7)
+    elif tr in ["month", "30d", "monthly"]:
+        return now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    elif tr in ["season", "quarter", "90d"]:
+        return now - timedelta(days=90)
+    return None
+
+def record_in_time_range(doc: dict, start_dt: Optional[datetime], date_keys: List[str]) -> bool:
+    if not start_dt:
+        return True
+    val = None
+    for k in date_keys:
+        if doc.get(k):
+            val = doc[k]
+            break
+    if not val:
+        return True
+    try:
+        if isinstance(val, datetime):
+            doc_dt = val if val.tzinfo else val.replace(tzinfo=timezone.utc)
+        else:
+            doc_dt = datetime.fromisoformat(str(val).replace("Z", "+00:00"))
+        return doc_dt >= start_dt
+    except Exception:
+        return True
+
 from fastapi import APIRouter, Depends, Query, HTTPException, status
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
@@ -151,13 +184,15 @@ async def ensure_default_categories(db: AsyncIOMotorDatabase):
         )
 
 @router.get("/stats", response_model=LeaderboardStatsSchema)
-async def get_leaderboard_stats(db: AsyncIOMotorDatabase = Depends(get_db)):
+async def get_leaderboard_stats(
+    time_range: Optional[str] = Query(None),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
     """Retrieve platform overview statistics for leaderboard header (calculated dynamically from real DB data)."""
     doc = await db.platform_settings.find_one({"_id": "leaderboard_stats"}) or {}
+    start_dt = get_time_range_start(time_range)
 
     # Real counts from database:
-    # An active contender is an athlete actively participating in open or active tournaments
-    # (either as an individual solo contender or through confirmed team lineups).
     active_tournaments = await db.tournaments.find(
         {
             "status": {"$in": ["REGISTRATION_OPEN", "CHECK_IN_OPEN", "LIVE", "ACTIVE", "IN_PROGRESS"]},
@@ -218,14 +253,27 @@ async def get_leaderboard_stats(db: AsyncIOMotorDatabase = Depends(get_db)):
 
     # Real total awarded prizes from completed payouts
     paid_payouts = await db.payouts.find({"status": "PAID", "is_dummy": {"$ne": True}}).to_list(500)
+    if start_dt:
+        paid_payouts = [p for p in paid_payouts if record_in_time_range(p, start_dt, ["paid_at", "created_at", "updated_at"])]
     total_prizes = sum(int(p.get("amount_paise", 0)) // 100 for p in paid_payouts)
 
     teams_count = await db.teams.count_documents({"is_dummy": {"$ne": True}})
     custom_count = await db.custom_leaderboard_entries.count_documents({"is_dummy": {"$ne": True}})
     ranked_players_count = teams_count + custom_count
 
-    total_matches_count = await db.matches.count_documents({"status": "COMPLETED", "is_dummy": {"$ne": True}})
-    prize_paid_out_str = f"₹{total_prizes:,}" if total_prizes > 0 else "₹0"
+    all_completed_matches = await db.matches.find({"status": "COMPLETED", "is_dummy": {"$ne": True}}).to_list(1000)
+    if start_dt:
+        filtered_matches = [m for m in all_completed_matches if record_in_time_range(m, start_dt, ["completed_at", "updated_at", "created_at"])]
+        total_matches_count = len(filtered_matches)
+    else:
+        total_matches_count = len(all_completed_matches)
+
+    if total_prizes >= 1_000_000:
+        prize_paid_out_str = f"${total_prizes / 1_000_000:.1f}M"
+    elif total_prizes >= 1_000:
+        prize_paid_out_str = f"${total_prizes / 1_000:.1f}K"
+    else:
+        prize_paid_out_str = f"${total_prizes:,.0f}"
 
     active_streaks_count = 0
     try:
@@ -245,7 +293,8 @@ async def get_leaderboard_stats(db: AsyncIOMotorDatabase = Depends(get_db)):
                 sort=[("completed_at", -1), ("updated_at", -1)]
             )
             if last_match and last_match.get("winner_team_id") in t_ids:
-                active_streaks_count += 1
+                if not start_dt or record_in_time_range(last_match, start_dt, ["completed_at", "updated_at", "created_at"]):
+                    active_streaks_count += 1
     except Exception:
         active_streaks_count = 0
 
@@ -520,6 +569,7 @@ async def get_leaderboard(
     metric: Optional[str] = Query(None),
     platform: Optional[str] = Query(None),
     search: Optional[str] = Query(None),
+    time_range: Optional[str] = Query(None),
     limit: Optional[int] = Query(None),
     skip: Optional[int] = Query(None),
     include_disqualified: Optional[bool] = Query(False),
@@ -529,6 +579,7 @@ async def get_leaderboard(
     Dynamically calculate leaderboard standings based on category metrics and game filters.
     """
     entries: List[dict] = []
+    start_dt = get_time_range_start(time_range)
 
     # Check category definition
     cat_doc = None
@@ -600,22 +651,40 @@ async def get_leaderboard(
                 ]
             }) if cap_id else None
             captain_user = "@captain"
+            captain_username = ""
+            captain_display_name = ""
             if captain:
                 cap_privacy = captain.get("privacy_settings") or {}
                 if cap_privacy.get("show_stats") is False:
                     captain_user = "@Anonymous Contender"
-                elif captain.get("username"):
-                    captain_user = f"@{captain['username']}"
+                    captain_username = "Anonymous Contender"
+                else:
+                    captain_username = (captain.get("username") or "").strip()
+                    captain_display_name = (captain.get("display_name") or "").strip()
+                    if captain_username:
+                        captain_user = f"@{captain_username}"
 
-            team_name = team.get("name", "Team")
-            if captain and captain.get("username"):
-                if (
-                    team_name.lower().startswith("player_")
-                    or team_name.lower().startswith("user_")
-                    or team.get("is_solo")
-                    or team_name == captain.get("email")
-                ):
-                    team_name = captain["username"]
+            raw_team_name = (team.get("name") or "Team").strip()
+            team_tag = (team.get("tag") or "TM").strip().upper()
+
+            is_fragment = (
+                len(raw_team_name) <= 3
+                or raw_team_name.upper() == team_tag
+                or raw_team_name.lower().startswith(("player_", "user_"))
+                or (captain and raw_team_name == captain.get("email"))
+                or bool(team.get("is_solo"))
+            )
+
+            if is_fragment and (captain_display_name or captain_username):
+                player_name = captain_display_name or captain_username
+            elif not is_fragment and raw_team_name:
+                player_name = raw_team_name
+            elif captain_display_name:
+                player_name = captain_display_name
+            elif captain_username:
+                player_name = captain_username
+            else:
+                player_name = raw_team_name or "Contender"
 
             # Query completed matches for this team across both team_a and team_b positions
             completed_cursor = db.matches.find({
@@ -629,6 +698,8 @@ async def get_leaderboard(
                 ]
             })
             completed_matches = await completed_cursor.to_list(length=100)
+            if start_dt:
+                completed_matches = [m for m in completed_matches if record_in_time_range(m, start_dt, ["completed_at", "updated_at", "created_at"])]
 
             matches_played = len(completed_matches)
             wins = sum(1 for m in completed_matches if m.get("winner_team_id") in team_ids)
@@ -655,6 +726,8 @@ async def get_leaderboard(
                 "status": "PAID",
                 "is_dummy": {"$ne": True},
             }).to_list(length=100)
+            if start_dt:
+                payout_docs = [p for p in payout_docs if record_in_time_range(p, start_dt, ["paid_at", "created_at", "updated_at"])]
             real_earnings = sum(int(p.get("amount_paise", 0)) // 100 for p in payout_docs)
 
             # Query real spending from approved payments
@@ -666,6 +739,8 @@ async def get_leaderboard(
                 "status": "APPROVED",
                 "is_dummy": {"$ne": True},
             }).to_list(length=100)
+            if start_dt:
+                spending_docs = [p for p in spending_docs if record_in_time_range(p, start_dt, ["created_at", "updated_at"])]
             real_spending = sum(int(p.get("amount_inr", 0)) or (int(p.get("amount_paise", 0)) // 100) for p in spending_docs)
 
             # Compute top 3 finishes from payouts and tournament finals
@@ -687,15 +762,19 @@ async def get_leaderboard(
             avatar_url = cap_avatar or team_logo or None
             logo_url = team_logo or cap_avatar or None
 
+            player_id = str(captain.get("_id", captain.get("id"))) if (is_fragment and captain) else team_id
+
             entries.append({
                 "rank": idx + 1,
-                "id": team_id,
-                "name": team_name,
-                "tag": team.get("tag", "TM"),
+                "id": player_id,
+                "name": player_name,
+                "tag": team_tag if team_tag else "TM",
                 "type": "team",
                 "game_slug": game_slug,
                 "game_name": game_name,
                 "captain": captain_user,
+                "username": captain_username if captain_username else None,
+                "display_name": captain_display_name if captain_display_name else None,
                 "logo_url": logo_url,
                 "avatar_url": avatar_url,
                 "win_rate": win_rate,
@@ -727,12 +806,35 @@ async def get_leaderboard(
                     {"clerk_user_id": str(cap_id)},
                 ]
             }) if cap_id else None
-            c_name = c.get("name", "Team")
+            raw_c_name = (c.get("name") or "Team").strip()
+            c_tag = (c.get("tag") or "TM").strip().upper()
+            c_username = ""
+            c_display_name = ""
             captain_user = c.get("captain", "@captain")
-            if captain and captain.get("username"):
-                captain_user = f"@{captain['username']}"
-                if c_name.lower().startswith("player_") or c_name.lower().startswith("user_"):
-                    c_name = captain["username"]
+            if captain:
+                c_username = (captain.get("username") or "").strip()
+                c_display_name = (captain.get("display_name") or "").strip()
+                if c_username:
+                    captain_user = f"@{c_username}"
+
+            is_c_fragment = (
+                len(raw_c_name) <= 3
+                or raw_c_name.upper() == c_tag
+                or raw_c_name.lower().startswith(("player_", "user_"))
+                or (captain and raw_c_name == captain.get("email"))
+            )
+
+            if is_c_fragment and (c_display_name or c_username):
+                resolved_c_name = c_display_name or c_username
+            elif not is_c_fragment and raw_c_name:
+                resolved_c_name = raw_c_name
+            elif c_display_name:
+                resolved_c_name = c_display_name
+            elif c_username:
+                resolved_c_name = c_username
+            else:
+                resolved_c_name = raw_c_name or "Contender"
+
             c_avatar = c.get("avatar_url") or (captain.get("avatar_url") if captain else None) or c.get("logo_url")
 
             c_streak = int(c.get("streak", 0))
@@ -747,12 +849,14 @@ async def get_leaderboard(
             entries.append({
                 "rank": 1,
                 "id": c_id,
-                "name": c_name,
-                "tag": c.get("tag", "TM"),
+                "name": resolved_c_name,
+                "tag": c_tag if c_tag else "TM",
                 "type": c.get("type", "team"),
                 "game_slug": c.get("game_slug"),
                 "game_name": c.get("game_name"),
                 "captain": captain_user,
+                "username": c_username if c_username else None,
+                "display_name": c_display_name if c_display_name else None,
                 "logo_url": c.get("logo_url") or c_avatar,
                 "avatar_url": c_avatar,
                 "win_rate": float(c.get("win_rate", 0.0)),
