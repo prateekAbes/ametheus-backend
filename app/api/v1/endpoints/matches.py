@@ -166,17 +166,43 @@ async def captain_check_in(
 
         # Check BR teams
         if not is_authorized and competing_teams:
-            matching_team = await db.teams.find_one({
-                "$and": [
-                    {"$or": [{"_id": {"$in": competing_teams}}, {"id": {"$in": competing_teams}}]},
-                    {"$or": [
-                        {"captain_id": current_user.id},
-                        {"members.user_id": current_user.id},
-                    ]}
-                ]
+            valid_user_ids = [str(current_user.id)]
+            if getattr(current_user, "clerk_user_id", None):
+                valid_user_ids.append(str(current_user.clerk_user_id))
+
+            for uid in valid_user_ids:
+                if uid in competing_teams:
+                    checked_in_team_id = uid
+                    is_authorized = True
+                    break
+
+            if not is_authorized:
+                matching_team = await db.teams.find_one({
+                    "$and": [
+                        {"$or": [{"_id": {"$in": competing_teams}}, {"id": {"$in": competing_teams}}]},
+                        {"$or": [
+                            {"captain_id": {"$in": valid_user_ids}},
+                            {"members.user_id": {"$in": valid_user_ids}},
+                        ]}
+                    ]
+                })
+                if matching_team:
+                    checked_in_team_id = str(matching_team.get("_id", matching_team.get("id")))
+                    is_authorized = True
+
+        # Check solo registrations
+        if not is_authorized:
+            valid_user_ids = [str(current_user.id)]
+            if getattr(current_user, "clerk_user_id", None):
+                valid_user_ids.append(str(current_user.clerk_user_id))
+            tid = str(match.get("tournament_id") or "")
+            reg_doc = await db.tournament_registrations.find_one({
+                "$or": [{"tournament_id": tid}, {"tournament_id": match.get("tournament_slug", tid)}],
+                "$or": [{"player_id": {"$in": valid_user_ids}}, {"user_id": {"$in": valid_user_ids}}],
+                "payment_status": {"$in": ["PAID", "FREE"]},
             })
-            if matching_team:
-                checked_in_team_id = str(matching_team.get("_id", matching_team.get("id")))
+            if reg_doc:
+                checked_in_team_id = str(reg_doc.get("team_id") or reg_doc.get("player_id") or current_user.id)
                 is_authorized = True
 
     if not is_authorized:

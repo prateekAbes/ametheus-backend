@@ -764,22 +764,70 @@ async def generate_tournament_bracket(
     format_fmt = (getattr(tournament, "format", None) or "").lower()
     raw_fmt = f"{type_fmt} {match_fmt} {format_fmt}"
 
-    if "double" in raw_fmt and "robin" in raw_fmt:
-        return await build_double_round_robin_schedule(tournament, db)
-    elif "double" in raw_fmt or "double_elimination" in raw_fmt:
-        return await build_double_elimination_bracket(tournament, db)
-    elif "consolation" in raw_fmt or "feed" in raw_fmt:
-        return await build_consolation_bracket(tournament, db)
-    elif "group" in raw_fmt or "knockout" in raw_fmt:
-        return await build_group_stage_knockout(tournament, db)
-    elif "single_round_robin" in raw_fmt or "round robin" in raw_fmt or "round_robin" in raw_fmt or "robin" in raw_fmt:
+    if "battle" in raw_fmt or "royale" in raw_fmt:
+        from app.services.battle_royale_engine import (
+            get_confirmed_registered_teams,
+            get_battle_royale_specs,
+            calculate_battle_royale_parameters,
+            distribute_teams_into_matches,
+        )
+        tourn_doc, teams_list = await get_confirmed_registered_teams(tournament.id, db)
+        game_slug_or_id = getattr(tournament, "game_id", "") or ""
+        game_doc = await db.games.find_one({"$or": [{"_id": game_slug_or_id}, {"id": game_slug_or_id}, {"slug": game_slug_or_id}]})
+        room_capacity, players_per_team = get_battle_royale_specs(
+            game_slug_or_name=game_slug_or_id,
+            tournament_doc=tourn_doc or tournament.model_dump(),
+            game_doc=game_doc,
+        )
+        calc = calculate_battle_royale_parameters(
+            actual_registered_teams=len(teams_list),
+            room_capacity=room_capacity,
+            players_per_team=players_per_team,
+        )
+        partitions = distribute_teams_into_matches(
+            teams=teams_list,
+            max_teams_per_match=calc["max_teams_per_match"],
+            required_matches=max(1, calc["required_matches"]),
+            balanced=True,
+        )
+        await db.matches.delete_many({
+            "$or": [{"tournament_id": tournament.id}, {"tournament_id": tournament.slug}]
+        })
+        bracket_tree = [{"round_number": 1, "round_name": "Round 1", "matches": []}]
+        for idx, chunk in enumerate(partitions):
+            match_num = idx + 1
+            m_id = secrets.token_hex(8)
+            team_ids = [t["id"] for t in chunk]
+            db_m = Match(
+                id=m_id,
+                tournament_id=tournament.id,
+                stage="Round 1",
+                stage_name="Round 1",
+                round_name="Round 1",
+                match_type="BATTLE_ROYALE",
+                round_number=1,
+                match_number=match_num,
+                format="Battle Royale",
+                series_format="BO1",
+                status="SCHEDULED",
+                room_capacity=calc["room_capacity"],
+                players_per_team=calc["players_per_team"],
+                max_teams=calc["max_teams_per_match"],
+                teams=chunk,
+                team_ids=team_ids,
+                server_region=tournament.server_region,
+            )
+            await db.matches.insert_one(db_m.to_mongo())
+            bracket_tree[0]["matches"].append({"id": m_id, "stage": "Round 1", "status": "SCHEDULED", "teams_count": len(chunk)})
+        await db.tournaments.update_one(
+            {"$or": [{"_id": tournament.id}, {"id": tournament.id}]},
+            {"$set": {"bracket_rounds": bracket_tree, "status": "LIVE"}}
+        )
+        return {"total_rounds": 1, "bracket": bracket_tree}
+    elif "robin" in raw_fmt:
         return await build_round_robin_schedule(tournament, db)
-    elif "swiss" in raw_fmt:
-        return await build_swiss_pairings(tournament, 1, db)
-    elif "ladder" in raw_fmt or "pyramid" in raw_fmt:
-        return await build_ladder_structure(tournament, db)
     else:
-        # Default: Single Elimination
+        # Default: Knockout (Single Elimination style competition)
         return await build_single_elimination_bracket(tournament, db)
 
 async def record_match_qualification(

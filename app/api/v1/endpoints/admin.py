@@ -3075,10 +3075,6 @@ async def generate_battle_royale_matches_admin(
         match_num = idx + 1
         m_id = generate_uuid()
         team_ids = [t["id"] for t in chunk]
-        team_a_id = chunk[0]["id"] if len(chunk) > 0 else None
-        team_a_name = chunk[0]["name"] if len(chunk) > 0 else "Lobby"
-        team_b_id = chunk[1]["id"] if len(chunk) > 1 else None
-        team_b_name = f"+{len(chunk) - 1} Teams" if len(chunk) > 1 else None
 
         match_doc = Match(
             id=m_id,
@@ -3097,10 +3093,10 @@ async def generate_battle_royale_matches_admin(
             max_teams=calc["max_teams_per_match"],
             teams=chunk,
             team_ids=team_ids,
-            team_a_id=team_a_id,
-            team_a_name=team_a_name,
-            team_b_id=team_b_id,
-            team_b_name=team_b_name,
+            team_a_id=None,
+            team_a_name=None,
+            team_b_id=None,
+            team_b_name=None,
             scheduled_time="TBD",
             server_region=tourn.get("server_region", "AWS Mumbai (ap-south-1)"),
         )
@@ -3897,14 +3893,13 @@ async def update_tournament_format_admin(
         raise HTTPException(status_code=404, detail="Tournament not found")
 
     fmt_clean = payload.format.strip()
-    valid_formats = ["Knockout", "Round Robin", "Combination", "Swiss System", "Ladder Tournament"]
-    match_fmt = None
-    for vf in valid_formats:
-        if vf.lower() == fmt_clean.lower():
-            match_fmt = vf
-            break
-    if not match_fmt:
-        match_fmt = fmt_clean
+    s = fmt_clean.lower()
+    if "battle" in s or "royale" in s:
+        match_fmt = "Battle Royale"
+    elif "robin" in s:
+        match_fmt = "Round Robin"
+    else:
+        match_fmt = "Knockout"
 
     await db.tournaments.update_one(
         {"_id": tourn["_id"]},
@@ -4213,27 +4208,44 @@ async def update_tournament_community(
     if not tourn:
         raise HTTPException(status_code=404, detail="Tournament not found")
 
+    upd_fields: Dict[str, Any] = {}
+    if payload.whatsapp_group_url is not None:
+        upd_fields["whatsapp_group_url"] = payload.whatsapp_group_url.strip() or None
+    if payload.discord_url is not None:
+        upd_fields["discord_url"] = payload.discord_url.strip() or None
+
     platform = payload.community_platform
     if platform and platform.upper() in ["DISCORD", "WHATSAPP"]:
         platform = platform.upper()
     else:
         platform = None
 
-    link = payload.community_link.strip() if payload.community_link else None
+    if payload.community_link is not None:
+        link = payload.community_link.strip() or None
+        upd_fields["community_link"] = link
+        if platform == "WHATSAPP" or "whatsapp" in (link or "").lower():
+            if "whatsapp_group_url" not in upd_fields:
+                upd_fields["whatsapp_group_url"] = link
+        elif platform == "DISCORD" or "discord" in (link or "").lower():
+            if "discord_url" not in upd_fields:
+                upd_fields["discord_url"] = link
+    if platform is not None:
+        upd_fields["community_platform"] = platform
 
-    await db.tournaments.update_one(
-        {"_id": tourn["_id"]},
-        {"$set": {
-            "community_platform": platform,
-            "community_link": link,
-        }}
-    )
+    if upd_fields:
+        await db.tournaments.update_one(
+            {"_id": tourn["_id"]},
+            {"$set": upd_fields}
+        )
 
+    updated_t = await db.tournaments.find_one({"_id": tourn["_id"]})
     return {
         "status": "success",
         "message": "Tournament community settings updated successfully.",
-        "community_platform": platform,
-        "community_link": link,
+        "community_platform": updated_t.get("community_platform"),
+        "community_link": updated_t.get("community_link"),
+        "whatsapp_group_url": updated_t.get("whatsapp_group_url"),
+        "discord_url": updated_t.get("discord_url"),
     }
 
 @router.patch("/matches/{id}/join-info")

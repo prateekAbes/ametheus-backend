@@ -248,6 +248,27 @@ async def get_confirmed_registered_teams(
                     "is_solo": False,
                 }
                 teams_list.append(entry)
+            else:
+                seen_ids.add(t_id_str)
+                t_name = reg.get("team_name", f"Squad {t_id_str}")
+                entry = {
+                    "id": t_id_str,
+                    "team_id": t_id_str,
+                    "name": t_name,
+                    "team_name": t_name,
+                    "tag": reg.get("team_tag", "SQ"),
+                    "team_tag": reg.get("team_tag", "SQ"),
+                    "captain": {
+                        "user_id": str(reg.get("captain_id", "")),
+                        "username": t_name,
+                        "game_id": "",
+                    },
+                    "captain_username": t_name,
+                    "members": [],
+                    "member_handles": [],
+                    "is_solo": False,
+                }
+                teams_list.append(entry)
 
         elif player_id:
             u_id_str = str(player_id)

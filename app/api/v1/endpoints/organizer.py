@@ -72,8 +72,8 @@ class TournamentCreatePayload(BaseModel):
     registration_open_date: Optional[str] = None
     announcement_text: Optional[str] = None
     rank_requirement: str = "Open to All Ranks"
-    format: str = "Single Elimination Bracket"
-    tournament_type: Optional[str] = "Single Elimination"
+    format: str = "Knockout"
+    tournament_type: Optional[str] = "Knockout"
     match_format: Optional[str] = "Best of 1"
     banner_url: Optional[str] = None
     hero_banner_url: Optional[str] = None
@@ -86,6 +86,7 @@ class TournamentCreatePayload(BaseModel):
     schedule: List[Dict[str, Any]] = []
     prizes: Optional[List[Dict[str, Any]]] = None
     whatsapp_group_url: Optional[str] = None
+    discord_url: Optional[str] = None
     community_link: Optional[str] = None
 
 class TournamentUpdatePayload(BaseModel):
@@ -119,6 +120,7 @@ class TournamentUpdatePayload(BaseModel):
     status: Optional[str] = None
     registration_status: Optional[str] = None
     whatsapp_group_url: Optional[str] = None
+    discord_url: Optional[str] = None
     community_link: Optional[str] = None
 
 def parse_iso_datetime(dt_str: str) -> datetime:
@@ -133,6 +135,24 @@ def slugify(text: str) -> str:
     s = re.sub(r"[^\w\s-]", "", s)
     s = re.sub(r"[\s_-]+", "-", s)
     return s
+
+def normalize_competition_format(fmt: Optional[str]) -> str:
+    if not fmt:
+        return "Knockout"
+    s = fmt.lower().strip()
+    if "battle" in s or "royale" in s:
+        return "Battle Royale"
+    elif "robin" in s:
+        return "Round Robin"
+    return "Knockout"
+
+def normalize_series_format(fmt: Optional[str]) -> str:
+    if not fmt:
+        return "BO1"
+    s = fmt.upper().strip()
+    if "3" in s:
+        return "BO3"
+    return "BO1"
 
 def serialize_tournament_response(t: dict, game_obj: Optional[dict], reg_count: int) -> TournamentResponse:
     tid = str(t.get("_id", t.get("id")))
@@ -154,6 +174,9 @@ def serialize_tournament_response(t: dict, game_obj: Optional[dict], reg_count: 
 
     prize_inr = t.get("prize_pool_inr", 0)
     fee_inr = t.get("entry_fee_inr", 0)
+
+    comp_fmt = normalize_competition_format(t.get("format") or t.get("tournament_type"))
+    series_fmt = normalize_series_format(t.get("series_format") or t.get("match_format"))
 
     return TournamentResponse(
         id=tid,
@@ -178,9 +201,10 @@ def serialize_tournament_response(t: dict, game_obj: Optional[dict], reg_count: 
         min_team_size=t.get("min_team_size", 1),
         max_team_size=t.get("max_team_size", 5),
         rank_requirement=t.get("rank_requirement", "Open to All Ranks"),
-        format=t.get("format", "Single Elimination Bracket"),
-        tournament_type=t.get("tournament_type", "Single Elimination"),
-        match_format=t.get("match_format", "Best of 1"),
+        format=comp_fmt,
+        tournament_type=comp_fmt,
+        match_format=comp_fmt,
+        series_format=series_fmt,
         banner_url=t.get("banner_url", ""),
         hero_banner_url=t.get("hero_banner_url"),
         banner_tablet_url=t.get("banner_tablet_url"),
@@ -194,6 +218,7 @@ def serialize_tournament_response(t: dict, game_obj: Optional[dict], reg_count: 
         bracket_rounds=bracket,
         registered_rosters=[],
         whatsapp_group_url=t.get("whatsapp_group_url"),
+        discord_url=t.get("discord_url"),
         community_link=t.get("community_link"),
         media_config=t.get("media_config", {}),
     )
@@ -269,9 +294,10 @@ async def create_tournament(
         min_team_size=min_size,
         max_team_size=max_size,
         rank_requirement=payload.rank_requirement,
-        format=payload.format,
-        tournament_type=payload.tournament_type or "Single Elimination",
-        match_format=payload.match_format or "Best of 1",
+        format=normalize_competition_format(payload.format),
+        tournament_type=normalize_competition_format(payload.tournament_type or payload.format),
+        match_format=normalize_competition_format(payload.format),
+        series_format=normalize_series_format(payload.match_format),
         banner_url=banner or "",
         hero_banner_url=payload.hero_banner_url,
         banner_tablet_url=banner_tablet,
@@ -284,6 +310,7 @@ async def create_tournament(
         prizes=prizes,
         bracket_rounds=[],
         whatsapp_group_url=payload.whatsapp_group_url,
+        discord_url=payload.discord_url,
         community_link=payload.community_link,
     )
     if payload.media_config is not None:
@@ -357,11 +384,23 @@ async def update_tournament(
     if payload.rank_requirement is not None:
         update_fields["rank_requirement"] = payload.rank_requirement
     if payload.format is not None:
-        update_fields["format"] = payload.format
-    if payload.tournament_type is not None:
-        update_fields["tournament_type"] = payload.tournament_type
+        comp_fmt = normalize_competition_format(payload.format)
+        update_fields["format"] = comp_fmt
+        update_fields["tournament_type"] = comp_fmt
+        update_fields["match_format"] = comp_fmt
+    elif payload.tournament_type is not None:
+        comp_fmt = normalize_competition_format(payload.tournament_type)
+        update_fields["format"] = comp_fmt
+        update_fields["tournament_type"] = comp_fmt
+        update_fields["match_format"] = comp_fmt
     if payload.match_format is not None:
-        update_fields["match_format"] = payload.match_format
+        update_fields["series_format"] = normalize_series_format(payload.match_format)
+    if payload.whatsapp_group_url is not None:
+        update_fields["whatsapp_group_url"] = payload.whatsapp_group_url.strip() or None
+    if payload.discord_url is not None:
+        update_fields["discord_url"] = payload.discord_url.strip() or None
+    if payload.community_link is not None:
+        update_fields["community_link"] = payload.community_link.strip() or None
     if payload.banner_url is not None:
         update_fields["banner_url"] = payload.banner_url
     if payload.hero_banner_url is not None:

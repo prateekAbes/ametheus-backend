@@ -259,10 +259,10 @@ async def list_tournaments(
                 min_team_size=calc_min_size,
                 max_team_size=calc_max_size,
                 rank_requirement=t.get("rank_requirement", "Open to All Ranks"),
-                format=t.get("format", "Single Elimination"),
-                tournament_type=t.get("tournament_type", "Single Elimination"),
-                match_format=t.get("match_format", "Single Elimination"),
-                series_format=t.get("series_format", "BO1"),
+                format="Battle Royale" if "battle" in str(t.get("format") or "").lower() or "royale" in str(t.get("format") or "").lower() else ("Round Robin" if "robin" in str(t.get("format") or "").lower() else "Knockout"),
+                tournament_type="Battle Royale" if "battle" in str(t.get("tournament_type") or t.get("format") or "").lower() or "royale" in str(t.get("tournament_type") or t.get("format") or "").lower() else ("Round Robin" if "robin" in str(t.get("tournament_type") or t.get("format") or "").lower() else "Knockout"),
+                match_format="Battle Royale" if "battle" in str(t.get("format") or "").lower() or "royale" in str(t.get("format") or "").lower() else ("Round Robin" if "robin" in str(t.get("format") or "").lower() else "Knockout"),
+                series_format="BO3" if "3" in str(t.get("series_format") or "") or "3" in str(t.get("match_format") or "") else "BO1",
                 stage_formats=safe_json_loads(t.get("stage_formats"), {}),
                 registration_deadline=t.get("registration_deadline").isoformat() if isinstance(t.get("registration_deadline"), datetime) else t.get("registration_deadline"),
                 check_in_window_minutes=t.get("check_in_window_minutes", 15),
@@ -279,6 +279,9 @@ async def list_tournaments(
                 bracket_rounds=bracket,
                 registered_rosters=[],
                 is_featured=bool(t.get("is_featured", False)),
+                whatsapp_group_url=None,
+                discord_url=None,
+                community_link=None,
                 media_config=t.get("media_config", {}),
             )
         )
@@ -626,10 +629,10 @@ async def get_tournament_by_slug(slug: str, db: AsyncIOMotorDatabase = Depends(g
         min_team_size=min_team_size,
         max_team_size=max_team_size,
         rank_requirement=t.get("rank_requirement", "Open to All Ranks"),
-        format=t.get("format", "Single Elimination"),
-        tournament_type=t.get("tournament_type", "Single Elimination"),
-        match_format=t.get("match_format", "Single Elimination"),
-        series_format=t.get("series_format", "BO1"),
+        format="Battle Royale" if "battle" in str(t.get("format") or "").lower() or "royale" in str(t.get("format") or "").lower() else ("Round Robin" if "robin" in str(t.get("format") or "").lower() else "Knockout"),
+        tournament_type="Battle Royale" if "battle" in str(t.get("tournament_type") or t.get("format") or "").lower() or "royale" in str(t.get("tournament_type") or t.get("format") or "").lower() else ("Round Robin" if "robin" in str(t.get("tournament_type") or t.get("format") or "").lower() else "Knockout"),
+        match_format="Battle Royale" if "battle" in str(t.get("format") or "").lower() or "royale" in str(t.get("format") or "").lower() else ("Round Robin" if "robin" in str(t.get("format") or "").lower() else "Knockout"),
+        series_format="BO3" if "3" in str(t.get("series_format") or "") or "3" in str(t.get("match_format") or "") else "BO1",
         stage_formats=safe_json_loads(t.get("stage_formats"), {}),
         registration_deadline=t.get("registration_deadline").isoformat() if isinstance(t.get("registration_deadline"), datetime) else t.get("registration_deadline"),
         check_in_window_minutes=t.get("check_in_window_minutes", 15),
@@ -646,6 +649,9 @@ async def get_tournament_by_slug(slug: str, db: AsyncIOMotorDatabase = Depends(g
         bracket_rounds=bracket,
         registered_rosters=registered_rosters,
         is_featured=bool(t.get("is_featured", False)),
+        whatsapp_group_url=None,
+        discord_url=None,
+        community_link=None,
         media_config=t.get("media_config", {}),
     )
 
@@ -1709,14 +1715,17 @@ async def get_tournament_community_link(
     tslug = tourn.get("slug", tid)
 
     platform = tourn.get("community_platform") or "WHATSAPP"
-    link = tourn.get("community_link") or tourn.get("whatsapp_group_url")
+    whatsapp_url = tourn.get("whatsapp_group_url") or (tourn.get("community_link") if platform == "WHATSAPP" else None)
+    discord_url = tourn.get("discord_url") or (tourn.get("community_link") if platform == "DISCORD" or "discord" in str(tourn.get("community_link") or "").lower() else None)
+    link = whatsapp_url or discord_url or tourn.get("community_link")
     instructions = tourn.get("participant_instructions") or tourn.get("instructions") or "Custom Lobby Room ID, Password, Bracket calls, Coin toss, and real-time referee communications will be broadcasted exclusively in this channel."
 
-    if not link:
+    if not whatsapp_url and not discord_url and not link:
         return {
             "community_platform": platform,
             "community_link": None,
             "whatsapp_group_url": None,
+            "discord_url": None,
             "instructions": instructions,
             "tournament_title": tourn.get("title", "Tournament"),
         }
@@ -1726,7 +1735,8 @@ async def get_tournament_community_link(
         return {
             "community_platform": platform,
             "community_link": link,
-            "whatsapp_group_url": link,
+            "whatsapp_group_url": whatsapp_url,
+            "discord_url": discord_url,
             "instructions": instructions,
             "tournament_title": tourn.get("title", "Tournament"),
         }
@@ -1740,7 +1750,8 @@ async def get_tournament_community_link(
         return {
             "community_platform": platform,
             "community_link": link,
-            "whatsapp_group_url": link,
+            "whatsapp_group_url": whatsapp_url,
+            "discord_url": discord_url,
             "instructions": instructions,
             "tournament_title": tourn.get("title", "Tournament"),
         }
@@ -1822,7 +1833,8 @@ async def get_tournament_community_link(
     return {
         "community_platform": platform,
         "community_link": link,
-        "whatsapp_group_url": link,
+        "whatsapp_group_url": whatsapp_url,
+        "discord_url": discord_url,
         "instructions": instructions,
         "tournament_title": tourn.get("title", "Tournament"),
     }

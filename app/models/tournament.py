@@ -110,10 +110,10 @@ class Tournament(BaseModel):
     room_capacity: Optional[int] = None  # Battle Royale room capacity (e.g. 100 players)
     players_per_team: Optional[int] = None  # Active players per team/squad (e.g. 4)
     rank_requirement: str = "Open to All Ranks"
-    format: str = "Single Elimination"
-    tournament_type: str = "Single Elimination"
-    match_format: str = "Single Elimination"  # SINGLE_ELIMINATION, DOUBLE_ELIMINATION, CONSOLATION, SINGLE_ROUND_ROBIN, DOUBLE_ROUND_ROBIN, SWISS, LADDER, GROUP_STAGE_KNOCKOUT
-    series_format: str = "BO1"  # Strictly "BO1" or "BO3" (BO5 removed)
+    format: str = "Knockout"
+    tournament_type: str = "Knockout"
+    match_format: str = "Knockout"
+    series_format: str = "BO1"  # Strictly "BO1" or "BO3"
     live_stream_url: Optional[str] = None  # Permanent 1-stream per tournament
     stages: List[TournamentStage] = Field(default_factory=list)
     current_stage_id: Optional[str] = None
@@ -137,6 +137,7 @@ class Tournament(BaseModel):
     community_platform: Optional[str] = None  # "DISCORD" | "WHATSAPP" | None
     community_link: Optional[str] = None      # invite link URL
     whatsapp_group_url: Optional[str] = None  # dedicated WhatsApp group invite URL
+    discord_url: Optional[str] = None         # dedicated Discord server invite URL
     created_at: datetime = Field(default_factory=get_utc_now)
     updated_at: datetime = Field(default_factory=get_utc_now)
 
@@ -189,28 +190,47 @@ class Tournament(BaseModel):
         else:
             d["status"] = raw_status
 
-        # Migrate legacy match_format / series_format - BO5 mapped strictly to BO3
-        raw_fmt = d.get("match_format") or d.get("format") or "Single Elimination"
-        if raw_fmt in ["Best of 1", "BO1"]:
+        # Competition format: Strictly Knockout, Round Robin, Battle Royale
+        raw_comp_fmt = str(d.get("format") or d.get("tournament_type") or d.get("match_format") or "Knockout").strip()
+        comp_fmt_lower = raw_comp_fmt.lower()
+        if "battle" in comp_fmt_lower or "royale" in comp_fmt_lower:
+            norm_comp_fmt = "Battle Royale"
+        elif "robin" in comp_fmt_lower:
+            norm_comp_fmt = "Round Robin"
+        else:
+            norm_comp_fmt = "Knockout"
+        d["format"] = norm_comp_fmt
+        d["tournament_type"] = norm_comp_fmt
+        d["match_format"] = norm_comp_fmt
+
+        # Series format: Strictly BO1 or BO3 (BO5, BO2, etc. mapped to BO3)
+        raw_s_fmt = str(d.get("series_format") or "").upper().strip()
+        raw_m_fmt = str(d.get("match_format") or "").upper().strip()
+        if "3" in raw_s_fmt or "3" in raw_m_fmt or "BO3" in raw_s_fmt:
+            d["series_format"] = "BO3"
+        elif "5" in raw_s_fmt or "5" in raw_m_fmt or "BO5" in raw_s_fmt:
+            d["series_format"] = "BO3"
+        else:
             d["series_format"] = "BO1"
-            d["match_format"] = d.get("tournament_type") or "Single Elimination"
-        elif raw_fmt in ["Best of 3", "BO3"]:
-            d["series_format"] = "BO3"
-            d["match_format"] = d.get("tournament_type") or "Single Elimination"
-        elif raw_fmt in ["Best of 5", "BO5"]:
-            d["series_format"] = "BO3"
-            d["match_format"] = d.get("tournament_type") or "Single Elimination"
 
         # If live_stream_url not set, check youtube_live_url or stream_url
         if not d.get("live_stream_url"):
             d["live_stream_url"] = d.get("youtube_live_url") or d.get("stream_url") or None
 
-        # Synchronize whatsapp_group_url and community_link
+        # Synchronize discord_url, whatsapp_group_url, and community_link
+        if not d.get("discord_url") and d.get("community_platform") == "DISCORD":
+            d["discord_url"] = d.get("community_link")
+        elif d.get("discord_url") and not d.get("community_link"):
+            d["community_link"] = d.get("discord_url")
+            if not d.get("community_platform"):
+                d["community_platform"] = "DISCORD"
+
         if not d.get("whatsapp_group_url") and d.get("community_platform") == "WHATSAPP":
             d["whatsapp_group_url"] = d.get("community_link")
         elif d.get("whatsapp_group_url") and not d.get("community_link"):
             d["community_link"] = d.get("whatsapp_group_url")
-            d["community_platform"] = "WHATSAPP"
+            if not d.get("community_platform"):
+                d["community_platform"] = "WHATSAPP"
 
         # Parse legacy JSON strings if migrated from SQL
         for field in ["rules", "schedule", "prizes", "bracket_rounds"]:

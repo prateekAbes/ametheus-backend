@@ -370,9 +370,9 @@ class TournamentResponse(BaseModel):
     min_team_size: Optional[int] = 1
     max_team_size: Optional[int] = 5
     rank_requirement: Optional[str] = "Open to All Ranks"
-    format: Optional[str] = "Single Elimination"
-    tournament_type: Optional[str] = "Single Elimination"
-    match_format: Optional[str] = "Single Elimination"
+    format: Optional[str] = "Knockout"
+    tournament_type: Optional[str] = "Knockout"
+    match_format: Optional[str] = "Knockout"
     series_format: Optional[str] = "BO1"
     has_live_matches: bool = False
     live_matches_count: int = 0
@@ -394,6 +394,7 @@ class TournamentResponse(BaseModel):
     registered_rosters: List[Dict[str, Any]] = []
     is_featured: Optional[bool] = False
     whatsapp_group_url: Optional[str] = None
+    discord_url: Optional[str] = None
     community_link: Optional[str] = None
     media_config: Optional[Dict[str, Any]] = None
     model_config = ConfigDict(from_attributes=True, extra="allow")
@@ -635,6 +636,8 @@ class AdminCompleteMatchPayload(BaseModel):
 class TournamentCommunityUpdatePayload(BaseModel):
     community_platform: Optional[str] = None  # "DISCORD" | "WHATSAPP" | None
     community_link: Optional[str] = None
+    whatsapp_group_url: Optional[str] = None
+    discord_url: Optional[str] = None
 
 class MatchJoinInfoUpdatePayload(BaseModel):
     join_info_enabled: bool = False
