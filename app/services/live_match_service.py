@@ -119,17 +119,39 @@ async def sync_live_match_for_tournament(
     game_slug = game_doc.get("slug", "valorant") if game_doc else "valorant"
     game_name = game_doc.get("name", "Valorant") if game_doc else "Valorant"
 
-    # 3. Query all encounters for this tournament
+    # Tournament cancellation / deletion check
+    tourn_status = str(tourn.get("status", "")).upper()
+    if tourn_status in ["CANCELLED", "DELETED"] or tourn.get("is_deleted"):
+        await db.live_matches.delete_one({"tournament_id": tid})
+        return None
+
+    # 3. Query all authentic, persisted encounters for this tournament
     enc_cursor = db.matches.find({
-        "$or": [{"tournament_id": tid}, {"tournament_id": tslug}]
+        "$or": [{"tournament_id": tid}, {"tournament_id": tslug}],
+        "status": {"$nin": ["CANCELLED", "DELETED"]},
+        "is_deleted": {"$ne": True},
+        "is_dummy": {"$ne": True},
     })
     encounters = await enc_cursor.to_list(length=300)
 
+    # Filter out draft or invalid matches
+    valid_encounters = [
+        e for e in encounters
+        if e.get("roster_status") != "DRAFT"
+    ]
+
+    # If the tournament has no persisted matches in db.matches, it has NO live or upcoming match
+    if not valid_encounters:
+        await db.live_matches.delete_one({"tournament_id": tid})
+        return None
+
     # 4. Determine current encounter
-    current_encounter, calculated_status = determine_current_encounter(encounters, tourn)
+    current_encounter, calculated_status = determine_current_encounter(valid_encounters, tourn)
+    if not current_encounter:
+        await db.live_matches.delete_one({"tournament_id": tid})
+        return None
 
     # Tournament status override
-    tourn_status = str(tourn.get("status", "")).upper()
     if tourn_status == "COMPLETED":
         calculated_status = "COMPLETED"
     elif tourn_status in ["LIVE", "ONGOING"] and calculated_status != "COMPLETED":
@@ -142,12 +164,19 @@ async def sync_live_match_for_tournament(
         (current_encounter and "battle_royale" in str(current_encounter.get("match_type", "")).lower())
     )
 
-    # 5. Extract current encounter data
-    current_enc_id = None
-    current_enc_no = 1
-    current_enc_title = "Match 1"
-    current_round_name = "Round 1"
-    current_round_no = 1
+    # 5. Extract current encounter data from the real persisted match
+    current_enc_id = str(current_encounter.get("_id", current_encounter.get("id")))
+    current_enc_no = int(current_encounter.get("match_number") or current_encounter.get("order") or 1)
+    current_round_no = int(current_encounter.get("round_number") or 1)
+    current_round_name = (
+        current_encounter.get("round_name") or
+        current_encounter.get("stage") or
+        f"Round {current_round_no}"
+    )
+    current_enc_title = (
+        current_encounter.get("stage") or
+        f"Match {current_enc_no}"
+    )
     team_a_id = None
     team_b_id = None
     team_a_name = None
@@ -349,14 +378,28 @@ async def reconcile_all_live_matches(db: AsyncIOMotorDatabase) -> int:
     """
     await ensure_live_match_indexes(db)
 
-    tourn_cursor = db.tournaments.find({})
+    tourn_cursor = db.tournaments.find({
+        "status": {"$nin": ["CANCELLED", "DELETED"]},
+        "is_deleted": {"$ne": True},
+    })
     tournaments = await tourn_cursor.to_list(length=500)
     reconciled_count = 0
+    active_tourn_ids = set()
 
     for tourn in tournaments:
         tid = str(tourn.get("_id", tourn.get("id")))
         res = await sync_live_match_for_tournament(tid, db)
         if res:
             reconciled_count += 1
+            active_tourn_ids.add(tid)
+
+    # Purge any live_matches records that don't have an active encounter or belong to deleted/cancelled tournaments
+    await db.live_matches.delete_many({
+        "$or": [
+            {"tournament_id": {"$nin": list(active_tourn_ids)}},
+            {"current_encounter_id": None},
+            {"current_encounter_id": {"$exists": False}},
+        ]
+    })
 
     return reconciled_count

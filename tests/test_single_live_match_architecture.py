@@ -93,26 +93,23 @@ async def test_scenario_1_tournament_zero_matches(mock_db, make_client):
         "game_name": "Valorant",
     })
 
-    # Synchronize live match
+    # Synchronize live match - must return None when no persisted matches exist
     synced = await sync_live_match_for_tournament(tourn_id, mock_db)
-    assert synced is not None
-    assert synced["tournament_id"] == tourn_id
-    assert synced["status"] == "SCHEDULED"
+    assert synced is None
 
-    # Calling sync repeatedly must be idempotent and never duplicate
+    # Repeated calls must remain clean and idempotent (no phantom records)
     await sync_live_match_for_tournament(tourn_id, mock_db)
     await sync_live_match_for_tournament(tourn_id, mock_db)
 
     count = await mock_db.live_matches.count_documents({"tournament_id": tourn_id})
-    assert count == 1
+    assert count == 0
 
     client = make_client()
     resp = await client.get("/api/v1/matches")
     assert resp.status_code == 200
     cards = resp.json()
-    assert len(cards) == 1
-    assert cards[0]["tournament_id"] == tourn_id
-    assert cards[0]["status"] == "SCHEDULED"
+    # Critical requirement: Database is source of truth. Zero matches in db.matches must return empty list (clean empty state)
+    assert len(cards) == 0
 
 
 # Scenario 2: Tournament with 3 knockout matches (Shows Match 1, exactly 1 Live Card)
@@ -522,6 +519,14 @@ async def test_scenario_9_concurrent_update_requests_idempotency(mock_db):
         "title": "Concurrency Masters",
         "status": "LIVE",
         "format": "Knockout",
+    })
+    await mock_db.matches.insert_one({
+        "_id": generate_uuid(),
+        "tournament_id": tourn_id,
+        "round_number": 1,
+        "match_number": 1,
+        "status": "LIVE",
+        "roster_status": "CONFIRMED",
     })
 
     # Spawn 10 concurrent synchronization tasks

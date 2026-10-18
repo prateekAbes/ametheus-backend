@@ -42,19 +42,30 @@ async def list_matches(
 
     # 1. Single Live Match per Tournament (Live Matches Public View)
     if not tournament_id:
-        lm_count = await db.live_matches.count_documents({})
-        tourn_count = await db.tournaments.count_documents({})
-        if lm_count < tourn_count or lm_count == 0:
+        active_tournaments_with_matches = await db.matches.distinct("tournament_id", {
+            "status": {"$nin": ["CANCELLED", "DELETED", "DRAFT"]},
+            "is_deleted": {"$ne": True},
+            "is_dummy": {"$ne": True},
+            "roster_status": {"$ne": "DRAFT"},
+        })
+        lm_count = await db.live_matches.count_documents({
+            "current_encounter_id": {"$ne": None, "$exists": True}
+        })
+        if lm_count < len(active_tournaments_with_matches):
             from app.services.live_match_service import reconcile_all_live_matches
             await reconcile_all_live_matches(db)
 
-        lm_query = {}
+        lm_query = {
+            "current_encounter_id": {"$ne": None, "$exists": True},
+        }
         if status:
             stat_upper = status.upper()
             if stat_upper in ["LIVE", "ONGOING"]:
                 lm_query["status"] = {"$in": ["LIVE", "IN_PROGRESS", "CHECK_IN_OPEN"]}
             elif stat_upper in ["UPCOMING", "SCHEDULED"]:
-                lm_query["status"] = {"$in": ["SCHEDULED", "CHECK_IN_OPEN"]}
+                lm_query["status"] = {"$in": ["SCHEDULED", "CHECK_IN_OPEN", "UPCOMING", "PENDING"]}
+            elif stat_upper in ["COMPLETED", "FINISHED"]:
+                lm_query["status"] = {"$in": ["COMPLETED", "FINISHED"]}
             else:
                 lm_query["status"] = stat_upper
 
@@ -63,18 +74,40 @@ async def list_matches(
 
         response = []
         for lm in live_matches:
-            mid = str(lm.get("id") or lm.get("_id"))
-            tourn_id_val = str(lm.get("tournament_id") or "")
-            match_status = lm.get("status", "SCHEDULED")
-            scheduled_at_iso = lm.get("scheduled_at").isoformat() if isinstance(lm.get("scheduled_at"), datetime) else lm.get("scheduled_at")
-            credentials_released = bool(lm.get("credentials_released", False))
+            enc_id = lm.get("current_encounter_id")
+            if not enc_id:
+                continue
+
+            from bson import ObjectId
+            enc_q = [{"_id": enc_id}, {"id": enc_id}]
+            if ObjectId.is_valid(enc_id):
+                enc_q.append({"_id": ObjectId(enc_id)})
+
+            real_match = await db.matches.find_one({
+                "$or": enc_q,
+                "status": {"$nin": ["CANCELLED", "DELETED"]},
+                "is_deleted": {"$ne": True},
+                "is_dummy": {"$ne": True},
+            })
+            if not real_match:
+                # Purge stale live match
+                await db.live_matches.delete_one({"_id": lm["_id"]})
+                continue
+
+            real_mid = str(real_match.get("_id", real_match.get("id")))
+            tourn_id_val = str(lm.get("tournament_id") or real_match.get("tournament_id") or "")
+            match_status = lm.get("status") or real_match.get("status", "SCHEDULED")
+            scheduled_at_val = real_match.get("scheduled_at") or lm.get("scheduled_at")
+            scheduled_at_iso = scheduled_at_val.isoformat() if isinstance(scheduled_at_val, datetime) else scheduled_at_val
+            scheduled_time_val = real_match.get("scheduled_time") or lm.get("scheduled_time", "TBD")
+            credentials_released = bool(real_match.get("credentials_released", lm.get("credentials_released", False)))
 
             if is_admin_or_organizer:
-                lobby_code = lm.get("lobby_code") or lm.get("room_id")
-                lobby_password = lm.get("lobby_password") or lm.get("room_password")
-                room_id = lm.get("room_id") or lm.get("lobby_code")
-                room_password = lm.get("room_password") or lm.get("lobby_password")
-                custom_instructions = lm.get("custom_instructions")
+                lobby_code = real_match.get("lobby_code") or real_match.get("room_id") or lm.get("lobby_code")
+                lobby_password = real_match.get("lobby_password") or real_match.get("room_password") or lm.get("lobby_password")
+                room_id = real_match.get("room_id") or real_match.get("lobby_code") or lm.get("room_id")
+                room_password = real_match.get("room_password") or real_match.get("lobby_password") or lm.get("room_password")
+                custom_instructions = real_match.get("custom_instructions") or lm.get("custom_instructions")
             else:
                 lobby_code = None
                 lobby_password = None
@@ -86,39 +119,39 @@ async def list_matches(
 
             response.append(
                 MatchResponse(
-                    id=mid,
+                    id=real_mid,
                     tournament_id=tourn_id_val,
                     tournament_title=lm.get("tournament_title", "Championship"),
                     game_slug=lm.get("game_slug", "valorant"),
                     game_name=lm.get("game_name", "Valorant"),
-                    stage=lm.get("current_stage") or lm.get("current_round_name") or "Round 1",
-                    match_type="BATTLE_ROYALE" if lm.get("is_battle_royale") else "MATCH",
-                    format=normalize_match_format(lm.get("format")),
-                    series_format=lm.get("series_format", "BO1"),
-                    scheduled_time=lm.get("scheduled_time", "TBD"),
+                    stage=lm.get("current_stage") or lm.get("current_round_name") or real_match.get("stage") or "Round 1",
+                    match_type="BATTLE_ROYALE" if (lm.get("is_battle_royale") or real_match.get("match_type") == "BATTLE_ROYALE") else "MATCH",
+                    format=normalize_match_format(real_match.get("format") or lm.get("format")),
+                    series_format=real_match.get("series_format") or lm.get("series_format", "BO1"),
+                    scheduled_time=scheduled_time_val,
                     scheduled_at=scheduled_at_iso,
-                    live_link=lm.get("youtube_live_url") or lm.get("live_link"),
-                    youtube_live_url=lm.get("youtube_live_url") or lm.get("live_link"),
+                    live_link=real_match.get("youtube_live_url") or real_match.get("live_link") or lm.get("youtube_live_url") or lm.get("live_link"),
+                    youtube_live_url=real_match.get("youtube_live_url") or real_match.get("live_link") or lm.get("youtube_live_url") or lm.get("live_link"),
                     order=lm.get("current_encounter_number", 1),
                     status=match_status,
-                    server_region=lm.get("server_region", "AWS Mumbai (ap-south-1)"),
+                    server_region=real_match.get("server_region") or lm.get("server_region", "AWS Mumbai (ap-south-1)"),
                     lobby_code=lobby_code,
                     lobby_password=lobby_password,
                     room_id=room_id,
                     room_password=room_password,
                     custom_instructions=custom_instructions,
                     credentials_released=credentials_released,
-                    teams=lm.get("teams", []),
-                    team_ids=lm.get("team_ids", []),
-                    placements=lm.get("placements", []),
-                    qualifier_team_ids=lm.get("qualifier_team_ids", []),
-                    qualifiers_count=lm.get("qualifiers_count"),
-                    is_final_round=bool(lm.get("is_final_round", False)),
+                    teams=lm.get("teams", real_match.get("teams", [])),
+                    team_ids=lm.get("team_ids", real_match.get("team_ids", [])),
+                    placements=lm.get("placements", real_match.get("placements", [])),
+                    qualifier_team_ids=lm.get("qualifier_team_ids", real_match.get("qualifier_team_ids", [])),
+                    qualifiers_count=lm.get("qualifiers_count", real_match.get("qualifiers_count")),
+                    is_final_round=bool(lm.get("is_final_round", real_match.get("is_final_round", False))),
                     team_a=lm.get("team_a"),
                     team_b=lm.get("team_b"),
-                    winner_team_id=lm.get("winner_team_id"),
-                    check_in_status=lm.get("check_in_status") or {},
-                    current_encounter_id=lm.get("current_encounter_id"),
+                    winner_team_id=real_match.get("winner_team_id") or lm.get("winner_team_id"),
+                    check_in_status=real_match.get("check_in_status") or lm.get("check_in_status") or {},
+                    current_encounter_id=real_mid,
                     current_encounter_number=lm.get("current_encounter_number", 1),
                     current_encounter_title=lm.get("current_encounter_title", "Match 1"),
                     current_round_name=lm.get("current_round_name", "Round 1"),
@@ -713,41 +746,6 @@ async def get_match_detail(
                     live_doc = synced_live
 
         if not match:
-            if live_doc:
-                return {
-                    "id": str(live_doc.get("id") or live_doc.get("_id")),
-                    "tournament_id": live_doc.get("tournament_id"),
-                    "tournament_title": live_doc.get("tournament_title"),
-                    "game_slug": live_doc.get("game_slug"),
-                    "game_name": live_doc.get("game_name"),
-                    "stage": live_doc.get("current_stage", "Round 1"),
-                    "format": live_doc.get("format", "Knockout"),
-                    "series_format": live_doc.get("series_format", "BO1"),
-                    "status": live_doc.get("status", "SCHEDULED"),
-                    "scheduled_time": live_doc.get("scheduled_time", "TBD"),
-                    "scheduled_at": live_doc.get("scheduled_at"),
-                    "team_a": live_doc.get("team_a"),
-                    "team_b": live_doc.get("team_b"),
-                    "teams": live_doc.get("teams", []),
-                    "tournament": {
-                        "id": live_doc.get("tournament_id"),
-                        "title": live_doc.get("tournament_title"),
-                        "game_slug": live_doc.get("game_slug"),
-                        "game_name": live_doc.get("game_name"),
-                        "status": live_doc.get("status", "SCHEDULED"),
-                    },
-                    "team_a_details": None,
-                    "team_b_details": None,
-                    "teams_details": [],
-                    "previous_matches": [],
-                    "next_match": None,
-                    "tournament_progression": [],
-                    "current_encounter_id": None,
-                    "current_encounter_number": 1,
-                    "current_encounter_title": "Match 1",
-                    "current_round_name": "Round 1",
-                    "encounter_history": live_doc.get("encounter_history", []),
-                }
             raise HTTPException(status_code=404, detail="Match not found")
 
     m = Match.from_mongo(match).model_dump()
