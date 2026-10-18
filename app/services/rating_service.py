@@ -72,10 +72,11 @@ async def apply_manual_rating_adjustment(
     tournament_id: Optional[str] = None,
     round_id: Optional[str] = None,
     match_id: Optional[str] = None,
+    submission_id: Optional[str] = None,
 ) -> dict:
     """
     Applies an exact manual integer adjustment (+/-) to a player's rating for a specific game.
-    Persists immutable audit log record.
+    Persists immutable audit log record. Idempotent when submission_id is provided.
     """
     # 1. Fetch player user info
     player = await db.users.find_one({
@@ -86,6 +87,15 @@ async def apply_manual_rating_adjustment(
         ]
     })
     resolved_player_id = str(player["_id"] if player and "_id" in player else (player["id"] if player and "id" in player else player_id))
+
+    # Idempotency check: if submission_id is provided, check if already recorded
+    if submission_id:
+        existing_log = await db.rating_audit_logs.find_one({
+            "submission_id": str(submission_id),
+            "player_id": resolved_player_id,
+        })
+        if existing_log:
+            return existing_log
 
     # 2. Fetch game info
     game = await db.games.find_one({
@@ -177,6 +187,7 @@ async def apply_manual_rating_adjustment(
         "round_id": round_id,
         "round_name": round_name,
         "match_id": match_id,
+        "submission_id": str(submission_id) if submission_id else None,
         "is_reversal": False,
         "original_log_id": None,
         "created_at": now,
@@ -461,3 +472,168 @@ async def get_rating_management_hierarchy(db: AsyncIOMotorDatabase) -> List[dict
         })
 
     return hierarchy
+
+async def resolve_match_players(
+    match: dict,
+    db: AsyncIOMotorDatabase,
+) -> List[dict]:
+    """
+    Resolves authentic player identities (user_id, username, display_name, avatar, current MMR)
+    for a completed or live match. Supports both team/squad rosters and solo contenders.
+    Never assigns team IDs or placeholder hashes as player identities.
+    """
+    mid = str(match.get("_id", match.get("id", "")))
+    tid = str(match.get("tournament_id", ""))
+    gid = str(match.get("game_id", ""))
+    g_slug = str(match.get("game_slug", gid))
+
+    if not gid or not g_slug:
+        if tid:
+            t_doc = await db.tournaments.find_one({"$or": [{"_id": tid}, {"id": tid}, {"slug": tid}]})
+            if t_doc:
+                gid = str(t_doc.get("game_id", gid))
+                g_slug = str(t_doc.get("game_slug", gid))
+
+    team_ids: List[str] = []
+    if match.get("team_a_id"):
+        team_ids.append(str(match["team_a_id"]))
+    if match.get("team_b_id"):
+        team_ids.append(str(match["team_b_id"]))
+    for t_entry in match.get("teams", []) or []:
+        if isinstance(t_entry, dict):
+            t_id = t_entry.get("id") or t_entry.get("_id") or t_entry.get("team_id")
+            if t_id and str(t_id) not in team_ids:
+                team_ids.append(str(t_id))
+        elif isinstance(t_entry, str) and t_entry not in team_ids:
+            team_ids.append(t_entry)
+    for tid_extra in match.get("team_ids", []) or []:
+        if tid_extra and str(tid_extra) not in team_ids:
+            team_ids.append(str(tid_extra))
+
+    players: List[dict] = []
+    seen_user_ids = set()
+
+    # 1. Check embedded team details if already present on match
+    for team_key, tname_key, tid_val in [
+        ("team_a_details", "team_a_name", match.get("team_a_id")),
+        ("team_b_details", "team_b_name", match.get("team_b_id")),
+    ]:
+        details = match.get(team_key)
+        if isinstance(details, dict) and details.get("members"):
+            t_name = details.get("name") or match.get(tname_key) or "Team"
+            for mem in details["members"]:
+                uid = str(mem.get("id") or mem.get("user_id") or "")
+                if uid and uid not in seen_user_ids:
+                    seen_user_ids.add(uid)
+                    pr = await get_or_create_player_rating(db, uid, gid, g_slug) if gid else {"rating": 500}
+                    players.append({
+                        "player_id": uid,
+                        "user_id": uid,
+                        "username": mem.get("name") or mem.get("username") or "Player",
+                        "display_name": mem.get("name") or mem.get("display_name") or mem.get("username") or "Player",
+                        "avatar_url": mem.get("avatar_url") or mem.get("avatar"),
+                        "team_id": str(tid_val) if tid_val else None,
+                        "team_name": t_name,
+                        "current_rating": int(pr.get("rating", 500)),
+                        "match_id": mid,
+                    })
+
+    # 2. Query db.teams for teams
+    if team_ids:
+        teams_docs = await db.teams.find({
+            "$or": [
+                {"_id": {"$in": team_ids}},
+                {"id": {"$in": team_ids}},
+            ]
+        }).to_list(100)
+
+        team_dict = {str(tm.get("_id", tm.get("id"))): tm for tm in teams_docs}
+        all_member_ids = []
+        user_to_team = {}
+
+        for tm in teams_docs:
+            t_id = str(tm.get("_id", tm.get("id")))
+            cap_id = tm.get("captain_id")
+            if cap_id:
+                s_cap = str(cap_id)
+                all_member_ids.append(s_cap)
+                user_to_team[s_cap] = tm
+            for p in tm.get("players", []):
+                p_uid = p.get("user_id") if isinstance(p, dict) else str(p)
+                if p_uid:
+                    s_p = str(p_uid)
+                    if s_p not in all_member_ids:
+                        all_member_ids.append(s_p)
+                    user_to_team[s_p] = tm
+
+        if all_member_ids:
+            users_docs = await db.users.find({
+                "$or": [
+                    {"_id": {"$in": all_member_ids}},
+                    {"id": {"$in": all_member_ids}},
+                    {"clerk_user_id": {"$in": all_member_ids}},
+                ]
+            }).to_list(200)
+
+            for u in users_docs:
+                uid = str(u.get("_id", u.get("id")))
+                if uid not in seen_user_ids:
+                    seen_user_ids.add(uid)
+                    tm = user_to_team.get(uid) or user_to_team.get(u.get("clerk_user_id", ""))
+                    t_name = tm.get("name", "Team") if tm else "Team"
+                    t_id = str(tm.get("_id", tm.get("id"))) if tm else None
+                    pr = await get_or_create_player_rating(db, uid, gid, g_slug) if gid else {"rating": 500}
+                    players.append({
+                        "player_id": uid,
+                        "user_id": uid,
+                        "username": u.get("username", "player"),
+                        "display_name": u.get("display_name") or u.get("username", "Player"),
+                        "avatar_url": u.get("avatar_url"),
+                        "team_id": t_id,
+                        "team_name": t_name,
+                        "current_rating": int(pr.get("rating", 500)),
+                        "match_id": mid,
+                    })
+
+    # 3. If no team players found or solo contenders, check registrations or users directly
+    if not players:
+        regs = []
+        if tid:
+            regs = await db.tournament_registrations.find({
+                "$or": [{"tournament_id": tid}],
+                "status": {"$ne": "CANCELLED"},
+            }).to_list(100)
+
+        uids = [str(r["player_id"]) for r in regs if r.get("player_id")]
+        # Also check direct user_ids or player_ids on match
+        for m_uid in match.get("player_ids", []) or match.get("user_ids", []) or []:
+            if str(m_uid) not in uids:
+                uids.append(str(m_uid))
+
+        if uids:
+            users_docs = await db.users.find({
+                "$or": [
+                    {"_id": {"$in": uids}},
+                    {"id": {"$in": uids}},
+                    {"clerk_user_id": {"$in": uids}},
+                ]
+            }).to_list(100)
+
+            for u in users_docs:
+                uid = str(u.get("_id", u.get("id")))
+                if uid not in seen_user_ids:
+                    seen_user_ids.add(uid)
+                    pr = await get_or_create_player_rating(db, uid, gid, g_slug) if gid else {"rating": 500}
+                    players.append({
+                        "player_id": uid,
+                        "user_id": uid,
+                        "username": u.get("username", "player"),
+                        "display_name": u.get("display_name") or u.get("username", "Player"),
+                        "avatar_url": u.get("avatar_url"),
+                        "team_id": None,
+                        "team_name": "Solo Contender",
+                        "current_rating": int(pr.get("rating", 500)),
+                        "match_id": mid,
+                    })
+
+    return players

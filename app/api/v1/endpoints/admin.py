@@ -53,11 +53,15 @@ from app.schemas import (
     BattleRoyaleSubmitResultsPayload,
     ParticipantRatingItem,
     MatchRatingsSubmitPayload,
+    RoundPlayerRatingItem,
+    RoundRatingsSubmitPayload,
+    RoundFinalizePayload,
 )
 from app.services.rating_service import (
     get_rating_management_hierarchy,
     apply_manual_rating_adjustment,
     reverse_rating_adjustment,
+    resolve_match_players,
 )
 from app.schemas.archive import (
     ArchiveFilterRequest,
@@ -5915,7 +5919,8 @@ async def get_match_ratings_admin(
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """
-    Section 14: Returns participants and existing manual post-match ratings.
+    Section 14: Returns authentic participants and existing manual post-match ratings.
+    Resolves real player identities (user_id, display_name, avatar, current MMR rating).
     """
     from bson import ObjectId
     m_query = {"$or": [{"_id": match_id}, {"id": match_id}]}
@@ -5927,52 +5932,68 @@ async def get_match_ratings_admin(
         raise HTTPException(status_code=404, detail="Match not found")
 
     ratings_list = match.get("participant_ratings") or []
-    rated_map = {r["participant_id"]: r for r in ratings_list}
+    # Index ratings by user_id and participant_id
+    rated_map = {}
+    for r in ratings_list:
+        if r.get("user_id"):
+            rated_map[str(r["user_id"])] = r
+        if r.get("participant_id"):
+            rated_map[str(r["participant_id"])] = r
+
+    # Resolve authentic players
+    resolved_players = await resolve_match_players(match, db)
 
     participants = []
-    # Team A
-    if match.get("team_a_id"):
-        tid = match["team_a_id"]
-        tname = match.get("team_a_name") or "Team A"
+    seen_pids = set()
+
+    for p in resolved_players:
+        uid = str(p["user_id"])
+        if uid in seen_pids:
+            continue
+        seen_pids.add(uid)
+        existing_r = rated_map.get(uid, {})
         participants.append({
-            "participant_id": tid,
-            "user_id": tid,
-            "name": tname,
-            "team_name": tname,
-            "is_winner": (tid == match.get("winner_team_id")),
-            "rating": rated_map.get(tid, {}).get("rating"),
-            "notes": rated_map.get(tid, {}).get("notes"),
-            "rated": tid in rated_map,
+            "participant_id": uid,
+            "user_id": uid,
+            "player_id": uid,
+            "name": p.get("display_name") or p.get("username") or "Player",
+            "display_name": p.get("display_name") or p.get("username") or "Player",
+            "username": p.get("username", "player"),
+            "avatar_url": p.get("avatar_url"),
+            "team_id": p.get("team_id"),
+            "team_name": p.get("team_name") or "Team",
+            "current_rating": p.get("current_rating", 500),
+            "is_winner": (p.get("team_id") and p.get("team_id") == match.get("winner_team_id")),
+            "rating": existing_r.get("rating"),
+            "notes": existing_r.get("notes") or existing_r.get("review"),
+            "review": existing_r.get("review") or existing_r.get("notes"),
+            "rated": uid in rated_map,
         })
-    # Team B
-    if match.get("team_b_id"):
-        tid = match["team_b_id"]
-        tname = match.get("team_b_name") or "Team B"
-        participants.append({
-            "participant_id": tid,
-            "user_id": tid,
-            "name": tname,
-            "team_name": tname,
-            "is_winner": (tid == match.get("winner_team_id")),
-            "rating": rated_map.get(tid, {}).get("rating"),
-            "notes": rated_map.get(tid, {}).get("notes"),
-            "rated": tid in rated_map,
-        })
-    # Multi-teams
-    for t_obj in (match.get("teams") or []):
-        tid = t_obj.get("id") or t_obj.get("team_id")
-        tname = t_obj.get("name") or t_obj.get("team_name")
-        if tid and not any(p["participant_id"] == tid for p in participants):
-            participants.append({
-                "participant_id": tid,
-                "user_id": tid,
-                "name": tname or str(tid),
-                "team_name": tname or str(tid),
-                "is_winner": (tid == match.get("winner_team_id")),
-                "rating": rated_map.get(tid, {}).get("rating"),
-                "notes": rated_map.get(tid, {}).get("notes"),
-                "rated": tid in rated_map,
-            })
+
+    # If resolved_players was empty (edge case fallback), preserve team fallback so older fixtures don't break
+    if not participants:
+        for t_key, tname_key in [("team_a_id", "team_a_name"), ("team_b_id", "team_b_name")]:
+            tid = match.get(t_key)
+            if tid:
+                tname = match.get(tname_key) or "Team"
+                existing_r = rated_map.get(str(tid), {})
+                participants.append({
+                    "participant_id": str(tid),
+                    "user_id": str(tid),
+                    "player_id": str(tid),
+                    "name": tname,
+                    "display_name": tname,
+                    "username": tname,
+                    "avatar_url": None,
+                    "team_id": str(tid),
+                    "team_name": tname,
+                    "current_rating": 500,
+                    "is_winner": (str(tid) == str(match.get("winner_team_id"))),
+                    "rating": existing_r.get("rating"),
+                    "notes": existing_r.get("notes") or existing_r.get("review"),
+                    "review": existing_r.get("review") or existing_r.get("notes"),
+                    "rated": str(tid) in rated_map,
+                })
 
     return {
         "status": "success",
@@ -5993,7 +6014,8 @@ async def submit_match_ratings_admin(
 ):
     """
     Section 14: Manual post-match player ratings assigned by authorized organizers.
-    Strictly manual, no automated Elo recalculation.
+    Supports 1-10 performance rating (System 2) and optional skill rating adjustment (+/- MMR System 1).
+    Idempotent when submission_id is supplied.
     """
     from bson import ObjectId
     from app.models.base import generate_uuid, get_utc_now
@@ -6021,14 +6043,21 @@ async def submit_match_ratings_admin(
 
     now = get_utc_now()
     existing_ratings = list(match.get("participant_ratings") or [])
-    ratings_dict = {r["participant_id"]: r for r in existing_ratings if "participant_id" in r}
+    ratings_dict = {str(r.get("user_id") or r.get("participant_id")): r for r in existing_ratings if r.get("user_id") or r.get("participant_id")}
+
+    game_id = match.get("game_id", "")
+    tournament_id = match.get("tournament_id", "")
+    round_id = match.get("round_id") or match.get("round_name")
 
     for item in payload.ratings:
-        pid = item.participant_id or item.user_id or generate_uuid()
+        uid = str(item.player_id or item.user_id or item.participant_id or generate_uuid())
+        pid = uid
+
         entry = {
             "participant_id": pid,
-            "user_id": item.user_id or pid,
-            "username": item.username,
+            "user_id": uid,
+            "username": item.username or item.display_name,
+            "display_name": item.display_name or item.username,
             "team_name": item.team_name,
             "team_id": item.team_id,
             "rating": item.rating,
@@ -6037,21 +6066,24 @@ async def submit_match_ratings_admin(
             "rated_by": admin_user.username,
             "rated_at": now.isoformat(),
         }
-        ratings_dict[pid] = entry
+        if item.skill_adjustment:
+            entry["skill_adjustment"] = item.skill_adjustment
+        ratings_dict[uid] = entry
 
-        # Persist to match_ratings collection
+        # 1. Update/insert match_ratings collection
         await db.match_ratings.update_one(
             {
                 "match_id": match_id,
-                "participant_id": pid,
+                "$or": [{"user_id": uid}, {"participant_id": pid}],
             },
             {
                 "$set": {
                     "match_id": match_id,
-                    "tournament_id": match.get("tournament_id"),
+                    "tournament_id": tournament_id,
                     "participant_id": pid,
-                    "user_id": item.user_id or pid,
+                    "user_id": uid,
                     "rating": item.rating,
+                    "skill_adjustment": item.skill_adjustment,
                     "notes": item.notes or item.review,
                     "review": item.review or item.notes,
                     "rated_by": admin_user.username,
@@ -6064,6 +6096,23 @@ async def submit_match_ratings_admin(
             },
             upsert=True,
         )
+
+        # 2. If skill_adjustment is specified, apply System 1 MMR adjustment with idempotency
+        if item.skill_adjustment and int(item.skill_adjustment) != 0:
+            sub_id = f"{payload.submission_id}_{uid}" if payload.submission_id else None
+            await apply_manual_rating_adjustment(
+                db=db,
+                admin_user=admin_user,
+                player_id=uid,
+                game_id=str(game_id) if game_id else "general",
+                adjustment=int(item.skill_adjustment),
+                reason=item.adjustment_reason or "Post-Match Performance Evaluation",
+                explanation=item.adjustment_explanation or item.review or item.notes or f"Match {match_id} rating adjustment",
+                tournament_id=str(tournament_id) if tournament_id else None,
+                round_id=str(round_id) if round_id else None,
+                match_id=match_id,
+                submission_id=sub_id,
+            )
 
     updated_ratings = list(ratings_dict.values())
     await db.matches.update_one(m_query, {"$set": {"participant_ratings": updated_ratings}})
@@ -6083,6 +6132,438 @@ async def submit_match_ratings_admin(
         "match_id": match_id,
         "total_rated": len(updated_ratings),
         "ratings": updated_ratings,
+    }
+
+
+@router.get("/tournaments/{tournament_id}/rounds/{round_name}/review")
+async def get_round_review_admin(
+    tournament_id: str,
+    round_name: str,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Round-level workflow: Audits completion status of all matches in a round,
+    gathers all participants across completed matches, aggregates standings/scores,
+    computes proposed qualifiers, and provides ratings readiness.
+    """
+    from bson import ObjectId
+    t_query = {"$or": [{"id": tournament_id}, {"_id": tournament_id}, {"slug": tournament_id}]}
+    if ObjectId.is_valid(tournament_id):
+        t_query["$or"].append({"_id": ObjectId(tournament_id)})
+
+    tourn = await db.tournaments.find_one(t_query)
+    if not tourn:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+
+    tid = str(tourn.get("_id", tourn.get("id")))
+
+    # Query matches belonging to this tournament and round
+    m_cursor = db.matches.find({
+        "$or": [{"tournament_id": tid}, {"tournament_id": tourn.get("slug", tid)}],
+        "$and": [
+            {"$or": [
+                {"round_name": round_name},
+                {"stage": round_name},
+                {"round_id": round_name},
+            ]},
+            {"is_dummy": {"$ne": True}},
+        ],
+    })
+    matches = await m_cursor.to_list(100)
+
+    total_matches = len(matches)
+    completed_matches = sum(1 for m in matches if m.get("status") == "COMPLETED")
+    all_completed = (total_matches > 0 and completed_matches == total_matches)
+
+    # Gather participants and aggregate standings across all matches in this round
+    all_players: List[dict] = []
+    seen_uids = set()
+    standings_map: Dict[str, dict] = {}
+
+    for m in matches:
+        m_id = str(m.get("_id", m.get("id")))
+        # Check BR results if available
+        br_res = m.get("battle_royale_results") or m.get("placements") or []
+        for r in br_res:
+            t_id = str(r.get("team_id"))
+            if t_id not in standings_map:
+                standings_map[t_id] = {
+                    "participant_id": t_id,
+                    "participant_name": r.get("team_name", t_id),
+                    "total_points": 0,
+                    "kills": 0,
+                    "matches_played": 0,
+                    "best_placement": 999,
+                    "qualified": bool(r.get("qualified")),
+                }
+            st = standings_map[t_id]
+            st["total_points"] += int(r.get("total_points") or 0)
+            st["kills"] += int(r.get("kills") or 0)
+            st["matches_played"] += 1
+            st["best_placement"] = min(st["best_placement"], int(r.get("placement") or 999))
+            if r.get("qualified"):
+                st["qualified"] = True
+
+        # Check Head-to-Head winner
+        if m.get("winner_team_id"):
+            w_id = str(m["winner_team_id"])
+            if w_id not in standings_map:
+                standings_map[w_id] = {
+                    "participant_id": w_id,
+                    "participant_name": m.get("team_a_name" if w_id == str(m.get("team_a_id")) else "team_b_name") or w_id,
+                    "total_points": 0,
+                    "wins": 0,
+                    "matches_played": 0,
+                    "qualified": True,
+                }
+            standings_map[w_id]["wins"] = standings_map[w_id].get("wins", 0) + 1
+            standings_map[w_id]["matches_played"] += 1
+
+        # Resolve authentic players
+        players = await resolve_match_players(m, db)
+        # Get existing ratings on match
+        rated_lookup = {str(r.get("user_id") or r.get("participant_id")): r for r in (m.get("participant_ratings") or [])}
+
+        for p in players:
+            uid = str(p["user_id"])
+            if uid not in seen_uids:
+                seen_uids.add(uid)
+                ex = rated_lookup.get(uid, {})
+                all_players.append({
+                    "player_id": uid,
+                    "user_id": uid,
+                    "username": p.get("username", "player"),
+                    "display_name": p.get("display_name") or p.get("username", "Player"),
+                    "avatar_url": p.get("avatar_url"),
+                    "team_id": p.get("team_id"),
+                    "team_name": p.get("team_name") or "Team",
+                    "current_rating": p.get("current_rating", 500),
+                    "match_id": m_id,
+                    "existing_rating": ex.get("rating"),
+                    "existing_notes": ex.get("notes") or ex.get("review"),
+                    "is_rated": uid in rated_lookup,
+                })
+
+    # Sort standings by total_points or wins descending
+    sorted_standings = sorted(
+        standings_map.values(),
+        key=lambda x: (x.get("total_points", 0), x.get("wins", 0), -x.get("best_placement", 999)),
+        reverse=True,
+    )
+    for rank, item in enumerate(sorted_standings, 1):
+        item["rank"] = rank
+
+    # Check if this round is already finalized
+    is_round_finalized = False
+    for stg in tourn.get("stages", []):
+        for rnd in stg.get("rounds", []):
+            if rnd.get("name") == round_name or rnd.get("round_name") == round_name or rnd.get("id") == round_name:
+                if rnd.get("status") == "FINALIZED" or rnd.get("is_finalized"):
+                    is_round_finalized = True
+                    break
+
+    # Also check if qualifications already exist in db.tournament_qualifications for this round
+    existing_quals = await db.tournament_qualifications.find({
+        "$or": [{"tournament_id": tid}, {"tournament_id": tourn.get("slug", tid)}],
+        "source_round": round_name,
+        "status": "QUALIFIED",
+    }).to_list(100)
+    if existing_quals and not is_round_finalized:
+        is_round_finalized = True
+
+    return {
+        "status": "success",
+        "tournament_id": tid,
+        "round_name": round_name,
+        "total_matches": total_matches,
+        "completed_matches": completed_matches,
+        "all_matches_completed": all_completed,
+        "is_round_finalized": is_round_finalized,
+        "standings": sorted_standings,
+        "proposed_qualifiers": [s["participant_id"] for s in sorted_standings if s.get("qualified") or s.get("rank", 999) <= 10],
+        "confirmed_qualifiers": [q["participant_id"] for q in existing_quals],
+        "players": all_players,
+        "total_players": len(all_players),
+        "total_rated_players": sum(1 for p in all_players if p.get("is_rated")),
+    }
+
+
+@router.post("/tournaments/{tournament_id}/rounds/{round_name}/ratings")
+async def submit_round_ratings_admin(
+    tournament_id: str,
+    round_name: str,
+    payload: RoundRatingsSubmitPayload,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Submits ratings across all participants in a completed round.
+    Supports 1-10 performance rating (System 2) and optional skill rating adjustment (+/- MMR System 1).
+    Idempotent when submission_id is supplied.
+    """
+    from bson import ObjectId
+    from app.models.base import generate_uuid, get_utc_now
+
+    t_query = {"$or": [{"id": tournament_id}, {"_id": tournament_id}, {"slug": tournament_id}]}
+    if ObjectId.is_valid(tournament_id):
+        t_query["$or"].append({"_id": ObjectId(tournament_id)})
+
+    tourn = await db.tournaments.find_one(t_query)
+    if not tourn:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+
+    tid = str(tourn.get("_id", tourn.get("id")))
+    gid = str(tourn.get("game_id", ""))
+
+    for r in payload.ratings:
+        r_val = r.get_rating()
+        if r_val < 1 or r_val > 10:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid rating {r_val} for player {r.user_id}. Ratings must be between 1 and 10.",
+            )
+
+    now = get_utc_now()
+    updated_count = 0
+
+    for item in payload.ratings:
+        uid = str(item.player_id or item.user_id)
+        mid = item.match_id
+        r_val = item.get_rating()
+        n_val = item.get_notes()
+
+        # 1. Update match_ratings collection
+        rating_doc = {
+            "tournament_id": tid,
+            "round_name": round_name,
+            "match_id": mid,
+            "participant_id": uid,
+            "user_id": uid,
+            "username": item.username or item.display_name,
+            "display_name": item.display_name or item.username,
+            "team_id": item.team_id,
+            "team_name": item.team_name,
+            "rating": r_val,
+            "skill_adjustment": item.skill_adjustment,
+            "notes": n_val,
+            "review": n_val,
+            "rated_by": admin_user.username,
+            "updated_at": now,
+        }
+        await db.match_ratings.update_one(
+            {
+                "tournament_id": tid,
+                "user_id": uid,
+                "match_id": mid,
+            },
+            {
+                "$set": rating_doc,
+                "$setOnInsert": {"id": generate_uuid(), "created_at": now},
+            },
+            upsert=True,
+        )
+
+        # 2. Also update match document if mid is present
+        if mid:
+            m_q = {"$or": [{"_id": mid}, {"id": mid}]}
+            if ObjectId.is_valid(mid):
+                m_q["$or"].append({"_id": ObjectId(mid)})
+            match_doc = await db.matches.find_one(m_q)
+            if match_doc:
+                existing_m_ratings = list(match_doc.get("participant_ratings") or [])
+                m_r_dict = {str(r.get("user_id") or r.get("participant_id")): r for r in existing_m_ratings}
+                m_r_dict[uid] = {
+                    "participant_id": uid,
+                    "user_id": uid,
+                    "username": item.username or item.display_name,
+                    "team_name": item.team_name,
+                    "team_id": item.team_id,
+                    "rating": item.rating,
+                    "skill_adjustment": item.skill_adjustment,
+                    "notes": item.notes or item.review,
+                    "review": item.review or item.notes,
+                    "rated_by": admin_user.username,
+                    "rated_at": now.isoformat(),
+                }
+                await db.matches.update_one(m_q, {"$set": {"participant_ratings": list(m_r_dict.values())}})
+
+        # 3. If skill_adjustment is specified, apply System 1 MMR adjustment with idempotency
+        if item.skill_adjustment and int(item.skill_adjustment) != 0:
+            sub_id = f"{payload.submission_id}_{uid}" if payload.submission_id else None
+            await apply_manual_rating_adjustment(
+                db=db,
+                admin_user=admin_user,
+                player_id=uid,
+                game_id=gid or "general",
+                adjustment=int(item.skill_adjustment),
+                reason=item.adjustment_reason or "Round Performance Evaluation",
+                explanation=item.adjustment_explanation or item.review or item.notes or f"Round {round_name} rating adjustment",
+                tournament_id=tid,
+                round_id=round_name,
+                match_id=mid,
+                submission_id=sub_id,
+            )
+
+        updated_count += 1
+
+    await record_audit_log(
+        db=db,
+        operator=admin_user.username,
+        role=admin_user.role,
+        action="SUBMIT_ROUND_RATINGS",
+        target=f"Tournament {tid} - Round {round_name}",
+        details=f"Assigned round-level ratings for {updated_count} players.",
+    )
+
+    return {
+        "status": "success",
+        "message": f"Successfully assigned ratings for {updated_count} players in {round_name}.",
+        "tournament_id": tid,
+        "round_name": round_name,
+        "total_rated": updated_count,
+    }
+
+
+@router.post("/tournaments/{tournament_id}/rounds/{round_name}/finalize")
+async def finalize_round_admin(
+    tournament_id: str,
+    round_name: str,
+    payload: RoundFinalizePayload,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Finalizes a tournament round and persists confirmed/overridden qualifiers to db.tournament_qualifications.
+    CRITICAL: Validates that all matches in the round are COMPLETED before finalization.
+    CRITICAL: Does NOT automatically create the next round (organizer manually creates next round).
+    """
+    from bson import ObjectId
+    from app.models.base import generate_uuid, get_utc_now
+
+    t_query = {"$or": [{"id": tournament_id}, {"_id": tournament_id}, {"slug": tournament_id}]}
+    if ObjectId.is_valid(tournament_id):
+        t_query["$or"].append({"_id": ObjectId(tournament_id)})
+
+    tourn = await db.tournaments.find_one(t_query)
+    if not tourn:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+
+    tid = str(tourn.get("_id", tourn.get("id")))
+
+    # 1. Verify all matches in round are COMPLETED
+    m_cursor = db.matches.find({
+        "$or": [{"tournament_id": tid}, {"tournament_id": tourn.get("slug", tid)}],
+        "$and": [
+            {"$or": [
+                {"round_name": round_name},
+                {"stage": round_name},
+                {"round_id": round_name},
+            ]},
+            {"is_dummy": {"$ne": True}},
+        ],
+    })
+    matches = await m_cursor.to_list(100)
+
+    if not matches:
+        raise HTTPException(status_code=400, detail=f"No matches found for round '{round_name}'.")
+
+    incomplete_matches = [m for m in matches if m.get("status") != "COMPLETED"]
+    if incomplete_matches:
+        incomplete_ids = [str(m.get("_id", m.get("id"))) for m in incomplete_matches]
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot finalize round '{round_name}'. {len(incomplete_matches)} match(es) are not yet COMPLETED: {', '.join(incomplete_ids)}",
+        )
+
+    # 2. Persist confirmed / overridden qualifiers to db.tournament_qualifications
+    now = get_utc_now()
+    qualifier_ids = payload.get_qualifiers()
+    notes_val = payload.get_notes()
+    persisted_count = 0
+
+    # Resolve names for qualifiers (from teams or registrations)
+    teams_docs = await db.teams.find({
+        "$or": [
+            {"_id": {"$in": qualifier_ids}},
+            {"id": {"$in": qualifier_ids}},
+        ]
+    }).to_list(100)
+    name_map = {str(tm.get("_id", tm.get("id"))): tm.get("name", "Team") for tm in teams_docs}
+
+    # Also check users for solo contenders
+    users_docs = await db.users.find({
+        "$or": [
+            {"_id": {"$in": qualifier_ids}},
+            {"id": {"$in": qualifier_ids}},
+        ]
+    }).to_list(100)
+    for u in users_docs:
+        uid = str(u.get("_id", u.get("id")))
+        name_map[uid] = u.get("display_name") or u.get("username", "Player")
+
+    for q_id in qualifier_ids:
+        s_qid = str(q_id)
+        qual_doc = {
+            "tournament_id": tid,
+            "source_round": round_name,
+            "source_round_number": payload.round_number or 1,
+            "participant_id": s_qid,
+            "participant_name": name_map.get(s_qid, s_qid),
+            "status": "QUALIFIED",
+            "notes": notes_val,
+            "finalized_at": now,
+            "finalized_by": admin_user.username,
+        }
+        await db.tournament_qualifications.update_one(
+            {
+                "tournament_id": tid,
+                "source_round": round_name,
+                "participant_id": s_qid,
+            },
+            {
+                "$set": qual_doc,
+                "$setOnInsert": {"id": generate_uuid(), "created_at": now},
+            },
+            upsert=True,
+        )
+        persisted_count += 1
+
+    # 3. Update tournament stages to mark this round finalized
+    stages = list(tourn.get("stages") or [])
+    updated_stages = False
+    for stg in stages:
+        for rnd in stg.get("rounds", []):
+            if rnd.get("name") == round_name or rnd.get("round_name") == round_name or rnd.get("id") == round_name:
+                rnd["status"] = "FINALIZED"
+                rnd["is_finalized"] = True
+                rnd["finalized_at"] = now.isoformat()
+                rnd["finalized_by"] = admin_user.username
+                rnd["qualified_count"] = persisted_count
+                updated_stages = True
+
+    update_fields = {"updated_at": now}
+    if updated_stages:
+        update_fields["stages"] = stages
+
+    await db.tournaments.update_one(t_query, {"$set": update_fields})
+
+    await record_audit_log(
+        db=db,
+        operator=admin_user.username,
+        role=admin_user.role,
+        action="FINALIZE_TOURNAMENT_ROUND",
+        target=f"Tournament {tid} - Round {round_name}",
+        details=f"Finalized round {round_name} with {persisted_count} qualified contenders.",
+    )
+
+    return {
+        "status": "success",
+        "message": f"Successfully finalized {round_name} with {persisted_count} qualified contender(s).",
+        "tournament_id": tid,
+        "round_name": round_name,
+        "qualified_count": persisted_count,
+        "qualifier_ids": qualifier_ids,
     }
 
 

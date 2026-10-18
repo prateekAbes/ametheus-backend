@@ -934,16 +934,77 @@ class BattleRoyaleSubmitResultsPayload(BaseModel):
 class ParticipantRatingItem(BaseModel):
     participant_id: Optional[str] = None
     user_id: Optional[str] = None
+    player_id: Optional[str] = None
     username: Optional[str] = None
+    display_name: Optional[str] = None
+    avatar_url: Optional[str] = None
     team_name: Optional[str] = None
     team_id: Optional[str] = None
-    rating: float  # 1 to 10
+    match_id: Optional[str] = None
+    rating: float = 8.0  # 1 to 10
     notes: Optional[str] = None
     review: Optional[str] = None
+    # System 1: MMR skill adjustment
+    skill_adjustment: Optional[int] = None
+    adjustment_reason: Optional[str] = None
+    adjustment_explanation: Optional[str] = None
 
 class MatchRatingsSubmitPayload(BaseModel):
     ratings: List[ParticipantRatingItem]
     rating_scale: str = "1-10"
+    submission_id: Optional[str] = None
+
+class RoundPlayerRatingItem(BaseModel):
+    player_id: str
+    user_id: Optional[str] = None
+    username: Optional[str] = "player"
+    display_name: Optional[str] = None
+    avatar_url: Optional[str] = None
+    team_id: Optional[str] = None
+    team_name: Optional[str] = None
+    match_id: Optional[str] = None
+    match_title: Optional[str] = None
+    match_status: Optional[str] = None
+    # System 2: Match performance rating (1-10)
+    rating: Optional[float] = None
+    performance_rating: Optional[float] = None
+    notes: Optional[str] = None
+    review: Optional[str] = None
+    performance_notes: Optional[str] = None
+    # System 1: Skill rating (MMR Base 500)
+    current_skill_rating: Optional[int] = 500
+    current_rating: Optional[int] = 500
+    skill_adjustment: Optional[int] = 0
+    adjustment_reason: Optional[str] = None
+    adjustment_explanation: Optional[str] = None
+    is_rated: Optional[bool] = False
+
+    def get_rating(self) -> float:
+        return self.rating if self.rating is not None else (self.performance_rating if self.performance_rating is not None else 8.0)
+
+    def get_notes(self) -> Optional[str]:
+        return self.notes or self.review or self.performance_notes
+
+class RoundRatingsSubmitPayload(BaseModel):
+    round_name: Optional[str] = None
+    ratings: List[RoundPlayerRatingItem] = Field(default_factory=list)
+    rating_scale: str = "1-10"
+    submission_id: Optional[str] = None
+
+class RoundFinalizePayload(BaseModel):
+    round_name: Optional[str] = None
+    qualifier_ids: Optional[List[str]] = None
+    qualifier_participant_ids: Optional[List[str]] = None
+    round_number: Optional[int] = 1
+    notes: Optional[str] = None
+    qualification_notes: Optional[str] = None
+    enforce_ratings_completed: Optional[bool] = False
+
+    def get_qualifiers(self) -> List[str]:
+        return list(self.qualifier_ids or self.qualifier_participant_ids or [])
+
+    def get_notes(self) -> Optional[str]:
+        return self.notes or self.qualification_notes
 
 class WalletAuditSummaryResponse(BaseModel):
     total_wallet_pool_inr: float
