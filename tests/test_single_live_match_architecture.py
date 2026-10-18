@@ -427,7 +427,7 @@ async def test_scenario_7_battle_royale_round_progression(mock_db, make_client):
         "match_number": 1,
         "round_name": "Round 1",
         "format": "Battle Royale",
-        "status": "SCHEDULED",
+        "status": "ENDED",
         "teams": teams,
         "team_ids": [t["id"] for t in teams],
     })

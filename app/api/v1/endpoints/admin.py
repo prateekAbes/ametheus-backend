@@ -2467,17 +2467,45 @@ async def update_match_status(
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     from app.core.ws import ws_manager
+    from app.models.base import get_utc_now
+    from bson import ObjectId
 
-    match = await db.matches.find_one({"$or": [{"_id": id}, {"id": id}]})
+    m_query = {"$or": [{"_id": id}, {"id": id}]}
+    if ObjectId.is_valid(id):
+        m_query["$or"].append({"_id": ObjectId(id)})
+
+    match = await db.matches.find_one(m_query)
     if not match:
         raise HTTPException(status_code=404, detail="Match not found")
 
-    valid_statuses = ["DRAFT", "SCHEDULED", "CHECK_IN_OPEN", "LIVE", "COMPLETED", "CANCELLED"]
+    valid_statuses = [
+        "DRAFT", "SCHEDULED", "CHECK_IN_OPEN", "LIVE",
+        "ENDED", "RESULTS_SAVED", "RESULTS_PENDING",
+        "FINALIZED", "COMPLETED", "CANCELLED"
+    ]
     stat_upper = payload.status.upper()
     if stat_upper not in valid_statuses:
         raise HTTPException(status_code=400, detail=f"Invalid match status: {payload.status}")
 
-    await db.matches.update_one({"_id": match["_id"]}, {"$set": {"status": stat_upper}})
+    current_status = str(match.get("status", "SCHEDULED")).upper()
+
+    # Prevent restarting completed or finalized matches
+    if current_status in ["COMPLETED", "FINALIZED"] and stat_upper in ["LIVE", "SCHEDULED", "CHECK_IN_OPEN"]:
+        raise HTTPException(status_code=400, detail="Cannot restart a completed or finalized match.")
+
+    # Idempotent: if already LIVE and setting to LIVE
+    if stat_upper == "LIVE" and current_status == "LIVE":
+        return {"status": "success", "message": "Match is already LIVE", "status": "LIVE"}
+
+    await db.matches.update_one({"_id": match["_id"]}, {"$set": {"status": stat_upper, "updated_at": get_utc_now()}})
+
+    try:
+        from app.services.live_match_service import sync_live_match_for_tournament
+        tid = str(match.get("tournament_id"))
+        if tid:
+            await sync_live_match_for_tournament(tid, db)
+    except Exception:
+        pass
 
     await ws_manager.broadcast({
         "type": "MATCH_STATUS_CHANGED",
@@ -2494,7 +2522,7 @@ async def update_match_status(
         details=f"Status set to {stat_upper}",
     )
 
-    return {"status": "success", "message": f"Match status updated to {stat_upper}"}
+    return {"status": "success", "message": f"Match status updated to {stat_upper}", "status_code": stat_upper}
 
 @router.post("/matches/{id}/score")
 async def update_match_score_admin(
@@ -2505,10 +2533,23 @@ async def update_match_score_admin(
 ):
     from app.services.bracket_engine import advance_bracket_match
     from app.core.ws import ws_manager
+    from app.models.base import get_utc_now
+    from bson import ObjectId
 
-    match_doc = await db.matches.find_one({"$or": [{"_id": id}, {"id": id}]})
+    m_query = {"$or": [{"_id": id}, {"id": id}]}
+    if ObjectId.is_valid(id):
+        m_query["$or"].append({"_id": ObjectId(id)})
+
+    match_doc = await db.matches.find_one(m_query)
     if not match_doc:
         raise HTTPException(status_code=404, detail="Match not found")
+
+    current_status = str(match_doc.get("status", "SCHEDULED")).upper()
+    if current_status in ["SCHEDULED", "DRAFT"]:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot enter or submit match scores: match must be ended or live first."
+        )
 
     match = Match.from_mongo(match_doc)
     winner_id = payload.winner_team_id
@@ -2518,10 +2559,13 @@ async def update_match_score_admin(
     update_doc: dict[str, Any] = {
         "score_a": payload.score_a,
         "score_b": payload.score_b,
+        "updated_at": get_utc_now(),
     }
     if payload.complete_match:
         update_doc["status"] = "COMPLETED"
         update_doc["winner_team_id"] = winner_id
+    else:
+        update_doc["status"] = "RESULTS_SAVED"
 
     await db.matches.update_one({"_id": match_doc["_id"]}, {"$set": update_doc})
 
@@ -2536,12 +2580,20 @@ async def update_match_score_admin(
         except Exception:
             pass
 
+    try:
+        from app.services.live_match_service import sync_live_match_for_tournament
+        await sync_live_match_for_tournament(str(match.tournament_id), db)
+    except Exception:
+        pass
+
+    new_stat = "COMPLETED" if payload.complete_match else "RESULTS_SAVED"
+
     await ws_manager.broadcast({
         "type": "MATCH_SCORE_SUBMITTED",
         "match_id": match.id,
         "score_a": payload.score_a,
         "score_b": payload.score_b,
-        "status": "COMPLETED" if payload.complete_match else match.status,
+        "status": new_stat,
     })
 
     await record_audit_log(
@@ -2550,12 +2602,13 @@ async def update_match_score_admin(
         role=admin_user.role,
         action="ADMIN_UPDATE_MATCH_SCORE",
         target=f"Match {match.id} ({payload.score_a} - {payload.score_b})",
-        details=f"Winner: {winner_id or 'In Progress'} | Complete: {payload.complete_match}",
+        details=f"Winner: {winner_id or 'Draft'} | Complete: {payload.complete_match} | Status: {new_stat}",
     )
 
     return {
         "status": "success",
-        "message": f"Scores updated to {payload.score_a}-{payload.score_b}. Match {'completed' if payload.complete_match else 'in progress'}.",
+        "message": f"Scores updated to {payload.score_a}-{payload.score_b}. Match {'completed' if payload.complete_match else 'results saved as draft'}.",
+        "match_status": new_stat,
     }
 
 # ----------------- TOURNAMENT & LIVE MATCHES REDESIGN ENDPOINTS -----------------
@@ -5583,6 +5636,13 @@ async def submit_battle_royale_results_admin(
         if not is_creator:
             raise HTTPException(status_code=403, detail="Unauthorized: Only the tournament organizer or super admin can submit match results.")
 
+    current_status = str(match.get("status", "SCHEDULED")).upper()
+    if current_status in ["SCHEDULED", "LIVE", "CHECK_IN_OPEN", "DRAFT"]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot enter or submit match results: match must be ended first (current status: {current_status})."
+        )
+
     # 1. Gather all participating teams in this match
     match_teams = list(match.get("teams") or [])
     match_team_ids = set()
@@ -5699,14 +5759,66 @@ async def submit_battle_royale_results_admin(
     if not winner_team_id and raw_qualifier_ids:
         winner_team_id = raw_qualifier_ids[0]
 
-    # Validate that on final round, winner is certified
-    if payload.is_final_round and not winner_team_id:
+    # Validate that on final round (if finalizing), winner is certified
+    if not payload.draft and payload.is_final_round and not winner_team_id:
         if processed_results:
             winner_team_id = processed_results[0]["team_id"]
         elif raw_qualifier_ids:
             winner_team_id = raw_qualifier_ids[0]
         else:
             raise HTTPException(status_code=400, detail="Cannot finalize tournament without certifying a winning champion.")
+
+    # If this is a draft save (Save Results):
+    if payload.draft:
+        clean_scoring_matrix = None
+        if payload.scoring_matrix and isinstance(payload.scoring_matrix, dict):
+            clean_scoring_matrix = {}
+            for k, v in payload.scoring_matrix.items():
+                if isinstance(v, dict):
+                    clean_scoring_matrix[str(k)] = {str(sub_k): sub_v for sub_k, sub_v in v.items()}
+                else:
+                    clean_scoring_matrix[str(k)] = v
+        else:
+            clean_scoring_matrix = {"placement": default_placement_points, "kill": pts_per_kill}
+
+        match_update = {
+            "status": "RESULTS_SAVED",
+            "placements": processed_results,
+            "winner_team_id": winner_team_id,
+            "qualifier_team_ids": raw_qualifier_ids,
+            "qualifiers_count": len(raw_qualifier_ids),
+            "is_final_round": payload.is_final_round,
+            "scoring_matrix": clean_scoring_matrix,
+            "updated_at": get_utc_now(),
+        }
+        await db.matches.update_one(m_query, {"$set": match_update})
+
+        await record_audit_log(
+            db=db,
+            operator=admin_user.username,
+            role=admin_user.role,
+            action="SAVE_BATTLE_ROYALE_DRAFT_RESULTS",
+            target=f"Match {id}",
+            details=f"Draft BR results saved. Placements: {len(processed_results)}. Status: RESULTS_SAVED.",
+        )
+
+        try:
+            from app.services.live_match_service import sync_live_match_for_tournament
+            await sync_live_match_for_tournament(tid, db)
+        except Exception:
+            pass
+
+        return {
+            "status": "success",
+            "message": "Battle Royale results saved as draft. Review and finalize when ready.",
+            "draft": True,
+            "match_id": id,
+            "winner_team_id": winner_team_id,
+            "qualifiers_count": len(raw_qualifier_ids),
+            "qualifier_team_ids": raw_qualifier_ids,
+            "is_final_round": payload.is_final_round,
+            "placements": processed_results,
+        }
 
     # 4. Upsert records into db.tournament_qualifications
     curr_round_num = match.get("round_number", 1)
@@ -5998,7 +6110,7 @@ async def get_match_ratings_admin(
     return {
         "status": "success",
         "match_id": match_id,
-        "is_completed": (match.get("status") == "COMPLETED"),
+        "is_completed": (match.get("status") in ["COMPLETED", "FINALIZED"]),
         "participants": participants,
         "ratings": ratings_list,
         "rating_scale": "1-10",
@@ -6028,7 +6140,7 @@ async def submit_match_ratings_admin(
     if not match:
         raise HTTPException(status_code=404, detail="Match not found")
 
-    if match.get("status") != "COMPLETED":
+    if match.get("status") not in ["COMPLETED", "FINALIZED"]:
         raise HTTPException(
             status_code=400,
             detail="Participant ratings can only be assigned after the match result is finalized/completed.",
@@ -6173,7 +6285,7 @@ async def get_round_review_admin(
     matches = await m_cursor.to_list(100)
 
     total_matches = len(matches)
-    completed_matches = sum(1 for m in matches if m.get("status") == "COMPLETED")
+    completed_matches = sum(1 for m in matches if m.get("status") in ["COMPLETED", "FINALIZED"])
     all_completed = (total_matches > 0 and completed_matches == total_matches)
 
     # Gather participants and aggregate standings across all matches in this round
@@ -6215,6 +6327,7 @@ async def get_round_review_admin(
                     "total_points": 0,
                     "wins": 0,
                     "matches_played": 0,
+                    "best_placement": 1,
                     "qualified": True,
                 }
             standings_map[w_id]["wins"] = standings_map[w_id].get("wins", 0) + 1
@@ -6230,6 +6343,49 @@ async def get_round_review_admin(
             if uid not in seen_uids:
                 seen_uids.add(uid)
                 ex = rated_lookup.get(uid, {})
+                tid_str = str(p.get("team_id") or "")
+                perf = standings_map.get(tid_str) or standings_map.get(uid) or {}
+
+                place = perf.get("best_placement")
+                if place == 999:
+                    place = None
+                kills = perf.get("kills", 0)
+                pts = perf.get("total_points", 0)
+                wins = perf.get("wins", 0)
+
+                # Calculate transparent proposed rating adjustment and reason
+                curr_r = int(p.get("current_rating", 500))
+                proposed_adj = 0
+                calc_reason = "Standard Performance"
+
+                if place is not None:
+                    if place == 1:
+                        proposed_adj = 25
+                        calc_reason = f"1st Place Dominant ({pts} pts, {kills} kills) -> +25 MMR"
+                    elif place <= 3:
+                        proposed_adj = 15
+                        calc_reason = f"Top 3 Podium ({pts} pts, {kills} kills) -> +15 MMR"
+                    elif place <= 5:
+                        proposed_adj = 10
+                        calc_reason = f"Top 5 Placement ({pts} pts, {kills} kills) -> +10 MMR"
+                    elif place <= 10:
+                        proposed_adj = 5
+                        calc_reason = f"Top 10 Qualifier ({pts} pts, {kills} kills) -> +5 MMR"
+                    else:
+                        proposed_adj = -5
+                        calc_reason = f"Eliminated outside Top 10 (Rank #{place}) -> -5 MMR"
+                elif wins > 0:
+                    proposed_adj = 15
+                    calc_reason = f"Match Winner ({wins} win(s)) -> +15 MMR"
+                elif m.get("winner_team_id") and tid_str and tid_str != str(m.get("winner_team_id")):
+                    proposed_adj = -5
+                    calc_reason = "Match Defeat -> -5 MMR"
+                else:
+                    proposed_adj = 0
+                    calc_reason = "Neutral Performance -> +0 MMR"
+
+                post_r = max(0, curr_r + proposed_adj)
+
                 all_players.append({
                     "player_id": uid,
                     "user_id": uid,
@@ -6238,8 +6394,15 @@ async def get_round_review_admin(
                     "avatar_url": p.get("avatar_url"),
                     "team_id": p.get("team_id"),
                     "team_name": p.get("team_name") or "Team",
-                    "current_rating": p.get("current_rating", 500),
+                    "current_rating": curr_r,
                     "match_id": m_id,
+                    "placement": place,
+                    "kills": kills,
+                    "points": pts,
+                    "wins": wins,
+                    "proposed_adjustment": proposed_adj,
+                    "post_rating": post_r,
+                    "calculation_reason": calc_reason,
                     "existing_rating": ex.get("rating"),
                     "existing_notes": ex.get("notes") or ex.get("review"),
                     "is_rated": uid in rated_lookup,
@@ -6390,7 +6553,7 @@ async def submit_round_ratings_admin(
 
         # 3. If skill_adjustment is specified, apply System 1 MMR adjustment with idempotency
         if item.skill_adjustment and int(item.skill_adjustment) != 0:
-            sub_id = f"{payload.submission_id}_{uid}" if payload.submission_id else None
+            sub_id = f"{payload.submission_id}_{uid}" if payload.submission_id else f"round_ratings_{tid}_{round_name}_{uid}"
             await apply_manual_rating_adjustment(
                 db=db,
                 admin_user=admin_user,
@@ -6451,7 +6614,7 @@ async def finalize_round_admin(
 
     tid = str(tourn.get("_id", tourn.get("id")))
 
-    # 1. Verify all matches in round are COMPLETED
+    # 1. Verify all matches in round are COMPLETED or FINALIZED
     m_cursor = db.matches.find({
         "$or": [{"tournament_id": tid}, {"tournament_id": tourn.get("slug", tid)}],
         "$and": [
@@ -6468,12 +6631,15 @@ async def finalize_round_admin(
     if not matches:
         raise HTTPException(status_code=400, detail=f"No matches found for round '{round_name}'.")
 
-    incomplete_matches = [m for m in matches if m.get("status") != "COMPLETED"]
+    incomplete_matches = [m for m in matches if m.get("status") not in ["COMPLETED", "FINALIZED"]]
     if incomplete_matches:
-        incomplete_ids = [str(m.get("_id", m.get("id"))) for m in incomplete_matches]
+        incomplete_details = [
+            f"Match #{m.get('match_number', m.get('order', 1))} (ID: {m.get('_id', m.get('id'))}, Status: {m.get('status', 'SCHEDULED')})"
+            for m in incomplete_matches
+        ]
         raise HTTPException(
             status_code=400,
-            detail=f"Cannot finalize round '{round_name}'. {len(incomplete_matches)} match(es) are not yet COMPLETED: {', '.join(incomplete_ids)}",
+            detail=f"Cannot finalize round '{round_name}'. {len(incomplete_matches)} match(es) are not yet COMPLETED: {', '.join(incomplete_details)}",
         )
 
     # 2. Persist confirmed / overridden qualifiers to db.tournament_qualifications

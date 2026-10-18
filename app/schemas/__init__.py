@@ -374,6 +374,12 @@ class TournamentResponse(BaseModel):
     tournament_type: Optional[str] = "Knockout"
     match_format: Optional[str] = "Knockout"
     series_format: Optional[str] = "BO1"
+    registration_type: Optional[str] = "TEAM"
+    is_solo: Optional[bool] = False
+    match_structure: Optional[str] = "KNOCKOUT"
+    competitor_unit: Optional[str] = "Teams"
+    players_per_team: Optional[int] = None
+    room_capacity: Optional[int] = None
     has_live_matches: bool = False
     live_matches_count: int = 0
     live_matches: List[Dict[str, Any]] = []
@@ -516,7 +522,11 @@ class MatchResponse(BaseModel):
     current_round_name: Optional[str] = None
     current_round_number: Optional[int] = None
     encounter_history: Optional[List[Dict[str, Any]]] = None
+    is_solo: Optional[bool] = False
+    participants: Optional[List[Dict[str, Any]]] = None
+    teams_details: Optional[List[Dict[str, Any]]] = None
     model_config = ConfigDict(from_attributes=True, extra="allow")
+
 
 class AdminMatchPairRequest(BaseModel):
     tournament_id: str
@@ -921,15 +931,17 @@ class BattleRoyaleTeamResult(BaseModel):
 class BattleRoyaleSubmitResultsPayload(BaseModel):
     results: Optional[List[BattleRoyaleTeamResult]] = None
     team_results: Optional[List[BattleRoyaleTeamResult]] = None
+    placements: Optional[List[BattleRoyaleTeamResult]] = None
     qualifier_team_ids: Optional[List[str]] = None
     qualifiers_count: Optional[int] = None
     advance_to_next_round: bool = False
     next_round_name: Optional[str] = None
     is_final_round: bool = False
     scoring_matrix: Optional[Dict[str, Any]] = None
+    draft: bool = False
 
     def get_results(self) -> List[BattleRoyaleTeamResult]:
-        return self.team_results or self.results or []
+        return self.placements or self.team_results or self.results or []
 
 class ParticipantRatingItem(BaseModel):
     participant_id: Optional[str] = None

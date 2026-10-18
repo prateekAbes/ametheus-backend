@@ -4,7 +4,7 @@ from pydantic import BaseModel
 from fastapi import APIRouter, Depends, HTTPException, Query
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
-from app.api.deps import get_db, get_current_user, get_current_user_optional
+from app.api.deps import get_db, get_current_user, get_current_user_optional, require_organizer
 from app.models.user import User
 from app.models.match import Match
 from app.models.dispute import Dispute
@@ -519,6 +519,19 @@ async def submit_match_result(
 
     return {"status": "success", "message": "Match result finalized successfully"}
 
+@router.post("/{id}/qualifiers")
+@router.post("/{id}/battle-royale-results")
+async def submit_battle_royale_results_matches_alias(
+    id: str,
+    payload: dict,
+    current_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    from app.api.v1.endpoints.admin import submit_battle_royale_results_admin, BattleRoyaleSubmitResultsPayload
+    p = BattleRoyaleSubmitResultsPayload(**payload)
+    return await submit_battle_royale_results_admin(id=id, payload=p, admin_user=current_user, db=db)
+
+
 @router.post("/{id}/dispute")
 async def create_match_dispute(
     id: str,
@@ -698,7 +711,26 @@ async def is_match_authorized_viewer(current_user: Optional[User], match: dict, 
         if team_doc:
             return True
 
+    # Check tournament registrations for solo or team contender
+    if tourn_id:
+        tid_str = str(tourn_id)
+        valid_uids = [str(current_user.id)]
+        if getattr(current_user, "clerk_user_id", None):
+            valid_uids.append(str(current_user.clerk_user_id))
+        reg_check = await db.tournament_registrations.find_one({
+            "$or": [{"tournament_id": tid_str}, {"tournament_id": match.get("tournament_slug", tid_str)}],
+            "$or": [
+                {"player_id": {"$in": valid_uids}},
+                {"user_id": {"$in": valid_uids}},
+                {"team_id": {"$in": competing_teams}} if competing_teams else {"team_id": "NONE"},
+            ],
+            "payment_status": {"$in": ["PAID", "FREE"]},
+        })
+        if reg_check:
+            return True
+
     return False
+
 
 
 @router.get("/{id}")
@@ -1109,7 +1141,20 @@ async def update_match_details(
     if payload.server_region is not None:
         update_data["server_region"] = payload.server_region
     if payload.status is not None:
-        update_data["status"] = payload.status
+        stat_upper = payload.status.upper()
+        valid_statuses = [
+            "DRAFT", "SCHEDULED", "CHECK_IN_OPEN", "LIVE",
+            "ENDED", "RESULTS_SAVED", "RESULTS_PENDING",
+            "FINALIZED", "COMPLETED", "CANCELLED"
+        ]
+        if stat_upper not in valid_statuses:
+            raise HTTPException(status_code=400, detail=f"Invalid match status: {payload.status}")
+
+        curr_stat = str(match.get("status", "SCHEDULED")).upper()
+        if curr_stat in ["COMPLETED", "FINALIZED"] and stat_upper in ["LIVE", "SCHEDULED", "CHECK_IN_OPEN"]:
+            raise HTTPException(status_code=400, detail="Cannot restart a completed or finalized match.")
+
+        update_data["status"] = stat_upper
     if payload.score_a is not None:
         update_data["score_a"] = payload.score_a
     if payload.score_b is not None:

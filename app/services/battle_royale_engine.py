@@ -50,17 +50,29 @@ def get_battle_royale_specs(
 
     # 3. Check tournament overrides
     if tournament_doc:
+        is_solo = bool(
+            tournament_doc.get("is_solo")
+            or tournament_doc.get("registration_type") == "SOLO"
+            or "solo" in str(tournament_doc.get("format", "")).lower()
+            or "solo" in str(tournament_doc.get("tournament_type", "")).lower()
+            or "1v1" in str(tournament_doc.get("format", "")).lower()
+            or (tournament_doc.get("min_team_size") == 1 and tournament_doc.get("max_team_size") == 1)
+        )
+        if is_solo:
+            base_team_size = 1
+        else:
+            t_players = tournament_doc.get("players_per_team")
+            if t_players and int(t_players) > 0:
+                base_team_size = int(t_players)
+            else:
+                t_min = tournament_doc.get("min_team_size")
+                t_max = tournament_doc.get("max_team_size")
+                if t_min and t_max and t_min == t_max and int(t_min) > 0:
+                    base_team_size = int(t_min)
+
         t_room = tournament_doc.get("room_capacity")
         if t_room and int(t_room) > 0:
             base_room = int(t_room)
-        t_players = tournament_doc.get("players_per_team")
-        if t_players and int(t_players) > 0:
-            base_team_size = int(t_players)
-        else:
-            t_min = tournament_doc.get("min_team_size")
-            t_max = tournament_doc.get("max_team_size")
-            if t_min and t_max and t_min == t_max and int(t_min) > 0:
-                base_team_size = int(t_min)
 
     return max(1, base_room), max(1, base_team_size)
 
@@ -77,7 +89,11 @@ def calculate_battle_royale_parameters(
     """
     active_ppt = max(1, players_per_team)
     max_room = max(1, room_capacity)
-    max_teams_per_match = max(1, math.floor(max_room / active_ppt))
+    if active_ppt > 1 and max_room <= 50:
+        # Tournament room_capacity specifies maximum teams in the lobby (e.g. 25 teams in BGMI/Free Fire)
+        max_teams_per_match = max_room
+    else:
+        max_teams_per_match = max(1, math.floor(max_room / active_ppt))
     
     if actual_registered_teams <= 0:
         required_matches = 0

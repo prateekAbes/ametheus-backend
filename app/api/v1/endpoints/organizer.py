@@ -75,6 +75,11 @@ class TournamentCreatePayload(BaseModel):
     format: str = "Knockout"
     tournament_type: Optional[str] = "Knockout"
     match_format: Optional[str] = "Best of 1"
+    registration_type: Optional[str] = None
+    is_solo: Optional[bool] = None
+    match_structure: Optional[str] = None
+    players_per_team: Optional[int] = None
+    room_capacity: Optional[int] = None
     banner_url: Optional[str] = None
     hero_banner_url: Optional[str] = None
     banner_tablet_url: Optional[str] = None
@@ -107,6 +112,11 @@ class TournamentUpdatePayload(BaseModel):
     format: Optional[str] = None
     tournament_type: Optional[str] = None
     match_format: Optional[str] = None
+    registration_type: Optional[str] = None
+    is_solo: Optional[bool] = None
+    match_structure: Optional[str] = None
+    players_per_team: Optional[int] = None
+    room_capacity: Optional[int] = None
     banner_url: Optional[str] = None
     hero_banner_url: Optional[str] = None
     banner_tablet_url: Optional[str] = None
@@ -178,6 +188,21 @@ def serialize_tournament_response(t: dict, game_obj: Optional[dict], reg_count: 
     comp_fmt = normalize_competition_format(t.get("format") or t.get("tournament_type"))
     series_fmt = normalize_series_format(t.get("series_format") or t.get("match_format"))
 
+    min_s = t.get("min_team_size", 1)
+    max_s = t.get("max_team_size", 5)
+    raw_fmt_str = (str(t.get("format", "")) + " " + str(t.get("match_format", "")) + " " + str(t.get("title", ""))).lower()
+    is_solo = bool(
+        t.get("is_solo")
+        or t.get("registration_type") == "SOLO"
+        or (min_s == 1 and max_s == 1)
+        or "solo" in raw_fmt_str
+        or "1v1" in raw_fmt_str
+    )
+    reg_type = "SOLO" if is_solo else (t.get("registration_type") or "TEAM")
+    comp_structure = "BATTLE_ROYALE" if "battle" in comp_fmt.lower() else ("ROUND_ROBIN" if "robin" in comp_fmt.lower() else "KNOCKOUT")
+    comp_unit = "Players" if is_solo else ("Squads" if comp_structure == "BATTLE_ROYALE" or min_s == 4 else "Teams")
+    unit_label = "Player" if is_solo else ("Squad" if comp_structure == "BATTLE_ROYALE" or min_s == 4 else "Team")
+
     return TournamentResponse(
         id=tid,
         slug=t.get("slug", tid),
@@ -187,7 +212,7 @@ def serialize_tournament_response(t: dict, game_obj: Optional[dict], reg_count: 
         game_name=game_obj["name"] if game_obj else "Game",
         prize_pool=f"₹{prize_inr:,}",
         prize_pool_inr=prize_inr,
-        entry_fee=f"₹{fee_inr} / Team" if fee_inr > 0 else "₹0 / Free",
+        entry_fee=f"₹{fee_inr} / {unit_label}" if fee_inr > 0 else "₹0 / Free",
         entry_fee_inr=fee_inr,
         status=t.get("status", "REGISTRATION_OPEN"),
         expected_start_date=t.get("expected_start_date"),
@@ -197,14 +222,21 @@ def serialize_tournament_response(t: dict, game_obj: Optional[dict], reg_count: 
         roster_lock_time=t.get("roster_lock_time", "TBD"),
         server_region=t.get("server_region", "AWS Mumbai (ap-south-1)"),
         registered_teams=reg_count,
+        confirmed_teams=reg_count,
         max_teams=t.get("max_teams", 16),
-        min_team_size=t.get("min_team_size", 1),
-        max_team_size=t.get("max_team_size", 5),
+        min_team_size=min_s,
+        max_team_size=max_s,
         rank_requirement=t.get("rank_requirement", "Open to All Ranks"),
         format=comp_fmt,
         tournament_type=comp_fmt,
         match_format=comp_fmt,
         series_format=series_fmt,
+        registration_type=reg_type,
+        is_solo=is_solo,
+        match_structure=comp_structure,
+        competitor_unit=comp_unit,
+        players_per_team=t.get("players_per_team") or (1 if is_solo else min_s),
+        room_capacity=t.get("room_capacity"),
         banner_url=t.get("banner_url", ""),
         hero_banner_url=t.get("hero_banner_url"),
         banner_tablet_url=t.get("banner_tablet_url"),
@@ -222,6 +254,7 @@ def serialize_tournament_response(t: dict, game_obj: Optional[dict], reg_count: 
         community_link=t.get("community_link"),
         media_config=t.get("media_config", {}),
     )
+
 
 @router.post("/tournaments", response_model=TournamentResponse, status_code=status.HTTP_201_CREATED)
 async def create_tournament(
@@ -275,6 +308,20 @@ async def create_tournament(
 
     init_status = payload.status or "REGISTRATION_OPEN"
 
+    is_solo = bool(
+        payload.is_solo
+        or payload.registration_type == "SOLO"
+        or (min_size == 1 and max_size == 1)
+        or "solo" in str(payload.format).lower()
+        or "1v1" in str(payload.format).lower()
+    )
+    reg_type = "SOLO" if is_solo else (payload.registration_type or "TEAM")
+    if is_solo:
+        min_size = 1
+        max_size = 1
+
+    comp_structure = "BATTLE_ROYALE" if "battle" in str(payload.format).lower() else ("ROUND_ROBIN" if "robin" in str(payload.format).lower() else "KNOCKOUT")
+
     tourn = Tournament(
         slug=slug,
         game_id=gid,
@@ -293,6 +340,11 @@ async def create_tournament(
         max_teams=payload.max_teams,
         min_team_size=min_size,
         max_team_size=max_size,
+        registration_type=reg_type,
+        is_solo=is_solo,
+        match_structure=comp_structure,
+        players_per_team=payload.players_per_team or (1 if is_solo else min_size),
+        room_capacity=payload.room_capacity,
         rank_requirement=payload.rank_requirement,
         format=normalize_competition_format(payload.format),
         tournament_type=normalize_competition_format(payload.tournament_type or payload.format),
@@ -303,6 +355,7 @@ async def create_tournament(
         banner_tablet_url=banner_tablet,
         banner_mobile_url=banner_mobile,
         logo_url=logo,
+
         badge_color=game.get("accent_color", "#E56A10"),
         description=payload.description,
         rules=payload.rules,
@@ -438,6 +491,22 @@ async def update_tournament(
         if payload.max_team_size < eff_min:
             raise HTTPException(status_code=422, detail="Maximum team size cannot be less than minimum team size")
         update_fields["max_team_size"] = payload.max_team_size
+    if payload.registration_type is not None:
+        update_fields["registration_type"] = payload.registration_type.upper()
+        update_fields["is_solo"] = (payload.registration_type.upper() == "SOLO")
+    if payload.is_solo is not None:
+        update_fields["is_solo"] = payload.is_solo
+        if payload.is_solo:
+            update_fields["registration_type"] = "SOLO"
+            update_fields["min_team_size"] = 1
+            update_fields["max_team_size"] = 1
+    if payload.match_structure is not None:
+        update_fields["match_structure"] = payload.match_structure.upper()
+    if payload.players_per_team is not None:
+        update_fields["players_per_team"] = payload.players_per_team
+    if payload.room_capacity is not None:
+        update_fields["room_capacity"] = payload.room_capacity
+
     if payload.registration_status is not None:
         update_fields["registration_status"] = payload.registration_status.strip().upper()
     if payload.status is not None:
@@ -832,6 +901,7 @@ async def get_my_organized_tournaments(
     return response
 
 @router.post("/tournaments/{id}/generate-bracket")
+@router.post("/tournaments/{id}/generate-brackets")
 async def generate_single_elimination_bracket(
     id: str,
     organizer: User = Depends(require_organizer),

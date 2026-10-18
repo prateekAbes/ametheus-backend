@@ -1,6 +1,6 @@
 import json
 from typing import Optional, List, Any, Dict
-from datetime import datetime
+from datetime import datetime, timezone
 from pydantic import BaseModel, Field
 from app.models.base import generate_uuid, get_utc_now
 
@@ -114,6 +114,10 @@ class Tournament(BaseModel):
     tournament_type: str = "Knockout"
     match_format: str = "Knockout"
     series_format: str = "BO1"  # Strictly "BO1" or "BO3"
+    registration_type: str = "TEAM"  # "SOLO" or "TEAM"
+    is_solo: bool = False
+    match_structure: str = "KNOCKOUT"  # "KNOCKOUT", "BATTLE_ROYALE", "ROUND_ROBIN"
+    game_format: Optional[str] = None
     live_stream_url: Optional[str] = None  # Permanent 1-stream per tournament
     stages: List[TournamentStage] = Field(default_factory=list)
     current_stage_id: Optional[str] = None
@@ -190,18 +194,38 @@ class Tournament(BaseModel):
         else:
             d["status"] = raw_status
 
-        # Competition format: Strictly Knockout, Round Robin, Battle Royale
-        raw_comp_fmt = str(d.get("format") or d.get("tournament_type") or d.get("match_format") or "Knockout").strip()
+        # Competition format / match structure: Strictly Knockout, Round Robin, Battle Royale
+        raw_comp_fmt = str(d.get("format") or d.get("tournament_type") or d.get("match_structure") or d.get("match_format") or "Knockout").strip()
         comp_fmt_lower = raw_comp_fmt.lower()
         if "battle" in comp_fmt_lower or "royale" in comp_fmt_lower:
             norm_comp_fmt = "Battle Royale"
+            d["match_structure"] = "BATTLE_ROYALE"
         elif "robin" in comp_fmt_lower:
             norm_comp_fmt = "Round Robin"
+            d["match_structure"] = "ROUND_ROBIN"
         else:
             norm_comp_fmt = "Knockout"
+            d["match_structure"] = "KNOCKOUT"
         d["format"] = norm_comp_fmt
         d["tournament_type"] = norm_comp_fmt
-        d["match_format"] = norm_comp_fmt
+        if not d.get("match_format"):
+            d["match_format"] = norm_comp_fmt
+
+        # Registration Type: Strictly SOLO or TEAM
+        if "registration_type" not in d:
+            min_s = d.get("min_team_size", 1)
+            max_s = d.get("max_team_size", 5)
+            raw_fmt_str = (str(d.get("format", "")) + " " + str(d.get("match_format", "")) + " " + str(d.get("title", ""))).lower()
+            if d.get("is_solo") or (min_s == 1 and max_s == 1) or "solo" in raw_fmt_str or "1v1" in raw_fmt_str:
+                d["registration_type"] = "SOLO"
+                d["is_solo"] = True
+            else:
+                d["registration_type"] = "TEAM"
+                d["is_solo"] = False
+        else:
+            d["registration_type"] = str(d["registration_type"]).upper()
+            d["is_solo"] = (d["registration_type"] == "SOLO")
+
 
         # Series format: Strictly BO1 or BO3 (BO5, BO2, etc. mapped to BO3)
         raw_s_fmt = str(d.get("series_format") or "").upper().strip()
@@ -232,14 +256,14 @@ class Tournament(BaseModel):
             if not d.get("community_platform"):
                 d["community_platform"] = "WHATSAPP"
 
-        # Parse legacy JSON strings if migrated from SQL
-        for field in ["rules", "schedule", "prizes", "bracket_rounds"]:
-            legacy_field = field.replace("bracket_rounds", "bracket") + "_json"
-            if legacy_field in d and field not in d:
-                try:
-                    d[field] = json.loads(d.pop(legacy_field))
-                except Exception:
-                    d[field] = []
+        # Fallback required fields if missing in legacy or mock documents
+        if not d.get("game_id"):
+            d["game_id"] = "general"
+        if not d.get("starts_at"):
+            d["starts_at"] = datetime.now(timezone.utc).isoformat()
+        if not d.get("roster_lock_time"):
+            d["roster_lock_time"] = datetime.now(timezone.utc).isoformat()
+
         return cls(**d)
 
 class TournamentRegistration(BaseModel):

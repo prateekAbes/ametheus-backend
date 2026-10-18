@@ -122,7 +122,7 @@ async def test_battle_royale_25_teams_select_10_qualifiers_and_advance(mock_db, 
         match_number=1,
         format="Battle Royale",
         series_format="BO1",
-        status="LIVE",
+        status="ENDED",
         room_capacity=60,
         players_per_team=3,
         max_teams=25,
@@ -243,7 +243,7 @@ async def test_battle_royale_idempotency_on_retry(mock_db, make_client):
         round_number=1,
         match_number=1,
         format="Battle Royale",
-        status="LIVE",
+        status="ENDED",
         teams=teams_10,
         team_ids=[t["id"] for t in teams_10],
     ).to_mongo())
@@ -303,7 +303,7 @@ async def test_multi_round_progression_to_final_champion(mock_db, make_client):
         tournament_id=tourn_id,
         round_number=1,
         format="Battle Royale",
-        status="LIVE",
+        status="ENDED",
         teams=t25,
         team_ids=[t["id"] for t in t25],
     ).to_mongo())
@@ -323,7 +323,8 @@ async def test_multi_round_progression_to_final_champion(mock_db, make_client):
     t_live_1 = await mock_db.tournaments.find_one({"_id": tourn_id})
     assert t_live_1["status"] == "LIVE"
 
-    # Advance 3 teams from Round 2
+    # Advance 3 teams from Round 2 (gameplay concludes: marked ENDED)
+    await mock_db.matches.update_one({"_id": m2_id}, {"$set": {"status": "ENDED"}})
     q3 = q10[:3]
     r2_res = await client.post(f"/api/v1/admin/matches/{m2_id}/battle-royale-results", json={
         "qualifier_team_ids": q3,
@@ -343,7 +344,8 @@ async def test_multi_round_progression_to_final_champion(mock_db, make_client):
     t_live_2 = await mock_db.tournaments.find_one({"_id": tourn_id})
     assert t_live_2["status"] == "LIVE"
 
-    # Final Round (Round 3) Finalization
+    # Final Round (Round 3) Finalization (gameplay concludes: marked ENDED)
+    await mock_db.matches.update_one({"_id": m3_id}, {"$set": {"status": "ENDED"}})
     champion_team_id = q3[0]
     final_res = await client.post(f"/api/v1/admin/matches/{m3_id}/battle-royale-results", json={
         "results": [
@@ -468,7 +470,7 @@ async def test_br_authorization_and_validation(mock_db, make_client):
         tournament_id=tourn_id,
         round_number=1,
         format="Battle Royale",
-        status="LIVE",
+        status="ENDED",
         teams=teams,
         team_ids=[t["id"] for t in teams],
     ).to_mongo())

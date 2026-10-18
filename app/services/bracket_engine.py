@@ -128,10 +128,38 @@ async def build_single_elimination_bracket(
                 else:
                     status = "SCHEDULED"
 
+            team_a_name = None
+            team_a_tag = None
+            if team_a_id:
+                t_doc = await db.teams.find_one({"$or": [{"_id": team_a_id}, {"id": team_a_id}]})
+                if t_doc:
+                    team_a_name = t_doc.get("name")
+                    team_a_tag = t_doc.get("tag", "TEAM")
+                else:
+                    u_doc = await db.users.find_one({"$or": [{"_id": team_a_id}, {"id": team_a_id}]})
+                    if u_doc:
+                        team_a_name = u_doc.get("display_name") or u_doc.get("username", "Contender")
+                        team_a_tag = "SOLO"
+
+            team_b_name = None
+            team_b_tag = None
+            if team_b_id:
+                t_doc = await db.teams.find_one({"$or": [{"_id": team_b_id}, {"id": team_b_id}]})
+                if t_doc:
+                    team_b_name = t_doc.get("name")
+                    team_b_tag = t_doc.get("tag", "TEAM")
+                else:
+                    u_doc = await db.users.find_one({"$or": [{"_id": team_b_id}, {"id": team_b_id}]})
+                    if u_doc:
+                        team_b_name = u_doc.get("display_name") or u_doc.get("username", "Contender")
+                        team_b_tag = "SOLO"
+
             lobby_pw = f"AMT-{secrets.token_hex(3).upper()}"
             fmt = resolve_stage_format(tournament, stage_name, r, total_rounds)
 
             match_type = "GRAND_FINAL" if r == total_rounds else ("SEMI_FINAL" if r == total_rounds - 1 else ("QUARTER_FINAL" if r == total_rounds - 2 else "ROUND_OF_16"))
+
+            is_solo_tourn = bool(tournament.is_solo or getattr(tournament, "registration_type", "TEAM") == "SOLO")
 
             db_match = Match(
                 tournament_id=tournament.id,
@@ -145,6 +173,11 @@ async def build_single_elimination_bracket(
                 status=status,
                 team_a_id=team_a_id,
                 team_b_id=team_b_id,
+                team_a_name=team_a_name,
+                team_b_name=team_b_name,
+                team_a_tag=team_a_tag,
+                team_b_tag=team_b_tag,
+                is_solo=is_solo_tourn,
                 winner_team_id=team_a_id if status == "BYE" else None,
                 server_region=tournament.server_region,
                 lobby_code=f"AMETHEUS-{tournament.slug[:6].upper()}-R{r}M{m_idx}",
@@ -772,9 +805,10 @@ async def generate_tournament_bracket(
     type_fmt = (getattr(tournament, "tournament_type", None) or "").lower()
     match_fmt = (getattr(tournament, "match_format", None) or "").lower()
     format_fmt = (getattr(tournament, "format", None) or "").lower()
-    raw_fmt = f"{type_fmt} {match_fmt} {format_fmt}"
+    struct_fmt = (getattr(tournament, "match_structure", None) or "").lower()
+    raw_fmt = f"{type_fmt} {match_fmt} {format_fmt} {struct_fmt}"
 
-    if "battle" in raw_fmt or "royale" in raw_fmt:
+    if "battle" in raw_fmt or "royale" in raw_fmt or struct_fmt == "battle_royale":
         from app.services.battle_royale_engine import (
             get_confirmed_registered_teams,
             get_battle_royale_specs,
@@ -804,6 +838,7 @@ async def generate_tournament_bracket(
             "$or": [{"tournament_id": tournament.id}, {"tournament_id": tournament.slug}]
         })
         bracket_tree = [{"round_number": 1, "round_name": "Round 1", "matches": []}]
+        is_solo_tourn = bool(tournament.is_solo or getattr(tournament, "registration_type", "TEAM") == "SOLO")
         for idx, chunk in enumerate(partitions):
             match_num = idx + 1
             m_id = secrets.token_hex(8)
@@ -825,6 +860,7 @@ async def generate_tournament_bracket(
                 max_teams=calc["max_teams_per_match"],
                 teams=chunk,
                 team_ids=team_ids,
+                is_solo=is_solo_tourn,
                 server_region=tournament.server_region,
             )
             await db.matches.insert_one(db_m.to_mongo())

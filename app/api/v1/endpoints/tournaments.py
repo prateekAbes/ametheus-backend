@@ -7,7 +7,7 @@ from pymongo.errors import DuplicateKeyError
 from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, status
 from motor.motor_asyncio import AsyncIOMotorDatabase
-from app.api.deps import get_db, get_current_user, require_organizer
+from app.api.deps import get_db, get_current_user, get_current_user_optional, require_organizer
 from app.models.user import User
 from app.models.tournament import Tournament, TournamentRegistration
 from app.models.payment import GamePayment
@@ -209,28 +209,35 @@ async def list_tournaments(
         else:
             norm_status = raw_stat
 
-        is_solo_game = bool(game_obj and (not game_obj.get("is_team_game", True) or game_obj.get("slug") == "chess"))
         raw_min = t.get("min_team_size") or t.get("required_team_size")
-        game_min = game_obj.get("min_team_size") if game_obj else None
-        if is_solo_game:
+        raw_max = t.get("max_team_size")
+        raw_fmt = (str(t.get("format", "")) + " " + str(t.get("match_format", "")) + " " + str(t.get("title", ""))).lower()
+        is_solo = bool(
+            t.get("registration_type") == "SOLO"
+            or t.get("is_solo")
+            or (raw_min == 1 and raw_max == 1)
+            or (game_obj and not game_obj.get("is_team_game", True))
+            or (game_obj and game_obj.get("slug") == "chess")
+            or "solo" in raw_fmt
+            or "1v1" in raw_fmt
+        )
+        reg_type = "SOLO" if is_solo else (t.get("registration_type") or "TEAM")
+        if is_solo:
             calc_min_size = 1
+            calc_max_size = 1
         elif raw_min and int(raw_min) > 0:
             calc_min_size = int(raw_min)
-        elif game_min and int(game_min) > 0:
-            calc_min_size = int(game_min)
+            calc_max_size = int(raw_max) if raw_max and int(raw_max) >= calc_min_size else max(calc_min_size, 5)
+        elif game_obj and game_obj.get("min_team_size"):
+            calc_min_size = int(game_obj.get("min_team_size"))
+            calc_max_size = int(game_obj.get("max_team_size", 5))
         else:
             calc_min_size = 1
+            calc_max_size = 5
 
-        raw_max = t.get("max_team_size")
-        game_max = game_obj.get("max_team_size") if game_obj else None
-        if is_solo_game:
-            calc_max_size = 1
-        elif raw_max and int(raw_max) >= calc_min_size:
-            calc_max_size = int(raw_max)
-        elif game_max and int(game_max) >= calc_min_size:
-            calc_max_size = int(game_max)
-        else:
-            calc_max_size = max(calc_min_size, 5)
+        norm_structure = "BATTLE_ROYALE" if "battle" in raw_fmt or "royale" in raw_fmt else ("ROUND_ROBIN" if "robin" in raw_fmt else "KNOCKOUT")
+        comp_unit = "Players" if is_solo else ("Squads" if norm_structure == "BATTLE_ROYALE" or calc_min_size == 4 else "Teams")
+        unit_label = "Player" if is_solo else ("Squad" if norm_structure == "BATTLE_ROYALE" or calc_min_size == 4 else "Team")
 
         response.append(
             TournamentResponse(
@@ -242,7 +249,7 @@ async def list_tournaments(
                 game_name=game_obj["name"] if game_obj else "Valorant",
                 prize_pool=f"₹{prize_inr:,}",
                 prize_pool_inr=prize_inr,
-                entry_fee=f"₹{fee_inr} / Team" if fee_inr > 0 else "₹0 / Free",
+                entry_fee=f"₹{fee_inr} / {unit_label}" if fee_inr > 0 else "₹0 / Free",
                 entry_fee_inr=fee_inr,
                 status=norm_status,
                 has_live_matches=has_live,
@@ -258,10 +265,16 @@ async def list_tournaments(
                 max_teams=max_teams_val,
                 min_team_size=calc_min_size,
                 max_team_size=calc_max_size,
+                registration_type=reg_type,
+                is_solo=is_solo,
+                match_structure=norm_structure,
+                competitor_unit=comp_unit,
+                players_per_team=t.get("players_per_team") or (1 if is_solo else calc_min_size),
+                room_capacity=t.get("room_capacity"),
                 rank_requirement=t.get("rank_requirement", "Open to All Ranks"),
-                format="Battle Royale" if "battle" in str(t.get("format") or "").lower() or "royale" in str(t.get("format") or "").lower() else ("Round Robin" if "robin" in str(t.get("format") or "").lower() else "Knockout"),
-                tournament_type="Battle Royale" if "battle" in str(t.get("tournament_type") or t.get("format") or "").lower() or "royale" in str(t.get("tournament_type") or t.get("format") or "").lower() else ("Round Robin" if "robin" in str(t.get("tournament_type") or t.get("format") or "").lower() else "Knockout"),
-                match_format="Battle Royale" if "battle" in str(t.get("format") or "").lower() or "royale" in str(t.get("format") or "").lower() else ("Round Robin" if "robin" in str(t.get("format") or "").lower() else "Knockout"),
+                format="Battle Royale" if norm_structure == "BATTLE_ROYALE" else ("Round Robin" if norm_structure == "ROUND_ROBIN" else "Knockout"),
+                tournament_type="Battle Royale" if norm_structure == "BATTLE_ROYALE" else ("Round Robin" if norm_structure == "ROUND_ROBIN" else "Knockout"),
+                match_format="Battle Royale" if norm_structure == "BATTLE_ROYALE" else ("Round Robin" if norm_structure == "ROUND_ROBIN" else "Knockout"),
                 series_format="BO3" if "3" in str(t.get("series_format") or "") or "3" in str(t.get("match_format") or "") else "BO1",
                 stage_formats=safe_json_loads(t.get("stage_formats"), {}),
                 registration_deadline=t.get("registration_deadline").isoformat() if isinstance(t.get("registration_deadline"), datetime) else t.get("registration_deadline"),
@@ -478,29 +491,36 @@ async def get_tournament_by_slug(slug: str, db: AsyncIOMotorDatabase = Depends(g
     prize_inr = t.get("prize_pool_inr") or 0
     fee_inr = t.get("entry_fee_inr") or 0
 
-    # Auto-derive min/max team size for solo titles (e.g. Chess) and handle legacy/missing values safely
-    is_solo_game = bool(game_obj and (not game_obj.get("is_team_game", True) or game_obj.get("slug") == "chess"))
+    # Auto-derive min/max team size and format architecture
     raw_min = t.get("min_team_size") or t.get("required_team_size")
-    game_min = game_obj.get("min_team_size") if game_obj else None
-    if is_solo_game:
+    raw_max = t.get("max_team_size")
+    raw_fmt = (str(t.get("format", "")) + " " + str(t.get("match_format", "")) + " " + str(t.get("title", ""))).lower()
+    is_solo = bool(
+        t.get("registration_type") == "SOLO"
+        or t.get("is_solo")
+        or (raw_min == 1 and raw_max == 1)
+        or (game_obj and not game_obj.get("is_team_game", True))
+        or (game_obj and game_obj.get("slug") == "chess")
+        or "solo" in raw_fmt
+        or "1v1" in raw_fmt
+    )
+    reg_type = "SOLO" if is_solo else (t.get("registration_type") or "TEAM")
+    if is_solo:
         min_team_size = 1
+        max_team_size = 1
     elif raw_min and int(raw_min) > 0:
         min_team_size = int(raw_min)
-    elif game_min and int(game_min) > 0:
-        min_team_size = int(game_min)
+        max_team_size = int(raw_max) if raw_max and int(raw_max) >= min_team_size else max(min_team_size, 5)
+    elif game_obj and game_obj.get("min_team_size"):
+        min_team_size = int(game_obj.get("min_team_size"))
+        max_team_size = int(game_obj.get("max_team_size", 5))
     else:
         min_team_size = 1
+        max_team_size = 5
 
-    raw_max = t.get("max_team_size")
-    game_max = game_obj.get("max_team_size") if game_obj else None
-    if is_solo_game:
-        max_team_size = 1
-    elif raw_max and int(raw_max) >= min_team_size:
-        max_team_size = int(raw_max)
-    elif game_max and int(game_max) >= min_team_size:
-        max_team_size = int(game_max)
-    else:
-        max_team_size = max(min_team_size, 5)
+    norm_structure = "BATTLE_ROYALE" if "battle" in raw_fmt or "royale" in raw_fmt else ("ROUND_ROBIN" if "robin" in raw_fmt else "KNOCKOUT")
+    comp_unit = "Players" if is_solo else ("Squads" if norm_structure == "BATTLE_ROYALE" or min_team_size == 4 else "Teams")
+    unit_label = "Player" if is_solo else ("Squad" if norm_structure == "BATTLE_ROYALE" or min_team_size == 4 else "Team")
 
     # 1. Bracket rounds: if empty, auto-assemble from matches
     if not bracket:
@@ -514,27 +534,51 @@ async def get_tournament_by_slug(slug: str, db: AsyncIOMotorDatabase = Depends(g
                 r_num = m.get("round_number", 1)
                 if r_num not in rounds_map:
                     rounds_map[r_num] = []
-                team_a_doc = await db.teams.find_one({"$or": [{"_id": m.get("team_a_id")}, {"id": m.get("team_a_id")}]}) if m.get("team_a_id") else None
-                team_b_doc = await db.teams.find_one({"$or": [{"_id": m.get("team_b_id")}, {"id": m.get("team_b_id")}]}) if m.get("team_b_id") else None
-                rounds_map[r_num].append({
-                    "id": str(m.get("_id", m.get("id"))),
-                    "round": r_num,
-                    "matchNumber": m.get("match_number", len(rounds_map[r_num]) + 1),
-                    "status": m.get("status", "SCHEDULED"),
-                    "scheduledTime": m.get("scheduled_time", "Scheduled Bracket Match"),
-                    "teamA": {
-                        "name": team_a_doc.get("name") if team_a_doc else (m.get("team_a_name") or "TBD (Slot 1)"),
-                        "tag": team_a_doc.get("tag") if team_a_doc else (m.get("team_a_tag") or "TBD"),
-                        "score": m.get("score_a", "-"),
-                        "isWinner": bool(m.get("winner_team_id") and m.get("winner_team_id") == m.get("team_a_id")),
-                    },
-                    "teamB": {
-                        "name": team_b_doc.get("name") if team_b_doc else (m.get("team_b_name") or "TBD (Slot 2)"),
-                        "tag": team_b_doc.get("tag") if team_b_doc else (m.get("team_b_tag") or "TBD"),
-                        "score": m.get("score_b", "-"),
-                        "isWinner": bool(m.get("winner_team_id") and m.get("winner_team_id") == m.get("team_b_id")),
-                    },
-                })
+
+                if norm_structure == "BATTLE_ROYALE" or "battle" in str(m.get("format", "")).lower() or m.get("teams"):
+                    # Multi-participant Battle Royale match
+                    rounds_map[r_num].append({
+                        "id": str(m.get("_id", m.get("id"))),
+                        "round": r_num,
+                        "matchNumber": m.get("match_number", len(rounds_map[r_num]) + 1),
+                        "status": m.get("status", "SCHEDULED"),
+                        "scheduledTime": m.get("scheduled_time", "Scheduled Lobby"),
+                        "format": "Battle Royale",
+                        "teams": m.get("teams", []),
+                        "teams_count": len(m.get("teams", [])),
+                    })
+                else:
+                    team_a_doc = await db.teams.find_one({"$or": [{"_id": m.get("team_a_id")}, {"id": m.get("team_a_id")}]}) if m.get("team_a_id") else None
+                    if not team_a_doc and m.get("team_a_id"):
+                        user_a = await db.users.find_one({"$or": [{"_id": m.get("team_a_id")}, {"id": m.get("team_a_id")}]})
+                        if user_a:
+                            team_a_doc = {"name": user_a.get("display_name") or user_a.get("username", "Contender"), "tag": "SOLO"}
+
+                    team_b_doc = await db.teams.find_one({"$or": [{"_id": m.get("team_b_id")}, {"id": m.get("team_b_id")}]}) if m.get("team_b_id") else None
+                    if not team_b_doc and m.get("team_b_id"):
+                        user_b = await db.users.find_one({"$or": [{"_id": m.get("team_b_id")}, {"id": m.get("team_b_id")}]})
+                        if user_b:
+                            team_b_doc = {"name": user_b.get("display_name") or user_b.get("username", "Contender"), "tag": "SOLO"}
+
+                    rounds_map[r_num].append({
+                        "id": str(m.get("_id", m.get("id"))),
+                        "round": r_num,
+                        "matchNumber": m.get("match_number", len(rounds_map[r_num]) + 1),
+                        "status": m.get("status", "SCHEDULED"),
+                        "scheduledTime": m.get("scheduled_time", "Scheduled Bracket Match"),
+                        "teamA": {
+                            "name": team_a_doc.get("name") if team_a_doc else (m.get("team_a_name") or "TBD (Slot 1)"),
+                            "tag": team_a_doc.get("tag") if team_a_doc else (m.get("team_a_tag") or "TBD"),
+                            "score": m.get("score_a", "-"),
+                            "isWinner": bool(m.get("winner_team_id") and m.get("winner_team_id") == m.get("team_a_id")),
+                        },
+                        "teamB": {
+                            "name": team_b_doc.get("name") if team_b_doc else (m.get("team_b_name") or "TBD (Slot 2)"),
+                            "tag": team_b_doc.get("tag") if team_b_doc else (m.get("team_b_tag") or "TBD"),
+                            "score": m.get("score_b", "-"),
+                            "isWinner": bool(m.get("winner_team_id") and m.get("winner_team_id") == m.get("team_b_id")),
+                        },
+                    })
             bracket = [
                 {"name": f"Round {r}", "matches": matches}
                 for r, matches in sorted(rounds_map.items())
@@ -609,9 +653,15 @@ async def get_tournament_by_slug(slug: str, db: AsyncIOMotorDatabase = Depends(g
         game_name=game_obj["name"] if game_obj else "Valorant",
         prize_pool=f"₹{prize_inr:,}",
         prize_pool_inr=prize_inr,
-        entry_fee=f"₹{fee_inr} / Team" if fee_inr > 0 else "₹0 / Free",
+        entry_fee=f"₹{fee_inr} / {unit_label}" if fee_inr > 0 else "₹0 / Free",
         entry_fee_inr=fee_inr,
         status=norm_status,
+        registration_type=reg_type,
+        is_solo=is_solo,
+        match_structure=norm_structure,
+        competitor_unit=comp_unit,
+        players_per_team=t.get("players_per_team") or (1 if is_solo else (4 if norm_structure == "BATTLE_ROYALE" else min_team_size)),
+        room_capacity=t.get("room_capacity") or (max_teams_val * (1 if is_solo else 4) if norm_structure == "BATTLE_ROYALE" else None),
         has_live_matches=has_live,
         live_matches_count=len(live_matches_list),
         live_matches=live_matches_list,
@@ -629,9 +679,9 @@ async def get_tournament_by_slug(slug: str, db: AsyncIOMotorDatabase = Depends(g
         min_team_size=min_team_size,
         max_team_size=max_team_size,
         rank_requirement=t.get("rank_requirement", "Open to All Ranks"),
-        format="Battle Royale" if "battle" in str(t.get("format") or "").lower() or "royale" in str(t.get("format") or "").lower() else ("Round Robin" if "robin" in str(t.get("format") or "").lower() else "Knockout"),
-        tournament_type="Battle Royale" if "battle" in str(t.get("tournament_type") or t.get("format") or "").lower() or "royale" in str(t.get("tournament_type") or t.get("format") or "").lower() else ("Round Robin" if "robin" in str(t.get("tournament_type") or t.get("format") or "").lower() else "Knockout"),
-        match_format="Battle Royale" if "battle" in str(t.get("format") or "").lower() or "royale" in str(t.get("format") or "").lower() else ("Round Robin" if "robin" in str(t.get("format") or "").lower() else "Knockout"),
+        format="Battle Royale" if norm_structure == "BATTLE_ROYALE" else ("Round Robin" if norm_structure == "ROUND_ROBIN" else "Knockout"),
+        tournament_type="Battle Royale" if norm_structure == "BATTLE_ROYALE" else ("Round Robin" if norm_structure == "ROUND_ROBIN" else "Knockout"),
+        match_format="Battle Royale" if norm_structure == "BATTLE_ROYALE" else ("Round Robin" if norm_structure == "ROUND_ROBIN" else "Knockout"),
         series_format="BO3" if "3" in str(t.get("series_format") or "") or "3" in str(t.get("match_format") or "") else "BO1",
         stage_formats=safe_json_loads(t.get("stage_formats"), {}),
         registration_deadline=t.get("registration_deadline").isoformat() if isinstance(t.get("registration_deadline"), datetime) else t.get("registration_deadline"),
@@ -656,7 +706,11 @@ async def get_tournament_by_slug(slug: str, db: AsyncIOMotorDatabase = Depends(g
     )
 
 @router.get("/{slug}/matches", response_model=List[MatchResponse])
-async def get_tournament_matches(slug: str, db: AsyncIOMotorDatabase = Depends(get_db)):
+async def get_tournament_matches(
+    slug: str,
+    db: AsyncIOMotorDatabase = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional),
+):
     t = await find_tournament_by_id_or_slug(db, slug)
     if not t:
         raise HTTPException(status_code=404, detail="Tournament not found")
@@ -664,19 +718,53 @@ async def get_tournament_matches(slug: str, db: AsyncIOMotorDatabase = Depends(g
     tid = str(t.get("_id", t.get("id")))
     t_slug = t.get("slug", tid)
     matches = await db.matches.find({
-        "$or": [{"tournament_id": tid}, {"tournament_id": t_slug}]
+        "$or": [{"tournament_id": tid}, {"tournament_id": t_slug}],
+        "roster_status": {"$ne": "DRAFT"},
     }).to_list(length=100)
 
     gid = t.get("game_id")
     game = await db.games.find_one({"$or": [{"_id": gid}, {"id": gid}, {"slug": gid}]})
+
+    from app.api.v1.endpoints.matches import is_match_authorized_viewer
+    is_admin_or_organizer = bool(current_user and current_user.role in ["SUPER_ADMIN", "ADMIN", "ORGANIZER"])
 
     response = []
     for m in matches:
         mid = str(m.get("_id", m.get("id")))
         team_a_id = m.get("team_a_id")
         team_b_id = m.get("team_b_id")
+
         team_a = await db.teams.find_one({"$or": [{"_id": team_a_id}, {"id": team_a_id}]}) if team_a_id else None
+        if not team_a and team_a_id:
+            user_a = await db.users.find_one({"$or": [{"_id": team_a_id}, {"id": team_a_id}]})
+            if user_a:
+                team_a = {"name": user_a.get("display_name") or user_a.get("username", "Contender"), "tag": "SOLO"}
+
         team_b = await db.teams.find_one({"$or": [{"_id": team_b_id}, {"id": team_b_id}]}) if team_b_id else None
+        if not team_b and team_b_id:
+            user_b = await db.users.find_one({"$or": [{"_id": team_b_id}, {"id": team_b_id}]})
+            if user_b:
+                team_b = {"name": user_b.get("display_name") or user_b.get("username", "Contender"), "tag": "SOLO"}
+
+        credentials_released = bool(m.get("credentials_released", False))
+        is_auth = await is_match_authorized_viewer(current_user, m, db)
+
+        if is_admin_or_organizer or (credentials_released and is_auth):
+            room_id = m.get("room_id") or m.get("lobby_code")
+            room_password = m.get("room_password") or m.get("lobby_password")
+            lobby_code = m.get("lobby_code") or m.get("room_id")
+            lobby_password = m.get("lobby_password") or m.get("room_password")
+            custom_instructions = m.get("custom_instructions") or m.get("match_message")
+        else:
+            room_id = None
+            room_password = None
+            lobby_code = None
+            lobby_password = None
+            custom_instructions = None
+
+        m_num = int(m.get("match_number") or m.get("order") or 1)
+        r_name = m.get("round_name") or m.get("stage") or "Round 1"
+        r_num = int(m.get("round_number") or 1)
 
         response.append(
             MatchResponse(
@@ -686,14 +774,31 @@ async def get_tournament_matches(slug: str, db: AsyncIOMotorDatabase = Depends(g
                 game_slug=game["slug"] if game else "valorant",
                 game_name=game["name"] if game else "Valorant",
                 stage=m.get("stage", "QUARTER_FINAL"),
+                round_name=r_name,
+                round_number=r_num,
+                match_number=m_num,
                 format=m.get("format", "BO1"),
+                series_format=m.get("series_format", "BO1"),
                 scheduled_time=m.get("scheduled_time", "TBD"),
+                scheduled_date=m.get("scheduled_date"),
                 status=m.get("status", "SCHEDULED"),
                 server_region=m.get("server_region", t.get("server_region", "AWS Mumbai (ap-south-1)")),
-                lobby_code=m.get("lobby_code"),
-                lobby_password=m.get("lobby_password"),
-                team_a={"name": team_a["name"], "tag": team_a["tag"], "score": m.get("score_a", 0)} if team_a else None,
-                team_b={"name": team_b["name"], "tag": team_b["tag"], "score": m.get("score_b", 0)} if team_b else None,
+                lobby_code=lobby_code,
+                lobby_password=lobby_password,
+                room_id=room_id,
+                room_password=room_password,
+                custom_instructions=custom_instructions,
+                credentials_released=credentials_released,
+                teams=m.get("teams", []),
+                team_ids=m.get("team_ids", []),
+                placements=m.get("placements", []),
+                qualifier_team_ids=m.get("qualifier_team_ids", []),
+                qualifiers_count=m.get("qualifiers_count"),
+                is_final_round=bool(m.get("is_final_round", False)),
+                is_solo=bool(m.get("is_solo", t.get("is_solo", False))),
+                check_in_status=m.get("check_in_status", {}),
+                team_a={"name": team_a["name"], "tag": team_a.get("tag", "TEAM"), "score": m.get("score_a", 0)} if team_a else ({"name": m.get("team_a_name"), "tag": m.get("team_a_tag", "TBD"), "score": m.get("score_a", 0)} if m.get("team_a_name") else None),
+                team_b={"name": team_b["name"], "tag": team_b.get("tag", "TEAM"), "score": m.get("score_b", 0)} if team_b else ({"name": m.get("team_b_name"), "tag": m.get("team_b_tag", "TBD"), "score": m.get("score_b", 0)} if m.get("team_b_name") else None),
                 evidence_url=m.get("evidence_url"),
                 dispute_notes=m.get("dispute_notes"),
             )
@@ -777,13 +882,22 @@ async def register_team_for_tournament(
         )
 
     is_solo_game = bool(game_obj and (not game_obj.get("is_team_game", True) or game_obj.get("slug") == "chess"))
+    raw_tourn_fmt = str(tourn.get("format") or tourn.get("tournament_type") or tourn.get("match_format") or "").lower()
+    is_solo_tourn = bool(
+        tourn.get("is_solo")
+        or tourn.get("registration_type") == "SOLO"
+        or is_solo_game
+        or "solo" in raw_tourn_fmt
+        or "1v1" in raw_tourn_fmt
+        or (tourn.get("min_team_size") == 1 and tourn.get("max_team_size") == 1)
+    )
 
     user_game_id = payload.game_id or payload.in_game_id
 
-    if not payload.team_id:
+    if is_solo_tourn or not payload.team_id:
         # Solo player registration without requiring a team
         existing_reg = await db.tournament_registrations.find_one({
-            "tournament_id": tid,
+            "$or": [{"tournament_id": tid}, {"tournament_id": tourn.get("slug")}],
             "player_id": current_user.id,
             "payment_status": {"$nin": ["REJECTED", "CANCELLED", "REFUNDED"]},
         })
@@ -853,11 +967,11 @@ async def register_team_for_tournament(
             "entry_fee_inr": fee_inr,
         }
 
-    # If game is solo, multi-player teams are strictly prohibited
-    if is_solo_game:
+    # If game or tournament is solo, multi-player teams are strictly prohibited
+    if is_solo_tourn or is_solo_game:
         raise HTTPException(
             status_code=400,
-            detail=f"{game_obj.get('name', 'Chess')} is a solo 1v1 discipline. Team registration is not permitted. Please register as an individual contender.",
+            detail=f"{tourn.get('title', 'This competition')} is a solo discipline. Team registration is not permitted. Please register as an individual contender.",
         )
 
     # 3. Team check
@@ -1257,13 +1371,27 @@ async def register_tournament_direct_upi(
         )
 
     is_solo_game = bool(game_obj and (not game_obj.get("is_team_game", True) or game_obj.get("slug") == "chess"))
+    raw_tourn_fmt = str(tourn.get("format") or tourn.get("tournament_type") or tourn.get("match_format") or "").lower()
+    is_solo_tourn = bool(
+        tourn.get("is_solo")
+        or tourn.get("registration_type") == "SOLO"
+        or is_solo_game
+        or "solo" in raw_tourn_fmt
+        or "1v1" in raw_tourn_fmt
+        or (tourn.get("min_team_size") == 1 and tourn.get("max_team_size") == 1)
+    )
+
+    if is_solo_tourn and payload.team_id:
+        raise HTTPException(status_code=400, detail="This is a solo competition. Individual player registration is required.")
+    if not is_solo_tourn and not payload.team_id:
+        raise HTTPException(status_code=400, detail="Team selection is required for team tournaments.")
 
     team_id = None
     team_name = None
 
     if payload.team_id:
-        if is_solo_game:
-            raise HTTPException(status_code=400, detail=f"{game_obj.get('name', 'Chess')} is a solo 1v1 discipline.")
+        if is_solo_game or is_solo_tourn:
+            raise HTTPException(status_code=400, detail="This is a solo competition. Individual player registration is required.")
         team = await db.teams.find_one({"$or": [{"_id": payload.team_id}, {"id": payload.team_id}]})
         if not team:
             raise HTTPException(status_code=404, detail="Team not found")

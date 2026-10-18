@@ -46,6 +46,8 @@ class Match(BaseModel):
     check_in_status: dict[str, bool] = Field(default_factory=lambda: {"team_a": False, "team_b": False})
     teams: list[dict] = Field(default_factory=list)  # For Battle Royale / multi-team matches
     team_ids: list[str] = Field(default_factory=list)  # IDs of participating teams in this match lobby
+    participants: list[dict] = Field(default_factory=list)  # For solo competitors or individual rosters
+    is_solo: bool = False
     room_capacity: Optional[int] = None
     players_per_team: Optional[int] = None
     max_teams: Optional[int] = None
