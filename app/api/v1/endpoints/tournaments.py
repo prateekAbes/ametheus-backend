@@ -236,8 +236,21 @@ async def list_tournaments(
             calc_max_size = 5
 
         norm_structure = "BATTLE_ROYALE" if "battle" in raw_fmt or "royale" in raw_fmt else ("ROUND_ROBIN" if "robin" in raw_fmt else "KNOCKOUT")
-        comp_unit = "Players" if is_solo else ("Squads" if norm_structure == "BATTLE_ROYALE" or calc_min_size == 4 else "Teams")
-        unit_label = "Player" if is_solo else ("Squad" if norm_structure == "BATTLE_ROYALE" or calc_min_size == 4 else "Team")
+        raw_p_mode = t.get("participation_mode")
+        if not raw_p_mode:
+            if is_solo:
+                part_mode = "SOLO"
+            elif t.get("players_per_team") == 2 or (calc_min_size == 2 and calc_max_size == 2) or "duo" in raw_fmt:
+                part_mode = "DUO"
+            else:
+                part_mode = "SQUAD"
+        else:
+            norm_p = str(raw_p_mode).upper().strip()
+            part_mode = norm_p if norm_p in {"SOLO", "DUO", "SQUAD"} else "SQUAD"
+
+        cap_label = "Max Players" if part_mode == "SOLO" else "Max Teams"
+        comp_unit = "Players" if is_solo else ("Duos" if part_mode == "DUO" else ("Squads" if norm_structure == "BATTLE_ROYALE" or calc_min_size == 4 else "Teams"))
+        unit_label = "Player" if is_solo else ("Team" if part_mode == "DUO" else ("Squad" if norm_structure == "BATTLE_ROYALE" or calc_min_size == 4 else "Team"))
 
         response.append(
             TournamentResponse(
@@ -256,16 +269,18 @@ async def list_tournaments(
                 live_matches_count=len(live_matches_list),
                 live_matches=live_matches_list,
                 starts_at=t.get("starts_at", "TBD"),
-                roster_lock_time=t.get("roster_lock_time", "TBD"),
+                roster_lock_time=None,
                 server_region=t.get("server_region", "AWS Mumbai (ap-south-1)"),
                 registered_teams=reg_count,
                 confirmed_teams=reg_count,
                 reserved_teams=reserved_count,
                 available_slots=avail_slots,
                 max_teams=max_teams_val,
+                capacity_label=cap_label,
                 min_team_size=calc_min_size,
                 max_team_size=calc_max_size,
                 registration_type=reg_type,
+                participation_mode=part_mode,
                 is_solo=is_solo,
                 match_structure=norm_structure,
                 competitor_unit=comp_unit,
@@ -519,8 +534,21 @@ async def get_tournament_by_slug(slug: str, db: AsyncIOMotorDatabase = Depends(g
         max_team_size = 5
 
     norm_structure = "BATTLE_ROYALE" if "battle" in raw_fmt or "royale" in raw_fmt else ("ROUND_ROBIN" if "robin" in raw_fmt else "KNOCKOUT")
-    comp_unit = "Players" if is_solo else ("Squads" if norm_structure == "BATTLE_ROYALE" or min_team_size == 4 else "Teams")
-    unit_label = "Player" if is_solo else ("Squad" if norm_structure == "BATTLE_ROYALE" or min_team_size == 4 else "Team")
+    raw_p_mode = t.get("participation_mode")
+    if not raw_p_mode:
+        if is_solo:
+            part_mode = "SOLO"
+        elif t.get("players_per_team") == 2 or (min_team_size == 2 and max_team_size == 2) or "duo" in raw_fmt:
+            part_mode = "DUO"
+        else:
+            part_mode = "SQUAD"
+    else:
+        norm_p = str(raw_p_mode).upper().strip()
+        part_mode = norm_p if norm_p in {"SOLO", "DUO", "SQUAD"} else "SQUAD"
+
+    cap_label = "Max Players" if part_mode == "SOLO" else "Max Teams"
+    comp_unit = "Players" if is_solo else ("Duos" if part_mode == "DUO" else ("Squads" if norm_structure == "BATTLE_ROYALE" or min_team_size == 4 else "Teams"))
+    unit_label = "Player" if is_solo else ("Team" if part_mode == "DUO" else ("Squad" if norm_structure == "BATTLE_ROYALE" or min_team_size == 4 else "Team"))
 
     # 1. Bracket rounds: if empty, auto-assemble from matches
     if not bracket:
@@ -669,13 +697,14 @@ async def get_tournament_by_slug(slug: str, db: AsyncIOMotorDatabase = Depends(g
         registration_open_date=t.get("registration_open_date"),
         announcement_text=t.get("announcement_text"),
         starts_at=t.get("starts_at", "TBD"),
-        roster_lock_time=t.get("roster_lock_time", "TBD"),
+        roster_lock_time=None,
         server_region=t.get("server_region", "AWS Mumbai (ap-south-1)"),
         registered_teams=reg_count,
         confirmed_teams=reg_count,
         reserved_teams=reserved_count,
         available_slots=avail_slots,
         max_teams=max_teams_val,
+        capacity_label=cap_label,
         min_team_size=min_team_size,
         max_team_size=max_team_size,
         rank_requirement=t.get("rank_requirement", "Open to All Ranks"),
@@ -684,6 +713,7 @@ async def get_tournament_by_slug(slug: str, db: AsyncIOMotorDatabase = Depends(g
         match_format="Battle Royale" if norm_structure == "BATTLE_ROYALE" else ("Round Robin" if norm_structure == "ROUND_ROBIN" else "Knockout"),
         series_format="BO3" if "3" in str(t.get("series_format") or "") or "3" in str(t.get("match_format") or "") else "BO1",
         stage_formats=safe_json_loads(t.get("stage_formats"), {}),
+        participation_mode=part_mode,
         registration_deadline=t.get("registration_deadline").isoformat() if isinstance(t.get("registration_deadline"), datetime) else t.get("registration_deadline"),
         check_in_window_minutes=t.get("check_in_window_minutes", 15),
         banner_url=t.get("banner_url") or "",

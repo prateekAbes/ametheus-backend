@@ -1,6 +1,6 @@
 from typing import Optional, List, Dict, Any
 from datetime import datetime
-from pydantic import BaseModel, Field, ConfigDict, model_validator
+from pydantic import BaseModel, Field, ConfigDict, model_validator, field_validator
 
 # User
 class UserBase(BaseModel):
@@ -65,11 +65,13 @@ class GameResponse(BaseModel):
     category: str
     genre_id: Optional[str] = None
     genre_name: Optional[str] = None
+    genre: Optional[str] = None
     platform: str
     tag: str
     is_team_game: bool
-    min_team_size: int
-    max_team_size: int
+    supported_game_modes: List[str] = ["SQUAD"]
+    min_team_size: Optional[int] = 1
+    max_team_size: Optional[int] = 5
     max_substitutes: int = 1
     entry_fee_inr: int = 0
     prize_pool_inr: int = 0
@@ -101,11 +103,13 @@ class GameCreate(BaseModel):
     category: str
     genre_id: Optional[str] = None
     genre_name: Optional[str] = None
+    genre: Optional[str] = None
     platform: str
     tag: str
     is_team_game: bool = True
-    min_team_size: int = 1
-    max_team_size: int = 5
+    supported_game_modes: List[str] = Field(default_factory=lambda: ["SQUAD"])
+    min_team_size: Optional[int] = 1
+    max_team_size: Optional[int] = 5
     max_substitutes: int = 1
     entry_fee_inr: int = 0
     prize_pool_inr: int = 0
@@ -129,14 +133,35 @@ class GameCreate(BaseModel):
     gallery: Optional[List[Dict[str, Any]]] = None
     media_config: Optional[Dict[str, Any]] = None
 
+    @field_validator("supported_game_modes", mode="before")
+    @classmethod
+    def validate_create_supported_modes(cls, v):
+        if isinstance(v, str):
+            v = [v]
+        if not v or not isinstance(v, list):
+            raise ValueError("Supported game modes cannot be empty")
+        norm = [str(x).upper().strip() for x in v if str(x).strip()]
+        invalid = [x for x in norm if x not in {"SOLO", "DUO", "SQUAD"}]
+        if invalid:
+            raise ValueError(f"Invalid game mode(s): {', '.join(invalid)}. Allowed modes: Solo, Duo, Squad")
+        res = []
+        for m in norm:
+            if m not in res:
+                res.append(m)
+        if not res:
+            raise ValueError("At least one valid supported game mode (Solo, Duo, Squad) must be selected")
+        return res
+
 class GameUpdate(BaseModel):
     name: Optional[str] = None
     category: Optional[str] = None
     genre_id: Optional[str] = None
     genre_name: Optional[str] = None
+    genre: Optional[str] = None
     platform: Optional[str] = None
     tag: Optional[str] = None
     is_team_game: Optional[bool] = None
+    supported_game_modes: Optional[List[str]] = None
     min_team_size: Optional[int] = None
     max_team_size: Optional[int] = None
     max_substitutes: Optional[int] = None
@@ -161,6 +186,27 @@ class GameUpdate(BaseModel):
     hero_media_enabled: Optional[bool] = None
     gallery: Optional[List[Dict[str, Any]]] = None
     media_config: Optional[Dict[str, Any]] = None
+
+    @field_validator("supported_game_modes", mode="before")
+    @classmethod
+    def validate_update_supported_modes(cls, v):
+        if v is None:
+            return None
+        if isinstance(v, str):
+            v = [v]
+        if not isinstance(v, list) or len(v) == 0:
+            raise ValueError("Supported game modes cannot be empty")
+        norm = [str(x).upper().strip() for x in v if str(x).strip()]
+        invalid = [x for x in norm if x not in {"SOLO", "DUO", "SQUAD"}]
+        if invalid:
+            raise ValueError(f"Invalid game mode(s): {', '.join(invalid)}. Allowed modes: Solo, Duo, Squad")
+        res = []
+        for m in norm:
+            if m not in res:
+                res.append(m)
+        if not res:
+            raise ValueError("At least one valid supported game mode (Solo, Duo, Squad) must be selected")
+        return res
 
 # Team
 class TeamMemberResponse(BaseModel):
@@ -360,13 +406,14 @@ class TournamentResponse(BaseModel):
     registration_open_date: Optional[str] = None
     announcement_text: Optional[str] = None
     starts_at: Optional[str] = "TBD"
-    roster_lock_time: Optional[str] = "TBD"
+    roster_lock_time: Optional[str] = None
     server_region: Optional[str] = "AWS Mumbai (ap-south-1)"
     registered_teams: Optional[int] = 0
     confirmed_teams: Optional[int] = 0
     reserved_teams: Optional[int] = 0
     available_slots: Optional[int] = 16
     max_teams: Optional[int] = 16
+    capacity_label: Optional[str] = "Max Teams"
     min_team_size: Optional[int] = 1
     max_team_size: Optional[int] = 5
     rank_requirement: Optional[str] = "Open to All Ranks"
@@ -375,6 +422,7 @@ class TournamentResponse(BaseModel):
     match_format: Optional[str] = "Knockout"
     series_format: Optional[str] = "BO1"
     registration_type: Optional[str] = "TEAM"
+    participation_mode: Optional[str] = "SQUAD"
     is_solo: Optional[bool] = False
     match_structure: Optional[str] = "KNOCKOUT"
     competitor_unit: Optional[str] = "Teams"

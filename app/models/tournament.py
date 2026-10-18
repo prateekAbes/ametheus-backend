@@ -102,7 +102,8 @@ class Tournament(BaseModel):
     registration_open_date: Optional[str] = None
     announcement_text: Optional[str] = None
     starts_at: str
-    roster_lock_time: str
+    roster_lock_time: Optional[str] = None
+    participation_mode: str = "SQUAD"  # "SOLO", "DUO", "SQUAD"
     server_region: str = "AWS Mumbai (ap-south-1)"
     max_teams: int = 16
     min_team_size: int = 1
@@ -211,20 +212,24 @@ class Tournament(BaseModel):
         if not d.get("match_format"):
             d["match_format"] = norm_comp_fmt
 
-        # Registration Type: Strictly SOLO or TEAM
-        if "registration_type" not in d:
+        # Participation Mode: Strictly SOLO, DUO, or SQUAD
+        raw_mode = d.get("participation_mode")
+        if not raw_mode:
             min_s = d.get("min_team_size", 1)
             max_s = d.get("max_team_size", 5)
             raw_fmt_str = (str(d.get("format", "")) + " " + str(d.get("match_format", "")) + " " + str(d.get("title", ""))).lower()
-            if d.get("is_solo") or (min_s == 1 and max_s == 1) or "solo" in raw_fmt_str or "1v1" in raw_fmt_str:
-                d["registration_type"] = "SOLO"
-                d["is_solo"] = True
+            if d.get("is_solo") or d.get("registration_type") == "SOLO" or (min_s == 1 and max_s == 1) or "solo" in raw_fmt_str or "1v1" in raw_fmt_str:
+                d["participation_mode"] = "SOLO"
+            elif d.get("players_per_team") == 2 or (min_s == 2 and max_s == 2) or "duo" in raw_fmt_str:
+                d["participation_mode"] = "DUO"
             else:
-                d["registration_type"] = "TEAM"
-                d["is_solo"] = False
+                d["participation_mode"] = "SQUAD"
         else:
-            d["registration_type"] = str(d["registration_type"]).upper()
-            d["is_solo"] = (d["registration_type"] == "SOLO")
+            norm_mode = str(raw_mode).upper().strip()
+            d["participation_mode"] = norm_mode if norm_mode in {"SOLO", "DUO", "SQUAD"} else "SQUAD"
+
+        d["is_solo"] = (d["participation_mode"] == "SOLO")
+        d["registration_type"] = "SOLO" if d["is_solo"] else "TEAM"
 
 
         # Series format: Strictly BO1 or BO3 (BO5, BO2, etc. mapped to BO3)
@@ -261,8 +266,6 @@ class Tournament(BaseModel):
             d["game_id"] = "general"
         if not d.get("starts_at"):
             d["starts_at"] = datetime.now(timezone.utc).isoformat()
-        if not d.get("roster_lock_time"):
-            d["roster_lock_time"] = datetime.now(timezone.utc).isoformat()
 
         return cls(**d)
 

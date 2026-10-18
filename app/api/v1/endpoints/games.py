@@ -43,6 +43,7 @@ DEFAULT_GAMES = [
         "platform": "Mobile (Android / iOS)",
         "tag": "BGMI",
         "is_team_game": True,
+        "supported_game_modes": ["SOLO", "DUO", "SQUAD"],
         "min_team_size": 4,
         "max_team_size": 4,
         "max_substitutes": 1,
@@ -62,6 +63,7 @@ DEFAULT_GAMES = [
         "platform": "PC",
         "tag": "VALORANT",
         "is_team_game": True,
+        "supported_game_modes": ["SQUAD"],
         "min_team_size": 5,
         "max_team_size": 5,
         "max_substitutes": 1,
@@ -81,6 +83,7 @@ DEFAULT_GAMES = [
         "platform": "Mobile (Android / iOS)",
         "tag": "FF MAX",
         "is_team_game": True,
+        "supported_game_modes": ["SOLO", "DUO", "SQUAD"],
         "min_team_size": 4,
         "max_team_size": 4,
         "max_substitutes": 1,
@@ -100,6 +103,7 @@ DEFAULT_GAMES = [
         "platform": "Mobile (Android / iOS)",
         "tag": "CODM",
         "is_team_game": True,
+        "supported_game_modes": ["SOLO", "SQUAD"],
         "min_team_size": 5,
         "max_team_size": 5,
         "max_substitutes": 1,
@@ -119,6 +123,7 @@ DEFAULT_GAMES = [
         "platform": "Cross-Platform",
         "tag": "CHESS",
         "is_team_game": False,
+        "supported_game_modes": ["SOLO"],
         "min_team_size": 1,
         "max_team_size": 1,
         "max_substitutes": 0,
@@ -139,6 +144,7 @@ DEFAULT_GAMES = [
         "platform": "PC",
         "tag": "CS2",
         "is_team_game": True,
+        "supported_game_modes": ["SQUAD"],
         "min_team_size": 5,
         "max_team_size": 5,
         "max_substitutes": 1,
@@ -160,6 +166,7 @@ DEFAULT_GAMES = [
         "platform": "Cross-Platform",
         "tag": "RL",
         "is_team_game": True,
+        "supported_game_modes": ["DUO", "SQUAD"],
         "min_team_size": 3,
         "max_team_size": 3,
         "max_substitutes": 1,
@@ -181,6 +188,7 @@ DEFAULT_GAMES = [
         "platform": "Mobile (Android / iOS)",
         "tag": "CR",
         "is_team_game": False,
+        "supported_game_modes": ["SOLO", "DUO"],
         "min_team_size": 1,
         "max_team_size": 1,
         "max_substitutes": 0,
@@ -202,6 +210,7 @@ DEFAULT_GAMES = [
         "platform": "Mobile (Android / iOS)",
         "tag": "BS",
         "is_team_game": True,
+        "supported_game_modes": ["SOLO", "DUO", "SQUAD"],
         "min_team_size": 3,
         "max_team_size": 3,
         "max_substitutes": 1,
@@ -223,6 +232,7 @@ DEFAULT_GAMES = [
         "platform": "PC",
         "tag": "LOL",
         "is_team_game": True,
+        "supported_game_modes": ["SQUAD"],
         "min_team_size": 5,
         "max_team_size": 5,
         "max_substitutes": 1,
@@ -244,6 +254,7 @@ DEFAULT_GAMES = [
         "platform": "Cross-Platform",
         "tag": "SMASH",
         "is_team_game": False,
+        "supported_game_modes": ["SOLO", "DUO", "SQUAD"],
         "min_team_size": 1,
         "max_team_size": 1,
         "max_substitutes": 0,
@@ -265,6 +276,7 @@ DEFAULT_GAMES = [
         "platform": "Mobile (Android / iOS)",
         "tag": "MILITIA",
         "is_team_game": True,
+        "supported_game_modes": ["DUO", "SQUAD"],
         "min_team_size": 3,
         "max_team_size": 3,
         "max_substitutes": 1,
@@ -286,6 +298,7 @@ DEFAULT_GAMES = [
         "platform": "PC",
         "tag": "BLADES",
         "is_team_game": False,
+        "supported_game_modes": ["SOLO"],
         "min_team_size": 1,
         "max_team_size": 1,
         "max_substitutes": 0,
@@ -313,6 +326,21 @@ async def seed_games_if_needed(db: AsyncIOMotorDatabase):
                     mongo_doc["genre_id"] = str(genre_match.get("_id", genre_match.get("id")))
                     mongo_doc["genre_name"] = genre_match.get("name")
             await db.games.insert_one(mongo_doc)
+    else:
+        # Non-destructive backfill for existing games in database lacking supported_game_modes
+        existing_without_modes = await db.games.find({"supported_game_modes": {"$exists": False}}).to_list(length=200)
+        for eg in existing_without_modes:
+            min_s = eg.get("min_team_size", 1)
+            max_s = eg.get("max_team_size", 5)
+            is_team = eg.get("is_team_game", True)
+            cat = str(eg.get("category", "")).lower()
+            if not is_team or (min_s == 1 and max_s == 1):
+                s_modes = ["SOLO"]
+            elif "battle-royale" in cat or "br" in cat:
+                s_modes = ["SOLO", "DUO", "SQUAD"]
+            else:
+                s_modes = ["SQUAD"]
+            await db.games.update_one({"_id": eg["_id"]}, {"$set": {"supported_game_modes": s_modes}})
 
 def normalize_category_slug(category: Optional[str]) -> str:
     if not category:
@@ -342,6 +370,23 @@ def serialize_game_doc(g: dict, teams_count: int = 0) -> GameResponse:
     poster = g.get("poster_url") or ""
     if "aida-public" in poster:
         poster = ""
+    supported_modes = g.get("supported_game_modes")
+    if not supported_modes:
+        min_s = g.get("min_team_size", 1)
+        max_s = g.get("max_team_size", 5)
+        is_team = g.get("is_team_game", True)
+        cat = str(g.get("category", "")).lower()
+        if not is_team or (min_s == 1 and max_s == 1):
+            supported_modes = ["SOLO"]
+        elif "battle-royale" in cat or "br" in cat:
+            supported_modes = ["SOLO", "DUO", "SQUAD"]
+        else:
+            supported_modes = ["SQUAD"]
+    else:
+        supported_modes = [str(m).upper().strip() for m in supported_modes if str(m).upper().strip() in {"SOLO", "DUO", "SQUAD"}]
+        if not supported_modes:
+            supported_modes = ["SQUAD"]
+
     return GameResponse(
         id=gid,
         slug=g["slug"],
@@ -350,6 +395,7 @@ def serialize_game_doc(g: dict, teams_count: int = 0) -> GameResponse:
         platform=g.get("platform", "PC"),
         tag=g.get("tag", "ESPORTS"),
         is_team_game=g.get("is_team_game", True),
+        supported_game_modes=supported_modes,
         min_team_size=g.get("min_team_size", 1),
         max_team_size=g.get("max_team_size", 5),
         max_substitutes=g.get("max_substitutes", 1),
@@ -376,6 +422,7 @@ def serialize_game_doc(g: dict, teams_count: int = 0) -> GameResponse:
         teams_count=teams_count,
         genre_id=g.get("genre_id"),
         genre_name=g.get("genre_name"),
+        genre=g.get("genre") or g.get("genre_name"),
         media_config=g.get("media_config", {}),
     )
 
@@ -436,7 +483,7 @@ async def create_game(
             detail=f"Game with slug '{payload.slug}' already exists",
         )
 
-    g_name = payload.genre_name
+    g_name = payload.genre_name or payload.genre
     if payload.genre_id and not g_name:
         genre_doc = await db.genres.find_one({"$or": [{"_id": payload.genre_id}, {"id": payload.genre_id}, {"slug": payload.genre_id}]})
         if genre_doc:
@@ -451,6 +498,7 @@ async def create_game(
         platform=payload.platform,
         tag=payload.tag,
         is_team_game=payload.is_team_game,
+        supported_game_modes=payload.supported_game_modes,
         min_team_size=payload.min_team_size,
         max_team_size=payload.max_team_size,
         max_substitutes=payload.max_substitutes,
@@ -518,6 +566,8 @@ async def update_game(
             genre_doc = await db.genres.find_one({"$or": [{"_id": update_data["genre_id"]}, {"id": update_data["genre_id"]}, {"slug": update_data["genre_id"]}]})
             if genre_doc:
                 update_data["genre_name"] = genre_doc.get("name")
+    if "genre" in update_data and update_data["genre"] is not None and not update_data.get("genre_name"):
+        update_data["genre_name"] = update_data["genre"]
 
     # Sync canonical artwork slots from media_config when provided
     if "media_config" in fields_set:

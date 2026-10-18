@@ -61,12 +61,15 @@ class TournamentCreatePayload(BaseModel):
     slug: Optional[str] = None
     prize_pool_inr: int = 0
     entry_fee_inr: int = 0
-    starts_at: str
-    roster_lock_time: str
+    starts_at: Optional[str] = None
+    start_date: Optional[str] = None
+    start_time: Optional[str] = None
+    roster_lock_time: Optional[str] = None
+    participation_mode: Optional[str] = None  # "SOLO", "DUO", "SQUAD"
     server_region: str = "AWS Mumbai (ap-south-1)"
-    max_teams: int = 16
-    min_team_size: Optional[int] = 1
-    max_team_size: Optional[int] = 5
+    max_teams: int = 16  # Dynamic Capacity: Max Players if Solo, Max Teams if Duo/Squad
+    min_team_size: Optional[int] = None
+    max_team_size: Optional[int] = None
     status: Optional[str] = "REGISTRATION_OPEN"
     expected_start_date: Optional[str] = None
     registration_open_date: Optional[str] = None
@@ -100,7 +103,10 @@ class TournamentUpdatePayload(BaseModel):
     prize_pool_inr: Optional[int] = None
     entry_fee_inr: Optional[int] = None
     starts_at: Optional[str] = None
+    start_date: Optional[str] = None
+    start_time: Optional[str] = None
     roster_lock_time: Optional[str] = None
+    participation_mode: Optional[str] = None  # "SOLO", "DUO", "SQUAD"
     server_region: Optional[str] = None
     max_teams: Optional[int] = None
     min_team_size: Optional[int] = None
@@ -191,17 +197,25 @@ def serialize_tournament_response(t: dict, game_obj: Optional[dict], reg_count: 
     min_s = t.get("min_team_size", 1)
     max_s = t.get("max_team_size", 5)
     raw_fmt_str = (str(t.get("format", "")) + " " + str(t.get("match_format", "")) + " " + str(t.get("title", ""))).lower()
-    is_solo = bool(
-        t.get("is_solo")
-        or t.get("registration_type") == "SOLO"
-        or (min_s == 1 and max_s == 1)
-        or "solo" in raw_fmt_str
-        or "1v1" in raw_fmt_str
-    )
+    raw_p_mode = t.get("participation_mode")
+    if not raw_p_mode:
+        if t.get("is_solo") or t.get("registration_type") == "SOLO" or (min_s == 1 and max_s == 1) or "solo" in raw_fmt_str or "1v1" in raw_fmt_str:
+            part_mode = "SOLO"
+        elif t.get("players_per_team") == 2 or (min_s == 2 and max_s == 2) or "duo" in raw_fmt_str:
+            part_mode = "DUO"
+        else:
+            part_mode = "SQUAD"
+    else:
+        norm_m = str(raw_p_mode).upper().strip()
+        part_mode = norm_m if norm_m in {"SOLO", "DUO", "SQUAD"} else "SQUAD"
+
+    is_solo = (part_mode == "SOLO")
+    is_duo = (part_mode == "DUO")
     reg_type = "SOLO" if is_solo else (t.get("registration_type") or "TEAM")
     comp_structure = "BATTLE_ROYALE" if "battle" in comp_fmt.lower() else ("ROUND_ROBIN" if "robin" in comp_fmt.lower() else "KNOCKOUT")
-    comp_unit = "Players" if is_solo else ("Squads" if comp_structure == "BATTLE_ROYALE" or min_s == 4 else "Teams")
-    unit_label = "Player" if is_solo else ("Squad" if comp_structure == "BATTLE_ROYALE" or min_s == 4 else "Team")
+    cap_label = "Max Players" if is_solo else "Max Teams"
+    comp_unit = "Players" if is_solo else ("Duos" if is_duo else ("Squads" if comp_structure == "BATTLE_ROYALE" or min_s == 4 else "Teams"))
+    unit_label = "Player" if is_solo else ("Team" if is_duo else ("Squad" if comp_structure == "BATTLE_ROYALE" or min_s == 4 else "Team"))
 
     return TournamentResponse(
         id=tid,
@@ -219,11 +233,12 @@ def serialize_tournament_response(t: dict, game_obj: Optional[dict], reg_count: 
         registration_open_date=t.get("registration_open_date"),
         announcement_text=t.get("announcement_text"),
         starts_at=t.get("starts_at", "TBD"),
-        roster_lock_time=t.get("roster_lock_time", "TBD"),
+        roster_lock_time=None,
         server_region=t.get("server_region", "AWS Mumbai (ap-south-1)"),
         registered_teams=reg_count,
         confirmed_teams=reg_count,
         max_teams=t.get("max_teams", 16),
+        capacity_label=cap_label,
         min_team_size=min_s,
         max_team_size=max_s,
         rank_requirement=t.get("rank_requirement", "Open to All Ranks"),
@@ -232,10 +247,11 @@ def serialize_tournament_response(t: dict, game_obj: Optional[dict], reg_count: 
         match_format=comp_fmt,
         series_format=series_fmt,
         registration_type=reg_type,
+        participation_mode=part_mode,
         is_solo=is_solo,
         match_structure=comp_structure,
         competitor_unit=comp_unit,
-        players_per_team=t.get("players_per_team") or (1 if is_solo else min_s),
+        players_per_team=t.get("players_per_team") or (1 if is_solo else (2 if is_duo else min_s)),
         room_capacity=t.get("room_capacity"),
         banner_url=t.get("banner_url", ""),
         hero_banner_url=t.get("hero_banner_url"),
@@ -267,34 +283,91 @@ async def create_tournament(
     """
     if not payload.title or not payload.title.strip():
         raise HTTPException(status_code=422, detail="Tournament title cannot be empty")
-
-    min_size = payload.min_team_size or 1
-    max_size = payload.max_team_size or 5
-    if min_size < 1:
-        raise HTTPException(status_code=422, detail="Minimum team size must be at least 1")
-    if max_size < min_size:
-        raise HTTPException(status_code=422, detail="Maximum team size cannot be less than minimum team size")
-    if payload.max_teams < 2:
-        raise HTTPException(status_code=422, detail="Maximum teams must be at least 2")
     if payload.prize_pool_inr < 0:
         raise HTTPException(status_code=422, detail="Prize pool cannot be negative")
     if payload.entry_fee_inr < 0:
         raise HTTPException(status_code=422, detail="Entry fee cannot be negative")
 
-    try:
-        starts_dt = parse_iso_datetime(payload.starts_at)
-        lock_dt = parse_iso_datetime(payload.roster_lock_time)
-    except Exception as e:
-        raise HTTPException(status_code=422, detail=f"Invalid ISO 8601 date format for starts_at or roster_lock_time: {str(e)}")
+    # Resolve starts_at (from starts_at or start_date + start_time)
+    starts_at_str = payload.starts_at
+    if not starts_at_str and payload.start_date:
+        s_time = payload.start_time or "18:00"
+        starts_at_str = f"{payload.start_date}T{s_time}:00Z"
+    if not starts_at_str:
+        starts_at_str = datetime.now(timezone.utc).isoformat()
 
-    if lock_dt > starts_dt:
-        raise HTTPException(status_code=422, detail="Roster lock time must be at or before tournament start time")
+    try:
+        starts_dt = parse_iso_datetime(starts_at_str)
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Invalid ISO 8601 date format for starts_at: {str(e)}")
 
     game = await db.games.find_one({"$or": [{"_id": payload.game_id}, {"id": payload.game_id}, {"slug": payload.game_id}]})
     if not game:
         raise HTTPException(status_code=404, detail="Selected game discipline not found")
 
     gid = str(game.get("_id", game.get("id")))
+
+    # Retrieve game's supported modes from Game Catalog
+    raw_modes = game.get("supported_game_modes")
+    if not raw_modes:
+        min_s = game.get("min_team_size", 1)
+        max_s = game.get("max_team_size", 5)
+        is_team = game.get("is_team_game", True)
+        cat = str(game.get("category", "")).lower()
+        if not is_team or (min_s == 1 and max_s == 1):
+            raw_modes = ["SOLO"]
+        elif "battle-royale" in cat or "br" in cat:
+            raw_modes = ["SOLO", "DUO", "SQUAD"]
+        else:
+            raw_modes = ["SQUAD"]
+    game_supported_modes = [str(m).upper().strip() for m in raw_modes if str(m).strip()]
+    if not game_supported_modes:
+        raise HTTPException(status_code=422, detail="Selected game does not have any supported game modes configured.")
+
+    # Resolve and validate Participation Mode against game's Supported Game Modes
+    req_mode = payload.participation_mode
+    if not req_mode:
+        if payload.is_solo or payload.registration_type == "SOLO":
+            req_mode = "SOLO"
+        elif payload.players_per_team == 2:
+            req_mode = "DUO"
+        else:
+            req_mode = game_supported_modes[0] if game_supported_modes else "SQUAD"
+
+    norm_mode = str(req_mode).upper().strip()
+    if norm_mode not in {"SOLO", "DUO", "SQUAD"}:
+        raise HTTPException(status_code=422, detail=f"Invalid participation mode '{req_mode}'. Allowed modes: Solo, Duo, Squad")
+
+    if norm_mode not in game_supported_modes:
+        friendly_modes = [m.capitalize() for m in game_supported_modes]
+        raise HTTPException(
+            status_code=422,
+            detail=f"Participation mode '{norm_mode.capitalize()}' is not supported by {game.get('name')}. Available mode(s): {', '.join(friendly_modes)}"
+        )
+
+    # Dynamic Capacity semantics & validation
+    cap = payload.max_teams
+    if cap < 2:
+        cap_name = "Max Players" if norm_mode == "SOLO" else "Max Teams"
+        raise HTTPException(status_code=422, detail=f"{cap_name} must be at least 2")
+
+    is_solo = (norm_mode == "SOLO")
+    is_duo = (norm_mode == "DUO")
+    reg_type = "SOLO" if is_solo else "TEAM"
+
+    if is_solo:
+        min_size = 1
+        max_size = 1
+        players_per_team = 1
+    elif is_duo:
+        min_size = 2
+        max_size = 2
+        players_per_team = 2
+    else:  # SQUAD
+        min_size = 4
+        max_size = 4
+        players_per_team = 4
+
     base_slug = payload.slug or slugify(payload.title)
     existing = await db.tournaments.find_one({"slug": base_slug})
     slug = base_slug if not existing else f"{base_slug}-{organizer.id[:6]}"
@@ -305,20 +378,7 @@ async def create_tournament(
     logo = payload.logo_url or None
 
     prizes = payload.prizes if payload.prizes else [{"place": "1st", "amount": f"₹{payload.prize_pool_inr}"}]
-
     init_status = payload.status or "REGISTRATION_OPEN"
-
-    is_solo = bool(
-        payload.is_solo
-        or payload.registration_type == "SOLO"
-        or (min_size == 1 and max_size == 1)
-        or "solo" in str(payload.format).lower()
-        or "1v1" in str(payload.format).lower()
-    )
-    reg_type = "SOLO" if is_solo else (payload.registration_type or "TEAM")
-    if is_solo:
-        min_size = 1
-        max_size = 1
 
     comp_structure = "BATTLE_ROYALE" if "battle" in str(payload.format).lower() else ("ROUND_ROBIN" if "robin" in str(payload.format).lower() else "KNOCKOUT")
 
@@ -332,18 +392,19 @@ async def create_tournament(
         status=init_status,
         expected_start_date=payload.expected_start_date,
         registration_open_date=payload.registration_open_date,
-        registration_deadline=lock_dt,
+        registration_deadline=starts_at_str,
         announcement_text=payload.announcement_text,
-        starts_at=payload.starts_at,
-        roster_lock_time=payload.roster_lock_time,
+        starts_at=starts_at_str,
+        roster_lock_time=None,
         server_region=payload.server_region,
-        max_teams=payload.max_teams,
+        max_teams=cap,
         min_team_size=min_size,
         max_team_size=max_size,
         registration_type=reg_type,
+        participation_mode=norm_mode,
         is_solo=is_solo,
         match_structure=comp_structure,
-        players_per_team=payload.players_per_team or (1 if is_solo else min_size),
+        players_per_team=players_per_team,
         room_capacity=payload.room_capacity,
         rank_requirement=payload.rank_requirement,
         format=normalize_competition_format(payload.format),
@@ -407,23 +468,69 @@ async def update_tournament(
         if payload.entry_fee_inr < 0:
             raise HTTPException(status_code=422, detail="Entry fee cannot be negative")
         update_fields["entry_fee_inr"] = payload.entry_fee_inr
-    if payload.starts_at is not None:
-        update_fields["starts_at"] = payload.starts_at
-    if payload.roster_lock_time is not None:
-        update_fields["roster_lock_time"] = payload.roster_lock_time
-    if payload.starts_at is not None or payload.roster_lock_time is not None:
-        new_starts = payload.starts_at or tourn.get("starts_at")
-        new_lock = payload.roster_lock_time or tourn.get("roster_lock_time")
-        if new_starts and new_lock and new_starts != "TBD" and new_lock != "TBD":
-            try:
-                starts_dt = parse_iso_datetime(new_starts)
-                lock_dt = parse_iso_datetime(new_lock)
-                if lock_dt > starts_dt:
-                    raise HTTPException(status_code=422, detail="Roster lock time must be at or before tournament start time")
-            except HTTPException:
-                raise
-            except Exception:
-                pass
+    starts_at_str = payload.starts_at
+    if not starts_at_str and payload.start_date:
+        s_time = payload.start_time or "18:00"
+        starts_at_str = f"{payload.start_date}T{s_time}:00Z"
+    if starts_at_str is not None:
+        try:
+            parse_iso_datetime(starts_at_str)
+        except Exception as e:
+            raise HTTPException(status_code=422, detail=f"Invalid ISO 8601 date format for starts_at: {str(e)}")
+        update_fields["starts_at"] = starts_at_str
+
+    target_gid = payload.game_id or tourn.get("game_id")
+    target_game = None
+    if target_gid:
+        target_game = await db.games.find_one({"$or": [{"_id": target_gid}, {"id": target_gid}, {"slug": target_gid}]})
+
+    if payload.game_id is not None:
+        if not target_game:
+            raise HTTPException(status_code=404, detail="Selected game discipline not found")
+        update_fields["game_id"] = str(target_game.get("_id", target_game.get("id")))
+
+    if payload.participation_mode is not None:
+        if target_game:
+            raw_modes = target_game.get("supported_game_modes")
+            if not raw_modes:
+                min_s = target_game.get("min_team_size", 1)
+                max_s = target_game.get("max_team_size", 5)
+                is_team = target_game.get("is_team_game", True)
+                cat = str(target_game.get("category", "")).lower()
+                if not is_team or (min_s == 1 and max_s == 1):
+                    raw_modes = ["SOLO"]
+                elif "battle-royale" in cat or "br" in cat:
+                    raw_modes = ["SOLO", "DUO", "SQUAD"]
+                else:
+                    raw_modes = ["SQUAD"]
+            game_supported_modes = [str(m).upper().strip() for m in raw_modes if str(m).strip()]
+            norm_mode = str(payload.participation_mode).upper().strip()
+            if norm_mode not in {"SOLO", "DUO", "SQUAD"}:
+                raise HTTPException(status_code=422, detail=f"Invalid participation mode '{payload.participation_mode}'. Allowed modes: Solo, Duo, Squad")
+            if norm_mode not in game_supported_modes:
+                friendly_modes = [m.capitalize() for m in game_supported_modes]
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Participation mode '{norm_mode.capitalize()}' is not supported by {target_game.get('name')}. Available mode(s): {', '.join(friendly_modes)}"
+                )
+            update_fields["participation_mode"] = norm_mode
+            is_s = (norm_mode == "SOLO")
+            is_d = (norm_mode == "DUO")
+            update_fields["is_solo"] = is_s
+            update_fields["registration_type"] = "SOLO" if is_s else "TEAM"
+            if is_s:
+                update_fields["min_team_size"] = 1
+                update_fields["max_team_size"] = 1
+                update_fields["players_per_team"] = 1
+            elif is_d:
+                update_fields["min_team_size"] = 2
+                update_fields["max_team_size"] = 2
+                update_fields["players_per_team"] = 2
+            else:
+                update_fields["min_team_size"] = 4
+                update_fields["max_team_size"] = 4
+                update_fields["players_per_team"] = 4
+
     if payload.whatsapp_group_url is not None:
         update_fields["whatsapp_group_url"] = payload.whatsapp_group_url
     if payload.community_link is not None:
@@ -432,7 +539,9 @@ async def update_tournament(
         update_fields["server_region"] = payload.server_region
     if payload.max_teams is not None:
         if payload.max_teams < 2:
-            raise HTTPException(status_code=422, detail="Maximum teams must be at least 2")
+            current_mode = update_fields.get("participation_mode") or tourn.get("participation_mode", "SQUAD")
+            cap_name = "Max Players" if current_mode == "SOLO" else "Max Teams"
+            raise HTTPException(status_code=422, detail=f"{cap_name} must be at least 2")
         update_fields["max_teams"] = payload.max_teams
     if payload.rank_requirement is not None:
         update_fields["rank_requirement"] = payload.rank_requirement
@@ -478,8 +587,6 @@ async def update_tournament(
         update_fields["description"] = payload.description
     if payload.rules is not None:
         update_fields["rules"] = payload.rules
-    if payload.game_id is not None:
-        update_fields["game_id"] = payload.game_id
     if payload.prizes is not None:
         update_fields["prizes"] = payload.prizes
     if payload.min_team_size is not None:

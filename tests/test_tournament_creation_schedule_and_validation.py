@@ -37,14 +37,16 @@ async def client(mock_db):
 
 
 @pytest.mark.asyncio
+@pytest.mark.asyncio
 async def test_tournament_creation_success(client, mock_db):
-    """Test successful tournament creation with starts_at, roster_lock_time, and community links."""
+    """Test successful tournament creation with starts_at, community links, and absence of roster lock."""
     await mock_db.games.insert_one({
         "_id": "valorant",
         "id": "valorant",
         "slug": "valorant",
         "name": "Valorant",
         "accent_color": "#FF4655",
+        "supported_game_modes": ["SQUAD"],
     })
 
     payload = {
@@ -54,10 +56,7 @@ async def test_tournament_creation_success(client, mock_db):
         "prize_pool_inr": 50000,
         "entry_fee_inr": 250,
         "max_teams": 16,
-        "min_team_size": 5,
-        "max_team_size": 5,
         "starts_at": "2026-11-01T14:00:00.000Z",
-        "roster_lock_time": "2026-11-01T12:00:00.000Z",
         "whatsapp_group_url": "https://chat.whatsapp.com/sampleInvite123",
         "community_link": "https://discord.gg/ametheus",
         "description": "Official competitive championship on AMETHEUS.",
@@ -69,7 +68,7 @@ async def test_tournament_creation_success(client, mock_db):
 
     assert data["title"] == "Ametheus Premier Cup 2026"
     assert data["starts_at"] == "2026-11-01T14:00:00.000Z"
-    assert data["roster_lock_time"] == "2026-11-01T12:00:00.000Z"
+    assert data["roster_lock_time"] is None
     assert data["whatsapp_group_url"] == "https://chat.whatsapp.com/sampleInvite123"
     assert data["community_link"] == "https://discord.gg/ametheus"
     assert data["prize_pool_inr"] == 50000
@@ -80,66 +79,32 @@ async def test_tournament_creation_success(client, mock_db):
     saved = await mock_db.tournaments.find_one({"title": "Ametheus Premier Cup 2026"})
     assert saved is not None
     assert saved["starts_at"] == "2026-11-01T14:00:00.000Z"
-    assert saved["roster_lock_time"] == "2026-11-01T12:00:00.000Z"
+    assert saved.get("roster_lock_time") is None
     assert saved["whatsapp_group_url"] == "https://chat.whatsapp.com/sampleInvite123"
     assert saved["community_link"] == "https://discord.gg/ametheus"
 
 
 @pytest.mark.asyncio
-async def test_tournament_creation_missing_required_dates(client, mock_db):
-    """Test that missing starts_at or roster_lock_time fails with HTTP 422."""
+async def test_tournament_creation_unsupported_mode_rejected(client, mock_db):
+    """Test that selecting a mode not supported by the game is rejected with HTTP 422."""
     await mock_db.games.insert_one({
         "_id": "valorant",
         "id": "valorant",
         "slug": "valorant",
         "name": "Valorant",
+        "supported_game_modes": ["SQUAD"],
     })
 
-    # Missing roster_lock_time
     payload = {
         "game_id": "valorant",
-        "title": "Championship Without Lock Time",
+        "title": "Valorant Solo Showdown",
+        "participation_mode": "SOLO",
         "starts_at": "2026-11-01T14:00:00.000Z",
         "description": "Description",
     }
     res = await client.post("/api/v1/organizer/tournaments", json=payload)
     assert res.status_code == 422
-    err_detail = str(res.json())
-    assert "roster_lock_time" in err_detail
-
-    # Missing starts_at
-    payload2 = {
-        "game_id": "valorant",
-        "title": "Championship Without Starts At",
-        "roster_lock_time": "2026-11-01T12:00:00.000Z",
-        "description": "Description",
-    }
-    res2 = await client.post("/api/v1/organizer/tournaments", json=payload2)
-    assert res2.status_code == 422
-    err_detail2 = str(res2.json())
-    assert "starts_at" in err_detail2
-
-
-@pytest.mark.asyncio
-async def test_tournament_creation_roster_lock_after_starts_at_rejected(client, mock_db):
-    """Test that roster_lock_time strictly after starts_at is rejected with HTTP 422."""
-    await mock_db.games.insert_one({
-        "_id": "valorant",
-        "id": "valorant",
-        "slug": "valorant",
-        "name": "Valorant",
-    })
-
-    payload = {
-        "game_id": "valorant",
-        "title": "Invalid Schedule Championship",
-        "starts_at": "2026-11-01T10:00:00.000Z",
-        "roster_lock_time": "2026-11-01T12:00:00.000Z",  # 2 hours AFTER start
-        "description": "Description",
-    }
-    res = await client.post("/api/v1/organizer/tournaments", json=payload)
-    assert res.status_code == 422
-    assert "Roster lock time must be at or before tournament start time" in res.json()["detail"]
+    assert "not supported by Valorant" in res.json()["detail"]
 
 
 @pytest.mark.asyncio
@@ -150,13 +115,13 @@ async def test_tournament_creation_invalid_iso_format(client, mock_db):
         "id": "valorant",
         "slug": "valorant",
         "name": "Valorant",
+        "supported_game_modes": ["SQUAD"],
     })
 
     payload = {
         "game_id": "valorant",
         "title": "Bad ISO Format Tournament",
         "starts_at": "invalid-datetime-string",
-        "roster_lock_time": "2026-11-01T12:00:00.000Z",
         "description": "Description",
     }
     res = await client.post("/api/v1/organizer/tournaments", json=payload)
@@ -172,13 +137,13 @@ async def test_tournament_creation_empty_title_rejected(client, mock_db):
         "id": "valorant",
         "slug": "valorant",
         "name": "Valorant",
+        "supported_game_modes": ["SQUAD"],
     })
 
     payload = {
         "game_id": "valorant",
         "title": "   ",
         "starts_at": "2026-11-01T14:00:00.000Z",
-        "roster_lock_time": "2026-11-01T12:00:00.000Z",
         "description": "Description",
     }
     res = await client.post("/api/v1/organizer/tournaments", json=payload)
@@ -187,28 +152,26 @@ async def test_tournament_creation_empty_title_rejected(client, mock_db):
 
 
 @pytest.mark.asyncio
-async def test_tournament_creation_invalid_team_size_bounds(client, mock_db):
-    """Test that invalid team size bounds are rejected with HTTP 422."""
+async def test_tournament_creation_invalid_capacity(client, mock_db):
+    """Test that capacity less than 2 is rejected with HTTP 422."""
     await mock_db.games.insert_one({
         "_id": "valorant",
         "id": "valorant",
         "slug": "valorant",
         "name": "Valorant",
+        "supported_game_modes": ["SQUAD"],
     })
 
-    # max < min
     payload = {
         "game_id": "valorant",
-        "title": "Invalid Squad Bounds",
-        "min_team_size": 5,
-        "max_team_size": 2,
+        "title": "Invalid Capacity Tournament",
+        "max_teams": 1,
         "starts_at": "2026-11-01T14:00:00.000Z",
-        "roster_lock_time": "2026-11-01T12:00:00.000Z",
         "description": "Description",
     }
     res = await client.post("/api/v1/organizer/tournaments", json=payload)
     assert res.status_code == 422
-    assert "Maximum team size cannot be less than minimum team size" in res.json()["detail"]
+    assert "must be at least 2" in res.json()["detail"]
 
 
 @pytest.mark.asyncio
@@ -219,6 +182,7 @@ async def test_tournament_update_schedule_and_links(client, mock_db):
         "id": "valorant",
         "slug": "valorant",
         "name": "Valorant",
+        "supported_game_modes": ["SQUAD"],
     })
 
     # First create
@@ -226,25 +190,15 @@ async def test_tournament_update_schedule_and_links(client, mock_db):
         "game_id": "valorant",
         "title": "Original Tournament Title",
         "starts_at": "2026-11-01T14:00:00.000Z",
-        "roster_lock_time": "2026-11-01T12:00:00.000Z",
         "description": "Original Description",
     })
     assert create_res.status_code == 201
     tid = create_res.json()["id"]
 
-    # Attempt update with invalid schedule order (lock after start)
-    bad_update = await client.put(f"/api/v1/organizer/tournaments/{tid}", json={
-        "starts_at": "2026-11-05T10:00:00.000Z",
-        "roster_lock_time": "2026-11-05T15:00:00.000Z",
-    })
-    assert bad_update.status_code == 422
-    assert "Roster lock time must be at or before tournament start time" in bad_update.json()["detail"]
-
     # Valid update
     good_update = await client.put(f"/api/v1/organizer/tournaments/{tid}", json={
         "title": "Updated Tournament Title",
         "starts_at": "2026-11-10T18:00:00.000Z",
-        "roster_lock_time": "2026-11-10T16:00:00.000Z",
         "whatsapp_group_url": "https://chat.whatsapp.com/newGroup456",
         "community_link": "https://discord.gg/newDiscordChannel",
     })
@@ -252,7 +206,7 @@ async def test_tournament_update_schedule_and_links(client, mock_db):
     updated_data = good_update.json()
     assert updated_data["title"] == "Updated Tournament Title"
     assert updated_data["starts_at"] == "2026-11-10T18:00:00.000Z"
-    assert updated_data["roster_lock_time"] == "2026-11-10T16:00:00.000Z"
+    assert updated_data["roster_lock_time"] is None
     assert updated_data["whatsapp_group_url"] == "https://chat.whatsapp.com/newGroup456"
     assert updated_data["community_link"] == "https://discord.gg/newDiscordChannel"
 

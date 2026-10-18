@@ -13,8 +13,9 @@ class Game(BaseModel):
     platform: str
     tag: str
     is_team_game: bool = True
-    min_team_size: int = 1
-    max_team_size: int = 5
+    supported_game_modes: List[str] = Field(default_factory=lambda: ["SQUAD"])
+    min_team_size: Optional[int] = 1
+    max_team_size: Optional[int] = 5
     max_substitutes: int = 1
     entry_fee_inr: int = 0
     prize_pool_inr: int = 0
@@ -53,4 +54,19 @@ class Game(BaseModel):
         d = dict(doc)
         if "_id" in d and "id" not in d:
             d["id"] = str(d.pop("_id"))
+        if not d.get("supported_game_modes"):
+            min_s = d.get("min_team_size", 1)
+            max_s = d.get("max_team_size", 5)
+            is_team = d.get("is_team_game", True)
+            cat = str(d.get("category", "")).lower()
+            if not is_team or (min_s == 1 and max_s == 1):
+                d["supported_game_modes"] = ["SOLO"]
+            elif "battle-royale" in cat or "br" in cat:
+                d["supported_game_modes"] = ["SOLO", "DUO", "SQUAD"]
+            else:
+                d["supported_game_modes"] = ["SQUAD"]
+        else:
+            d["supported_game_modes"] = [str(m).upper().strip() for m in d["supported_game_modes"] if str(m).upper().strip() in {"SOLO", "DUO", "SQUAD"}]
+            if not d["supported_game_modes"]:
+                d["supported_game_modes"] = ["SQUAD"]
         return cls(**d)
