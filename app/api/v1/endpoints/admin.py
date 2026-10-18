@@ -2497,7 +2497,14 @@ async def update_match_status(
     if stat_upper == "LIVE" and current_status == "LIVE":
         return {"status": "success", "message": "Match is already LIVE", "status": "LIVE"}
 
-    await db.matches.update_one({"_id": match["_id"]}, {"$set": {"status": stat_upper, "updated_at": get_utc_now()}})
+    update_dict: Dict[str, Any] = {"status": stat_upper, "updated_at": get_utc_now()}
+    if stat_upper == "LIVE":
+        update_dict["credentials_released"] = True
+        update_dict["credentials_released_at"] = get_utc_now()
+        update_dict["credentials_released_by"] = admin_user.username
+        update_dict["join_info_enabled"] = True
+
+    await db.matches.update_one({"_id": match["_id"]}, {"$set": update_dict})
 
     try:
         from app.services.live_match_service import sync_live_match_for_tournament
@@ -3413,10 +3420,33 @@ async def save_live_match_structure_admin(
     tid = str(tourn_doc.get("_id", tourn_doc.get("id")))
     tslug = tourn_doc.get("slug", tid)
 
-    # Delete existing matches for this tournament to cleanly replace with approved structure
-    await db.matches.delete_many({
-        "$or": [{"tournament_id": tid}, {"tournament_id": tslug}]
-    })
+    # Fetch existing matches so completed or in-progress matches and their winners/results are NEVER lost
+    existing_cursor = db.matches.find({"$or": [{"tournament_id": tid}, {"tournament_id": tslug}]})
+    existing_list = await existing_cursor.to_list(length=500)
+    existing_by_id = {}
+    existing_by_round_match = {}
+    for em in existing_list:
+        em_id = str(em.get("_id", em.get("id")))
+        existing_by_id[em_id] = em
+        if em.get("id"):
+            existing_by_id[str(em["id"])] = em
+        r_num = em.get("round_number", 1)
+        m_num = em.get("match_number") or em.get("order") or 1
+        existing_by_round_match[(r_num, m_num)] = em
+
+    locked_statuses = {"COMPLETED", "FINALIZED", "LIVE", "ENDED", "RESULTS_SAVED", "RESULTS_PENDING"}
+    locked_ids = {str(em.get("_id", em.get("id"))) for em in existing_list if str(em.get("status", "")).upper() in locked_statuses}
+
+    # Delete only unplayed draft or scheduled matches that are removed from payload
+    payload_match_ids = {str(item.id) for item in payload.matches if item.id}
+    deletable_ids = []
+    for em in existing_list:
+        em_id = str(em.get("_id", em.get("id")))
+        em_stat = str(em.get("status", "SCHEDULED")).upper()
+        if em_id not in locked_ids and em_id not in payload_match_ids and em_stat not in locked_statuses:
+            deletable_ids.append(em["_id"])
+    if deletable_ids:
+        await db.matches.delete_many({"_id": {"$in": deletable_ids}})
 
     bracket_rounds_map = {}
     saved_matches = []
@@ -3450,42 +3480,82 @@ async def save_live_match_structure_admin(
                 except Exception:
                     pass
 
-        db_match = Match(
-            id=match_id,
-            tournament_id=tid,
-            stage=stage,
-            round_name=item.round_name or stage,
-            match_type=m_type,
-            round_number=r_num,
-            match_number=m_num,
-            format=item.format or s_fmt,
-            series_format=s_fmt,
-            scheduled_time=sched_combined,
-            scheduled_at=parsed_dt,
-            status="SCHEDULED",
-            roster_status=item.roster_status or "DRAFT",
-            team_a_id=item.team_a_id,
-            team_b_id=item.team_b_id,
-            team_a_name=item.team_a_name,
-            team_b_name=item.team_b_name,
-            team_a_placeholder=item.team_a_placeholder,
-            team_b_placeholder=item.team_b_placeholder,
-            team_ids=item.team_ids or [],
-            teams=item.teams or [],
-            next_match_id=item.next_match_id,
-            next_match_slot=item.next_match_slot,
-            advancement_label=item.advancement_label,
-            join_info_enabled=item.join_info_enabled or False,
-            join_info=item.join_info,
-            match_message=item.match_message,
-            youtube_live_url=item.youtube_live_url or None,
-            live_link=item.youtube_live_url or None,
-            server_region=tourn_doc.get("server_region", "Asia (Mumbai)"),
-            lobby_code=f"AMT-R{r_num}M{m_num}",
-            lobby_password=f"AMT-{secrets.token_hex(3).upper()}",
-        )
-        await db.matches.insert_one(db_match.to_mongo())
-        saved_matches.append(db_match.id)
+        # Check if match already exists and has results or locked status
+        existing_match = existing_by_id.get(str(match_id)) or existing_by_round_match.get((r_num, m_num))
+        is_existing_locked = existing_match and str(existing_match.get("status", "")).upper() in locked_statuses
+
+        if is_existing_locked:
+            # Preserve status, score, winner, results, and credentials
+            upd_data: Dict[str, Any] = {
+                "round_name": item.round_name or stage,
+                "stage": stage,
+                "scheduled_time": sched_combined,
+                "scheduled_date": sched_date,
+            }
+            if parsed_dt:
+                upd_data["scheduled_at"] = parsed_dt
+            if item.youtube_live_url:
+                upd_data["youtube_live_url"] = item.youtube_live_url
+                upd_data["live_link"] = item.youtube_live_url
+            await db.matches.update_one({"_id": existing_match["_id"]}, {"$set": upd_data})
+            saved_matches.append(str(existing_match.get("_id", existing_match.get("id"))))
+            effective_status = existing_match.get("status", "COMPLETED")
+            effective_winner = existing_match.get("winner_team_id")
+            effective_team_a = existing_match.get("team_a_id", item.team_a_id)
+            effective_team_b = existing_match.get("team_b_id", item.team_b_id)
+            effective_teams = existing_match.get("teams", item.teams or [])
+            effective_team_ids = existing_match.get("team_ids", item.team_ids or [])
+        else:
+            room_code = f"AMT-R{r_num}M{m_num}"
+            room_pass = f"AMT-{secrets.token_hex(3).upper()}"
+            db_match = Match(
+                id=match_id,
+                tournament_id=tid,
+                stage=stage,
+                round_name=item.round_name or stage,
+                match_type=m_type,
+                round_number=r_num,
+                match_number=m_num,
+                format=item.format or s_fmt,
+                series_format=s_fmt,
+                scheduled_time=sched_combined,
+                scheduled_at=parsed_dt,
+                status="SCHEDULED",
+                roster_status=item.roster_status or "DRAFT",
+                team_a_id=item.team_a_id,
+                team_b_id=item.team_b_id,
+                team_a_name=item.team_a_name,
+                team_b_name=item.team_b_name,
+                team_a_placeholder=item.team_a_placeholder,
+                team_b_placeholder=item.team_b_placeholder,
+                team_ids=item.team_ids or [],
+                teams=item.teams or [],
+                next_match_id=item.next_match_id,
+                next_match_slot=item.next_match_slot,
+                advancement_label=item.advancement_label,
+                join_info_enabled=item.join_info_enabled or False,
+                join_info=item.join_info,
+                match_message=item.match_message,
+                youtube_live_url=item.youtube_live_url or None,
+                live_link=item.youtube_live_url or None,
+                server_region=tourn_doc.get("server_region", "Asia (Mumbai)"),
+                room_id=room_code,
+                room_password=room_pass,
+                lobby_code=room_code,
+                lobby_password=room_pass,
+            )
+            m_mongo = db_match.to_mongo()
+            if existing_match:
+                await db.matches.update_one({"_id": existing_match["_id"]}, {"$set": m_mongo})
+            else:
+                await db.matches.insert_one(m_mongo)
+            saved_matches.append(db_match.id)
+            effective_status = "SCHEDULED"
+            effective_winner = None
+            effective_team_a = item.team_a_id
+            effective_team_b = item.team_b_id
+            effective_teams = item.teams or []
+            effective_team_ids = item.team_ids or []
 
         if r_num not in bracket_rounds_map:
             bracket_rounds_map[r_num] = {
@@ -3842,6 +3912,13 @@ async def update_match_details_admin(
         update_fields["custom_instructions"] = c_inst if c_inst else None
         update_fields["match_message"] = c_inst if c_inst else None
 
+    curr_or_new_stat = (update_fields.get("status") or match.get("status", "")).upper()
+    if curr_or_new_stat == "LIVE" or getattr(payload, "credentials_released", False):
+        update_fields["credentials_released"] = True
+        update_fields["credentials_released_at"] = get_utc_now()
+        update_fields["credentials_released_by"] = admin_user.username
+        update_fields["join_info_enabled"] = True
+
     if update_fields:
         old_roster_status = match.get("roster_status", "PUBLISHED")
         new_roster_status = update_fields.get("roster_status", old_roster_status)
@@ -4121,7 +4198,12 @@ async def complete_match_admin(
     from app.services.match_notification_service import send_match_reminder
     from app.core.ws import ws_manager
 
-    match_doc = await db.matches.find_one({"$or": [{"_id": id}, {"id": id}]})
+    from bson import ObjectId
+    m_query = {"$or": [{"_id": id}, {"id": id}]}
+    if ObjectId.is_valid(id):
+        m_query["$or"].append({"_id": ObjectId(id)})
+
+    match_doc = await db.matches.find_one(m_query)
     if not match_doc:
         raise HTTPException(status_code=404, detail="Match not found")
 
@@ -4164,23 +4246,49 @@ async def complete_match_admin(
     if not winner_id and (score_a != 0 or score_b != 0):
         winner_id = match.team_a_id if score_a >= score_b else match.team_b_id
 
-    valid_targets = {
-        str(match.team_a_id) if match.team_a_id else None,
-        str(match.team_b_id) if match.team_b_id else None,
-        team_a_name,
-        team_b_name,
-        team_a_ph,
-        team_b_ph,
-    }
-    valid_targets = {t for t in valid_targets if t}
+    # Gather all valid participant target IDs and names
+    valid_targets = set()
+    if match.team_a_id:
+        valid_targets.add(str(match.team_a_id))
+    if match.team_b_id:
+        valid_targets.add(str(match.team_b_id))
+    for t in (match_doc.get("teams") or []):
+        if isinstance(t, dict):
+            tid = str(t.get("id") or t.get("_id") or t.get("team_id") or "")
+            if tid:
+                valid_targets.add(tid)
+            if t.get("name"):
+                valid_targets.add(t["name"])
+    for tid in (match_doc.get("team_ids") or []):
+        if tid:
+            valid_targets.add(str(tid))
+    for pid in (match_doc.get("registered_participant_ids") or []):
+        if pid:
+            valid_targets.add(str(pid))
+    for name in [team_a_name, team_b_name, team_a_ph, team_b_ph]:
+        if name:
+            valid_targets.add(name)
 
-    if winner_id and valid_targets and winner_id not in valid_targets:
+    if winner_id and str(winner_id) not in valid_targets:
         # Check if winner_id is a team ID in db whose name matches team_a or team_b
         winner_team = await db.teams.find_one({"$or": [{"_id": winner_id}, {"id": winner_id}]})
         if winner_team:
             w_name = winner_team.get("name")
             if w_name in valid_targets:
                 winner_id = str(winner_team.get("_id", winner_team.get("id")))
+
+    if not winner_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot complete match: a valid winning participant must be declared or determined by scores.",
+        )
+
+    winner_id = str(winner_id)
+    if valid_targets and winner_id not in valid_targets:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Selected winner '{winner_id}' does not belong to the participants of Match {match.match_number or id}.",
+        )
 
     await db.matches.update_one(
         {"_id": match_doc["_id"]},
@@ -5400,6 +5508,13 @@ async def update_match_credentials_admin(
     if payload.server_region is not None:
         upd["server_region"] = payload.server_region.strip()
 
+    if str(match.get("status", "")).upper() == "LIVE" or getattr(payload, "credentials_released", False):
+        from app.models.base import get_utc_now
+        upd["credentials_released"] = True
+        upd["credentials_released_at"] = get_utc_now()
+        upd["credentials_released_by"] = admin_user.username
+        upd["join_info_enabled"] = True
+
     if upd:
         await db.matches.update_one(m_query, {"$set": upd})
         try:
@@ -5505,11 +5620,15 @@ async def release_match_credentials_admin(
 async def get_qualified_contenders_admin(
     tournament_id: str,
     source_round: Optional[str] = Query(None),
+    round_number: Optional[int] = Query(None),
     admin_user: User = Depends(require_organizer),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """
-    Section 10: Returns eligible qualified contenders from earlier rounds for manual next-round formation.
+    Section 10 & Critical Repair: Returns eligible qualified contenders from earlier rounds for manual next-round formation.
+    - If round_number > 1: retrieves ONLY the actual winners of round_number - 1.
+    - Excludes all eliminated participants.
+    - Verifies whether all matches in round_number - 1 are completed and reports any pending matches.
     """
     from bson import ObjectId
     t_query = {"$or": [{"id": tournament_id}, {"_id": tournament_id}, {"slug": tournament_id}]}
@@ -5523,38 +5642,150 @@ async def get_qualified_contenders_admin(
     tid = str(tourn.get("_id", tourn.get("id")))
     tslug = tourn.get("slug", tid)
 
+    is_previous_round_complete = True
+    pending_matches = []
+    winner_ids = set()
+    eliminated_ids = set()
+    winner_details = {}
+
+    target_prev_round = (round_number - 1) if (round_number is not None and round_number > 1) else None
+
+    if target_prev_round:
+        # 1. Fetch all matches in preceding round for this tournament
+        prev_m_cursor = db.matches.find({
+            "$or": [{"tournament_id": tid}, {"tournament_id": tslug}],
+            "round_number": target_prev_round,
+        })
+        prev_matches = await prev_m_cursor.to_list(length=200)
+
+        for pm in prev_matches:
+            pm_stat = str(pm.get("status", "SCHEDULED")).upper()
+            if pm_stat != "COMPLETED":
+                is_previous_round_complete = False
+                pending_matches.append({
+                    "id": str(pm.get("_id", pm.get("id"))),
+                    "match_number": pm.get("match_number") or pm.get("order") or 1,
+                    "round_name": pm.get("round_name") or f"Round {target_prev_round}",
+                    "status": pm_stat,
+                })
+            else:
+                w_id = pm.get("winner_team_id")
+                if w_id:
+                    w_str = str(w_id)
+                    winner_ids.add(w_str)
+                    w_name = None
+                    if w_str == str(pm.get("team_a_id")):
+                        w_name = pm.get("team_a_name")
+                        if pm.get("team_b_id"):
+                            eliminated_ids.add(str(pm.get("team_b_id")))
+                    elif w_str == str(pm.get("team_b_id")):
+                        w_name = pm.get("team_b_name")
+                        if pm.get("team_a_id"):
+                            eliminated_ids.add(str(pm.get("team_a_id")))
+                    winner_details[w_str] = {
+                        "name": w_name or pm.get("winner_team_name") or w_str,
+                        "source_match_id": str(pm.get("_id", pm.get("id"))),
+                        "source_round": pm.get("round_name") or f"Round {target_prev_round}",
+                        "source_round_number": target_prev_round,
+                    }
+
+                # Also handle Battle Royale qualifiers list
+                for q_id in (pm.get("qualifier_team_ids") or []):
+                    winner_ids.add(str(q_id))
+                for pl in (pm.get("placements") or []):
+                    pl_tid = str(pl.get("team_id") or "")
+                    if pl_tid:
+                        if pl.get("qualified"):
+                            winner_ids.add(pl_tid)
+                            winner_details[pl_tid] = {
+                                "name": pl.get("team_name") or pl_tid,
+                                "source_match_id": str(pm.get("_id", pm.get("id"))),
+                                "source_round": pm.get("round_name") or f"Round {target_prev_round}",
+                                "source_round_number": target_prev_round,
+                            }
+                        else:
+                            eliminated_ids.add(pl_tid)
+
+    # 2. Query tournament_qualifications table
     q_filter: Dict[str, Any] = {
         "$or": [{"tournament_id": tid}, {"tournament_id": tslug}],
-        "status": "QUALIFIED",
     }
     if source_round:
         q_filter["source_round"] = source_round
+    if target_prev_round:
+        q_filter["source_round_number"] = target_prev_round
 
     cursor = db.tournament_qualifications.find(q_filter)
     docs = await cursor.to_list(length=300)
 
+    for d in docs:
+        pid = str(d.get("participant_id") or "")
+        if pid:
+            if d.get("status") == "QUALIFIED":
+                winner_ids.add(pid)
+                if pid not in winner_details:
+                    winner_details[pid] = {
+                        "name": d.get("participant_name") or pid,
+                        "source_match_id": d.get("source_match_id"),
+                        "source_round": d.get("source_round"),
+                        "source_round_number": d.get("source_round_number", target_prev_round or 1),
+                        "placement": d.get("placement"),
+                        "points": d.get("points"),
+                    }
+            elif d.get("status") == "ELIMINATED":
+                eliminated_ids.add(pid)
+
+    # Winner IDs take precedence over eliminated
+    active_contender_ids = [cid for cid in winner_ids if cid not in eliminated_ids]
+    if not target_prev_round and not active_contender_ids:
+        # Round 1 or no specific round: return all tournament qualifications
+        active_contender_ids = list(winner_ids)
+
+    # Resolve team docs for enriched display in frontend
     res = []
     seen = set()
-    for d in docs:
-        pid = d.get("participant_id")
-        if pid and pid not in seen:
-            seen.add(pid)
-            res.append({
-                "participant_id": pid,
-                "participant_name": d.get("participant_name") or str(pid),
-                "source_round": d.get("source_round"),
-                "source_round_number": d.get("source_round_number", 1),
-                "source_match_id": d.get("source_match_id"),
-                "status": d.get("status"),
-                "points": d.get("points"),
-                "placement": d.get("placement"),
-            })
+    for pid in active_contender_ids:
+        if pid in seen:
+            continue
+        seen.add(pid)
+        det = winner_details.get(pid, {})
+        team_doc = await db.teams.find_one({"$or": [{"_id": pid}, {"id": pid}]})
+        if team_doc:
+            p_name = team_doc.get("name") or det.get("name") or pid
+            p_tag = team_doc.get("tag", "TEAM")
+        else:
+            user_doc = await db.users.find_one({"$or": [{"_id": pid}, {"id": pid}]})
+            if user_doc:
+                p_name = user_doc.get("display_name") or user_doc.get("username") or pid
+                p_tag = "SOLO"
+            else:
+                p_name = det.get("name") or pid
+                p_tag = "TEAM"
+
+        res.append({
+            "participant_id": pid,
+            "participant_name": p_name,
+            "team_id": pid,
+            "team_name": p_name,
+            "team_tag": p_tag,
+            "source_round": det.get("source_round"),
+            "source_round_number": det.get("source_round_number", target_prev_round or 1),
+            "source_match_id": det.get("source_match_id"),
+            "status": "QUALIFIED",
+            "points": det.get("points"),
+            "placement": det.get("placement"),
+        })
 
     return {
         "status": "success",
         "tournament_id": tid,
+        "round_number": round_number,
+        "is_previous_round_complete": is_previous_round_complete,
+        "has_pending_matches": not is_previous_round_complete,
+        "pending_matches": pending_matches,
         "qualified_contenders": res,
         "contenders": res,
+        "eliminated_contenders": list(eliminated_ids),
         "total_qualified": len(res),
         "count": len(res),
     }

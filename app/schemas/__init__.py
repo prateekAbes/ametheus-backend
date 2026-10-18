@@ -710,6 +710,7 @@ class AdminMatchScoreUpdate(BaseModel):
 class MatchResultSubmit(BaseModel):
     score_a: int
     score_b: int
+    winner_team_id: Optional[str] = None
     evidence_url: Optional[str] = None
     captain_notes: Optional[str] = None
 

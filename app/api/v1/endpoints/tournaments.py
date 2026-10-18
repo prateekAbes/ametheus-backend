@@ -746,7 +746,8 @@ async def get_tournament_matches(
             if user_b:
                 team_b = {"name": user_b.get("display_name") or user_b.get("username", "Contender"), "tag": "SOLO"}
 
-        credentials_released = bool(m.get("credentials_released", False))
+        match_status = str(m.get("status", "")).upper()
+        credentials_released = bool(m.get("credentials_released", False)) or (match_status == "LIVE")
         is_auth = await is_match_authorized_viewer(current_user, m, db)
 
         if is_admin_or_organizer or (credentials_released and is_auth):

@@ -481,23 +481,76 @@ async def submit_match_result(
 
     mid = str(match.get("_id", match.get("id")))
 
-    await db.matches.update_one(
-        {"_id": match["_id"]},
-        {"$set": {
-            "score_a": payload.score_a,
-            "score_b": payload.score_b,
-            "evidence_url": payload.evidence_url,
-            "captain_notes": payload.captain_notes,
-            "status": "COMPLETED",
-        }}
-    )
+    winner_id = payload.winner_team_id
+    if not winner_id:
+        if payload.score_a > payload.score_b:
+            winner_id = match.get("team_a_id")
+        elif payload.score_b > payload.score_a:
+            winner_id = match.get("team_b_id")
+
+    valid_targets = set()
+    if match.get("team_a_id"): valid_targets.add(str(match["team_a_id"]))
+    if match.get("team_b_id"): valid_targets.add(str(match["team_b_id"]))
+    for t in (match.get("teams") or []):
+        if isinstance(t, dict):
+            tid = str(t.get("id") or t.get("_id") or t.get("team_id") or "")
+            if tid: valid_targets.add(tid)
+            if t.get("name"): valid_targets.add(t["name"])
+    for tid in (match.get("team_ids") or []):
+        if tid: valid_targets.add(str(tid))
+    for pid in (match.get("registered_participant_ids") or []):
+        if pid: valid_targets.add(str(pid))
+    for name in [match.get("team_a_name"), match.get("team_b_name"), match.get("team_a_placeholder"), match.get("team_b_placeholder")]:
+        if name: valid_targets.add(name)
+
+    if winner_id and str(winner_id) not in valid_targets:
+        winner_team = await db.teams.find_one({"$or": [{"_id": winner_id}, {"id": winner_id}]})
+        if winner_team and winner_team.get("name") in valid_targets:
+            winner_id = str(winner_team.get("_id", winner_team.get("id")))
+
+    if not winner_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot finalize match result: a winning participant must be declared or determined by scores.",
+        )
+
+    winner_id = str(winner_id)
+    if valid_targets and winner_id not in valid_targets:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Selected winner '{winner_id}' does not belong to the participants of Match {match.get('match_number') or id}.",
+        )
+
+    update_fields = {
+        "score_a": payload.score_a,
+        "score_b": payload.score_b,
+        "winner_team_id": winner_id,
+        "evidence_url": payload.evidence_url,
+        "captain_notes": payload.captain_notes,
+        "status": "COMPLETED",
+    }
+    await db.matches.update_one({"_id": match["_id"]}, {"$set": update_fields})
+
+    # Advance bracket and record qualification
+    try:
+        from app.models.match import Match
+        from app.services.bracket_engine import advance_bracket_match
+        m_obj = Match.from_mongo({**match, **update_fields})
+        await advance_bracket_match(
+            tournament_id=str(match.get("tournament_id")),
+            completed_match=m_obj,
+            winner_team_id=winner_id,
+            db=db,
+        )
+    except Exception as e:
+        print(f"[Bracket Advance on submit_result Warning]: {e}")
 
     await record_audit_log(
         db=db,
         operator=current_user.username,
         role=current_user.role,
         action="SUBMIT_MATCH_RESULT",
-        target=f"Match {mid} (Score: {payload.score_a}-{payload.score_b})",
+        target=f"Match {mid} (Score: {payload.score_a}-{payload.score_b} | Winner: {winner_id})",
         details=f"Proof: {payload.evidence_url or 'None'} | Notes: {payload.captain_notes or 'None'}",
     )
 
@@ -506,6 +559,7 @@ async def submit_match_result(
         "match_id": mid,
         "score_a": payload.score_a,
         "score_b": payload.score_b,
+        "winner_team_id": winner_id,
         "status": "COMPLETED",
     })
 
@@ -515,7 +569,12 @@ async def submit_match_result(
     except Exception:
         pass
 
-    return {"status": "success", "message": "Match result finalized successfully"}
+    return {
+        "status": "success",
+        "message": "Match result finalized successfully",
+        "match_id": mid,
+        "winner_team_id": winner_id,
+    }
 
 @router.post("/{id}/qualifiers")
 @router.post("/{id}/battle-royale-results")
@@ -691,22 +750,32 @@ async def is_match_authorized_viewer(current_user: Optional[User], match: dict, 
         if assign_check:
             return True
 
+    valid_uids = [str(current_user.id)]
+    if getattr(current_user, "clerk_user_id", None):
+        valid_uids.append(str(current_user.clerk_user_id))
+
     team_a_id = match.get("team_a_id")
     team_b_id = match.get("team_b_id")
+    raw_team_ids = [str(x) for x in (match.get("team_ids") or []) if x]
+    reg_part_ids = [str(x) for x in (match.get("registered_participant_ids") or []) if x]
     br_teams = match.get("teams") or []
-    br_team_ids = [str(t.get("id") or t.get("_id")) for t in br_teams if isinstance(t, dict)]
-    competing_teams = list(set([tid for tid in [team_a_id, team_b_id] + br_team_ids if tid]))
+    br_team_ids = [str(t.get("id") or t.get("_id") or t.get("team_id")) for t in br_teams if isinstance(t, dict)]
 
-    if current_user.id in [team_a_id, team_b_id]:
-        return True
+    all_part_ids = set([str(tid) for tid in [team_a_id, team_b_id] + raw_team_ids + reg_part_ids + br_team_ids if tid])
+
+    for uid in valid_uids:
+        if uid in all_part_ids:
+            return True
+
+    competing_teams = list(set([tid for tid in [team_a_id, team_b_id] + raw_team_ids + br_team_ids if tid]))
 
     if competing_teams:
         team_doc = await db.teams.find_one({
             "$and": [
                 {"$or": [{"_id": {"$in": competing_teams}}, {"id": {"$in": competing_teams}}]},
                 {"$or": [
-                    {"captain_id": current_user.id},
-                    {"members.user_id": current_user.id},
+                    {"captain_id": {"$in": valid_uids}},
+                    {"members.user_id": {"$in": valid_uids}},
                 ]}
             ]
         })
@@ -716,9 +785,6 @@ async def is_match_authorized_viewer(current_user: Optional[User], match: dict, 
     # Check tournament registrations for solo or team contender
     if tourn_id:
         tid_str = str(tourn_id)
-        valid_uids = [str(current_user.id)]
-        if getattr(current_user, "clerk_user_id", None):
-            valid_uids.append(str(current_user.clerk_user_id))
         reg_check = await db.tournament_registrations.find_one({
             "$or": [{"tournament_id": tid_str}, {"tournament_id": match.get("tournament_slug", tid_str)}],
             "$or": [
@@ -729,6 +795,13 @@ async def is_match_authorized_viewer(current_user: Optional[User], match: dict, 
             "payment_status": {"$in": ["PAID", "FREE"]},
         })
         if reg_check:
+            if competing_teams:
+                reg_tid = str(reg_check.get("team_id") or "")
+                reg_pid = str(reg_check.get("player_id") or reg_check.get("user_id") or "")
+                if reg_tid in competing_teams or reg_pid in all_part_ids:
+                    return True
+            else:
+                return True
             return True
 
     return False
@@ -895,7 +968,8 @@ async def get_match_detail(
             })
 
     # Strip sensitive credentials from public payload unless released and authorized
-    credentials_released = bool(m.get("credentials_released", False))
+    match_status = str(m.get("status", "")).upper()
+    credentials_released = bool(m.get("credentials_released", False)) or (match_status == "LIVE")
     is_admin_or_organizer = bool(current_user and current_user.role in ["SUPER_ADMIN", "ADMIN", "ORGANIZER"])
     is_authorized = await is_match_authorized_viewer(current_user, m, db)
 
@@ -905,6 +979,14 @@ async def get_match_detail(
         m["lobby_code"] = None
         m["lobby_password"] = None
         m["custom_instructions"] = None
+    else:
+        r_val = m.get("room_id") or m.get("lobby_code") or m.get("custom_room_id")
+        p_val = m.get("room_password") or m.get("lobby_password") or m.get("custom_room_password")
+        m["room_id"] = r_val
+        m["room_password"] = p_val
+        m["lobby_code"] = r_val
+        m["lobby_password"] = p_val
+        m["credentials_released"] = credentials_released
 
     m.pop("join_info", None)
 
@@ -1009,7 +1091,8 @@ async def get_match_join_info(
         )
 
     # Gating on credentials_released for participants
-    credentials_released = bool(match.get("credentials_released", False))
+    match_status = str(match.get("status", "")).upper()
+    credentials_released = bool(match.get("credentials_released", False)) or (match_status == "LIVE")
     if not credentials_released and current_user.role not in ["SUPER_ADMIN", "ADMIN", "ORGANIZER"]:
         return {
             "join_info_enabled": False,

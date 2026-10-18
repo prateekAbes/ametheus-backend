@@ -976,8 +976,11 @@ async def advance_bracket_match(
     """
     completed_match.winner_team_id = winner_team_id
     completed_match.status = "COMPLETED"
+    m_query = {"$or": [{"_id": completed_match.id}, {"id": completed_match.id}]}
+    if ObjectId.is_valid(completed_match.id):
+        m_query["$or"].append({"_id": ObjectId(completed_match.id)})
     await db.matches.update_one(
-        {"$or": [{"_id": completed_match.id}, {"id": completed_match.id}]},
+        m_query,
         {"$set": {"winner_team_id": winner_team_id, "status": "COMPLETED"}}
     )
 
@@ -989,11 +992,17 @@ async def advance_bracket_match(
         winner_name = completed_match.team_b_name
 
     if not winner_name:
-        team_doc = await db.teams.find_one({"$or": [{"_id": winner_team_id}, {"id": winner_team_id}]})
+        t_w_query = {"$or": [{"_id": winner_team_id}, {"id": winner_team_id}]}
+        if ObjectId.is_valid(winner_team_id):
+            t_w_query["$or"].append({"_id": ObjectId(winner_team_id)})
+        team_doc = await db.teams.find_one(t_w_query)
         if team_doc:
             winner_name = team_doc.get("name")
         else:
-            user_doc = await db.users.find_one({"$or": [{"_id": winner_team_id}, {"id": winner_team_id}]})
+            u_w_query = {"$or": [{"_id": winner_team_id}, {"id": winner_team_id}]}
+            if ObjectId.is_valid(winner_team_id):
+                u_w_query["$or"].append({"_id": ObjectId(winner_team_id)})
+            user_doc = await db.users.find_one(u_w_query)
             if user_doc:
                 winner_name = user_doc.get("username")
             elif winner_team_id in [completed_match.team_a_name, completed_match.team_a_placeholder]:
@@ -1021,9 +1030,10 @@ async def advance_bracket_match(
 
     # Case A: Explicit next_match_id
     if completed_match.next_match_id:
-        next_match_doc = await db.matches.find_one({
-            "$or": [{"_id": completed_match.next_match_id}, {"id": completed_match.next_match_id}]
-        })
+        nm_query = {"$or": [{"_id": completed_match.next_match_id}, {"id": completed_match.next_match_id}]}
+        if ObjectId.is_valid(completed_match.next_match_id):
+            nm_query["$or"].append({"_id": ObjectId(completed_match.next_match_id)})
+        next_match_doc = await db.matches.find_one(nm_query)
         if next_match_doc:
             slot = (completed_match.next_match_slot or "A").upper()
             is_team_a = (slot != "B")
@@ -1034,6 +1044,8 @@ async def advance_bracket_match(
             "$or": [
                 {"slot_a_source_match_id": completed_match.id},
                 {"slot_b_source_match_id": completed_match.id},
+                {"slot_a_source_match_id": str(completed_match.id)},
+                {"slot_b_source_match_id": str(completed_match.id)},
             ]
         })
         if downstream:
@@ -1087,8 +1099,11 @@ async def advance_bracket_match(
         await db.matches.update_one({"_id": next_match_doc["_id"]}, {"$addToSet": {"previous_match_ids": completed_match.id}})
 
         # Link completed match to next match
+        cm_query = {"$or": [{"_id": completed_match.id}, {"id": completed_match.id}]}
+        if ObjectId.is_valid(completed_match.id):
+            cm_query["$or"].append({"_id": ObjectId(completed_match.id)})
         await db.matches.update_one(
-            {"$or": [{"_id": completed_match.id}, {"id": completed_match.id}]},
+            cm_query,
             {"$set": {
                 "next_match_id": str(next_match_doc.get("_id", next_match_doc.get("id"))),
                 "next_match_slot": "A" if is_team_a else "B",
@@ -1106,7 +1121,10 @@ async def advance_bracket_match(
 
         # Synchronize bracket_rounds if stored on tournament
         try:
-            tourn_doc = await db.tournaments.find_one({"$or": [{"_id": tournament_id}, {"id": tournament_id}]})
+            t_sync_query = {"$or": [{"_id": tournament_id}, {"id": tournament_id}]}
+            if ObjectId.is_valid(tournament_id):
+                t_sync_query["$or"].append({"_id": ObjectId(tournament_id)})
+            tourn_doc = await db.tournaments.find_one(t_sync_query)
             if tourn_doc and "bracket_rounds" in tourn_doc and isinstance(tourn_doc["bracket_rounds"], list):
                 updated_rounds = tourn_doc["bracket_rounds"]
                 target_mid = str(next_match_doc.get("_id", next_match_doc.get("id")))
@@ -1139,7 +1157,10 @@ async def advance_bracket_match(
     )
     if not is_br:
         round_name_clean = (completed_match.round_name or completed_match.stage or "").lower().strip()
-        tourn_doc = await db.tournaments.find_one({"$or": [{"_id": tournament_id}, {"id": tournament_id}]})
+        t_comp_query = {"$or": [{"_id": tournament_id}, {"id": tournament_id}]}
+        if ObjectId.is_valid(tournament_id):
+            t_comp_query["$or"].append({"_id": ObjectId(tournament_id)})
+        tourn_doc = await db.tournaments.find_one(t_comp_query)
         total_rounds = None
         if tourn_doc:
             total_rounds = tourn_doc.get("total_rounds")
@@ -1173,8 +1194,11 @@ async def advance_bracket_match(
             })
             # Also verify no other rounds are pending in tournament stages
             if total_m > 0 and remaining == 0 and is_final_stage:
+                upd_t_query = {"$or": [{"_id": tournament_id}, {"id": tournament_id}, {"slug": tournament_id}]}
+                if ObjectId.is_valid(tournament_id):
+                    upd_t_query["$or"].append({"_id": ObjectId(tournament_id)})
                 await db.tournaments.update_one(
-                    {"$or": [{"_id": tournament_id}, {"id": tournament_id}, {"slug": tournament_id}]},
+                    upd_t_query,
                     {"$set": {"status": "COMPLETED", "winner_team_id": winner_team_id}}
                 )
 
