@@ -1139,11 +1139,28 @@ async def advance_bracket_match(
     )
     if not is_br:
         round_name_clean = (completed_match.round_name or completed_match.stage or "").lower().strip()
-        is_final_stage = (
-            getattr(completed_match, "is_final_round", False)
-            or round_name_clean in ["final", "grand final", "finals", "championship"]
+        tourn_doc = await db.tournaments.find_one({"$or": [{"_id": tournament_id}, {"id": tournament_id}]})
+        total_rounds = None
+        if tourn_doc:
+            total_rounds = tourn_doc.get("total_rounds")
+            if not total_rounds and tourn_doc.get("stages"):
+                total_rounds = len(tourn_doc.get("stages"))
+            if not total_rounds and tourn_doc.get("bracket_rounds"):
+                total_rounds = len(tourn_doc.get("bracket_rounds"))
+
+        curr_round = completed_match.round_number or 1
+
+        is_explicit_final = bool(getattr(completed_match, "is_final_round", False))
+        is_name_final = (
+            round_name_clean in ["final", "grand final", "finals", "championship"]
             or (round_name_clean.startswith("final") and "semi" not in round_name_clean and "quarter" not in round_name_clean)
         )
+
+        # Intermediate round safety: If total_rounds is known and curr_round < total_rounds, it is NOT the final stage
+        if total_rounds and curr_round < total_rounds:
+            is_final_stage = False
+        else:
+            is_final_stage = is_explicit_final or is_name_final
 
         if is_final_stage:
             tourn_id_str = str(tournament_id)
@@ -1154,7 +1171,8 @@ async def advance_bracket_match(
             total_m = await db.matches.count_documents({
                 "$or": [{"tournament_id": tourn_id_str}, {"tournament_id": tournament_id}],
             })
-            if total_m > 0 and remaining == 0:
+            # Also verify no other rounds are pending in tournament stages
+            if total_m > 0 and remaining == 0 and is_final_stage:
                 await db.tournaments.update_one(
                     {"$or": [{"_id": tournament_id}, {"id": tournament_id}, {"slug": tournament_id}]},
                     {"$set": {"status": "COMPLETED", "winner_team_id": winner_team_id}}

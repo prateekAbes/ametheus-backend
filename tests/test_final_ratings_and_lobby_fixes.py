@@ -653,4 +653,4 @@ async def test_lobby_credentials_persistence_and_release(mock_db, make_client):
 
     m_after_rel = await mock_db.matches.find_one({"_id": "m_cred_01"})
     assert m_after_rel["credentials_released"] is True
-    assert m_after_rel["status"] == "CHECK_IN_OPEN"
+    assert m_after_rel["status"] == "SCHEDULED"

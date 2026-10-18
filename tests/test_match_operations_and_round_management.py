@@ -206,7 +206,7 @@ async def test_credential_confidentiality_and_controlled_release(mock_db, make_c
     admin_client2 = make_client(admin)
     rel_resp = await admin_client2.post("/api/v1/admin/matches/match_cred_01/release-credentials")
     assert rel_resp.status_code == 200
-    assert rel_resp.json()["status"] == "CHECK_IN_OPEN"
+    assert rel_resp.json()["status"] == "success"
     assert rel_resp.json()["credentials_released"] is True
 
     # 5. Player now queries join info: credentials are visible
@@ -477,6 +477,9 @@ async def test_battle_royale_squad_alive_status_and_results(mock_db, make_client
             "total_points": 6,
         },
     ]
+
+    # Transition match to ENDED so results can be finalized
+    await mock_db.matches.update_one({"$or": [{"_id": "match_br_01"}, {"id": "match_br_01"}]}, {"$set": {"status": "ENDED"}})
 
     br_resp = await client.post(
         "/api/v1/admin/matches/match_br_01/battle-royale-results",

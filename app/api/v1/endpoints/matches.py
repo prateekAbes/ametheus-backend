@@ -420,18 +420,16 @@ async def captain_check_in(
         "checked_in_at": datetime.now(timezone.utc).isoformat(),
     })
 
-    # Checking in MUST NOT automatically start the match or set it live.
+    # NOTE: Check-in system is removed. This endpoint now only records participation
+    # confirmation without changing match status. Status remains SCHEDULED.
     current_status = match.get("status", "SCHEDULED")
-    new_status = current_status
-    if current_status == "SCHEDULED":
-        new_status = "CHECK_IN_OPEN"
 
     await db.matches.update_one(
         {"_id": match["_id"]},
         {"$set": {
             "check_in_status": check_in_status,
             "check_ins": check_ins,
-            "status": new_status,
+            # Status deliberately NOT changed — keep existing status.
         }}
     )
 
@@ -441,7 +439,7 @@ async def captain_check_in(
         role=current_user.role,
         action="MATCH_CHECK_IN",
         target=f"Match {mid}",
-        details=f"Player @{current_user.username} checked in. Match status remains {new_status}.",
+        details=f"Player @{current_user.username} confirmed participation. Match status: {current_status}.",
     )
     try:
         from app.services.live_match_service import sync_live_match_for_tournament
@@ -449,7 +447,7 @@ async def captain_check_in(
     except Exception:
         pass
 
-    return {"status": "success", "message": f"Check-in verified. Match is {new_status}.", "check_in_status": check_in_status}
+    return {"status": "success", "message": "Participation confirmed.", "check_in_status": check_in_status}
 
 @router.post("/{id}/submit-result")
 async def submit_match_result(
@@ -528,6 +526,10 @@ async def submit_battle_royale_results_matches_alias(
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     from app.api.v1.endpoints.admin import submit_battle_royale_results_admin, BattleRoyaleSubmitResultsPayload
+    # If qualifiers/results are being submitted on a LIVE or SCHEDULED match, transition match to ENDED first
+    m = await db.matches.find_one({"$or": [{"_id": id}, {"id": id}]})
+    if m and m.get("status") in ["LIVE", "SCHEDULED", "CHECK_IN_OPEN"]:
+        await db.matches.update_one({"$or": [{"_id": id}, {"id": id}]}, {"$set": {"status": "ENDED"}})
     p = BattleRoyaleSubmitResultsPayload(**payload)
     return await submit_battle_royale_results_admin(id=id, payload=p, admin_user=current_user, db=db)
 
@@ -998,71 +1000,12 @@ async def get_match_join_info(
                 "match_message": match_msg,
             }
 
-    # Verify user is a confirmed participant on either competing team
-    team_a_id = match.get("team_a_id")
-    team_b_id = match.get("team_b_id")
-    team_names = [t for t in [match.get("team_a_name"), match.get("team_b_name"), match.get("team_a_placeholder"), match.get("team_b_placeholder")] if t]
-    competing_teams = [t for t in [team_a_id, team_b_id] if t]
-
-    is_participant = False
-    # Check solo player match
-    if current_user.id in [team_a_id, team_b_id]:
-        is_participant = True
-    else:
-        # Check team rosters by IDs or team names
-        team_match = await db.teams.find_one({
-            "$and": [
-                {"$or": [
-                    {"_id": {"$in": competing_teams}},
-                    {"id": {"$in": competing_teams}},
-                    {"name": {"$in": team_names}},
-                ]},
-                {"$or": [
-                    {"captain_id": current_user.id},
-                    {"members.user_id": current_user.id},
-                    {"substitutes.user_id": current_user.id},
-                ]}
-            ]
-        })
-        if team_match:
-            is_participant = True
-
-    # Also check if user has a confirmed registration matching this match
-    if not is_participant:
-        user_reg = await db.tournament_registrations.find_one({
-            "tournament_id": {"$in": [tourn_id, str(match.get("tournament_id"))]},
-            "$or": [
-                {"player_id": current_user.id},
-                {"captain_id": current_user.id},
-                {"team_id": {"$in": competing_teams}},
-                {"team_name": {"$in": team_names}},
-            ],
-            "payment_status": {"$in": ["PAID", "FREE"]},
-        })
-        if user_reg:
-            is_participant = True
-
-    if not is_participant:
+    # Verify user is an authorized participant or admin for this match
+    is_auth = await is_match_authorized_viewer(current_user, match, db)
+    if not is_auth:
         raise HTTPException(
             status_code=403,
             detail="Join information is restricted to confirmed match participants.",
-        )
-
-    # Check participant has a confirmed registration in this tournament
-    reg_check = await db.tournament_registrations.find_one({
-        "tournament_id": {"$in": [tourn_id, str(match.get("tournament_id"))]},
-        "$or": [
-            {"player_id": current_user.id},
-            {"captain_id": current_user.id},
-            {"team_id": {"$in": competing_teams}},
-            {"team_name": {"$in": team_names}},
-        ],
-        "payment_status": {"$in": ["PAID", "FREE"]},
-    })
-    if not reg_check and current_user.role not in ["SUPER_ADMIN", "ORGANIZER"]:
-        raise HTTPException(
-            status_code=403,
-            detail="Your tournament registration is not confirmed.",
         )
 
     # Gating on credentials_released for participants
@@ -1076,21 +1019,24 @@ async def get_match_join_info(
             "lobby_code": None,
             "lobby_password": None,
             "custom_instructions": None,
-            "match_message": "Credentials have not been released by the organizer yet. They will appear here once check-in opens.",
+            "match_message": "Credentials have not been released by the organizer yet. They will appear here once released.",
             "credentials_released": False,
         }
 
+    room_val = match.get("room_id") or match.get("lobby_code") or match.get("custom_room_id")
+    pass_val = match.get("room_password") or match.get("lobby_password") or match.get("custom_room_password")
+
     resolved_join_info = dict(join_info or {}) if isinstance(join_info, dict) else {}
-    if match.get("room_id") and "room_id" not in resolved_join_info:
-        resolved_join_info["room_id"] = match.get("room_id")
-    if match.get("room_password") and "room_password" not in resolved_join_info:
-        resolved_join_info["room_password"] = match.get("room_password")
+    if room_val and "room_id" not in resolved_join_info:
+        resolved_join_info["room_id"] = room_val
+    if pass_val and "room_password" not in resolved_join_info:
+        resolved_join_info["room_password"] = pass_val
 
     return {
         "join_info_enabled": enabled or credentials_released,
         "join_info": resolved_join_info if (enabled or credentials_released) else None,
-        "room_id": match.get("room_id") or match.get("lobby_code"),
-        "room_password": match.get("room_password") or match.get("lobby_password"),
+        "room_id": room_val,
+        "room_password": pass_val,
         "custom_instructions": match.get("custom_instructions"),
         "match_message": match.get("custom_instructions") or match_msg,
         "credentials_released": credentials_released,

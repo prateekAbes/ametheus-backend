@@ -259,5 +259,5 @@ async def test_solo_player_captain_check_in(client_with_auth):
     assert res.status_code == 200, res.text
     data = res.json()
     assert data["status"] == "success"
-    assert "CHECK_IN_OPEN" in data["message"]
+    assert "Participation confirmed" in data["message"]
     assert data["check_in_status"][user.id] is True

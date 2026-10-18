@@ -5423,8 +5423,9 @@ async def release_match_credentials_admin(
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """
-    Section 7 & 8: Explicitly releases credentials and opens check-in window.
-    Credentials become accessible to eligible match participants.
+    Releases credentials for eligible match participants.
+    Credentials become immediately accessible; no check-in required.
+    Match status remains SCHEDULED until the organizer explicitly goes live.
     """
     from bson import ObjectId
     from app.models.base import get_utc_now
@@ -5441,8 +5442,8 @@ async def release_match_credentials_admin(
     mid = str(match.get("_id", match.get("id")))
     now = get_utc_now()
 
-    room_val = match.get("room_id") or match.get("lobby_code") or ""
-    pass_val = match.get("room_password") or match.get("lobby_password") or ""
+    room_val = match.get("room_id") or match.get("lobby_code") or match.get("custom_room_id") or ""
+    pass_val = match.get("room_password") or match.get("lobby_password") or match.get("custom_room_password") or ""
 
     upd: Dict[str, Any] = {
         "credentials_released": True,
@@ -5460,9 +5461,8 @@ async def release_match_credentials_admin(
             "password": pass_val,
         },
     }
-    # Open check-in if not already live or completed
-    if match.get("status") in ["SCHEDULED", "DRAFT", None]:
-        upd["status"] = "CHECK_IN_OPEN"
+    # NOTE: Do NOT change status to CHECK_IN_OPEN. Check-in system is removed.
+    # Status remains as-is (SCHEDULED). The organizer explicitly uses Go Live to transition.
 
     await db.matches.update_one(m_query, {"$set": upd})
 
@@ -5472,7 +5472,7 @@ async def release_match_credentials_admin(
             match_id=mid,
             reminder_type="FIFTEEN_MINUTES",
             db=db,
-            custom_message="Match credentials have been released! Captain check-in is now open.",
+            custom_message="Match credentials have been released! Check your Competitor Hub to view room details.",
         )
     except Exception as e:
         print(f"[Release Credentials Notification]: {e}")
@@ -5483,7 +5483,7 @@ async def release_match_credentials_admin(
         role=admin_user.role,
         action="RELEASE_CREDENTIALS",
         target=f"Match {mid}",
-        details="Match credentials released and check-in opened for participants.",
+        details="Match credentials released for participants. Status unchanged.",
     )
 
     try:
@@ -5494,10 +5494,10 @@ async def release_match_credentials_admin(
 
     return {
         "status": "success",
-        "message": "Credentials released and check-in window opened successfully.",
+        "message": "Credentials released successfully.",
         "match_id": mid,
         "credentials_released": True,
-        "status": upd.get("status", match.get("status")),
+        "current_status": match.get("status"),
     }
 
 
@@ -5875,8 +5875,8 @@ async def submit_battle_royale_results_admin(
             {"$set": {"status": "LIVE", "updated_at": get_utc_now()}}
         )
 
-        # Generate or update downstream round if advancing qualifiers
-        if payload.advance_to_next_round or raw_qualifier_ids:
+        # Generate or update downstream round ONLY if explicitly requested by organizer
+        if payload.advance_to_next_round:
             next_round_num = curr_round_num + 1
             next_round_name = payload.next_round_name or f"Round {next_round_num}"
 
@@ -5901,7 +5901,7 @@ async def submit_battle_royale_results_admin(
                             "name": next((r["team_name"] for r in processed_results if r["team_id"] == qid), f"Team {qid}"),
                         })
 
-            # Check if an existing downstream match for this tournament/round already exists (Idempotency)
+            # Check if an existing downstream match was explicitly created by the organizer (Idempotency)
             existing_next = await db.matches.find_one({
                 "$or": [{"tournament_id": tid}, {"tournament_id": match.get("tournament_id")}],
                 "round_number": next_round_num,
@@ -5942,24 +5942,16 @@ async def submit_battle_royale_results_admin(
                     stage_name=next_round_name,
                     round_name=next_round_name,
                     stage=next_round_name,
-                    match_type="BATTLE_ROYALE",
                     round_number=next_round_num,
                     match_number=1,
                     format="Battle Royale",
-                    series_format="BO1",
                     status="SCHEDULED",
-                    room_capacity=match.get("room_capacity", 100),
-                    players_per_team=match.get("players_per_team", 4),
-                    max_teams=len(advancing_teams),
                     teams=advancing_teams,
                     team_ids=raw_qualifier_ids,
-                    team_a_id=None,
-                    team_a_name=None,
-                    team_b_id=None,
-                    team_b_name=None,
-                    scheduled_time="TBD",
-                    server_region=match.get("server_region") or tourn.get("server_region", "AWS Mumbai (ap-south-1)"),
+                    max_teams=len(advancing_teams),
                     previous_match_ids=[match_id_str],
+                    created_at=get_utc_now(),
+                    updated_at=get_utc_now(),
                 )
                 await db.matches.insert_one(new_match.to_mongo())
 
