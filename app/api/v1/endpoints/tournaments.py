@@ -21,7 +21,7 @@ from app.schemas import (
     TournamentRegistrationStatusResponse,
     TournamentStageFormatsUpdate,
 )
-from app.services.wallet_service import debit_wallet_funds
+from app.services.wallet_service import debit_wallet_funds, credit_wallet_funds
 from app.services.upi_service import get_next_active_upi_account, build_upi_payment_uri
 from app.services.audit import record_audit_log
 from app.services.notification import create_notification
@@ -1346,8 +1346,279 @@ async def get_registration_status(
         payment_status=reg_dict.get("payment_status"),
         registration=reg_dict,
         team=team_payload,
-        position=position,
     )
+
+@router.post("/{id}/unregister")
+async def unregister_from_tournament(
+    id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Cancel registration and unregister participant from tournament.
+    Refunds entry fee to user wallet if paid via wallet.
+    Only registration owner (solo player or team captain) or admin can cancel.
+    Prevents cancellation if tournament has active matches or recorded results.
+    """
+    tourn = await find_tournament_by_id_or_slug(db, id)
+    if not tourn:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+
+    tid = str(tourn.get("_id", tourn.get("id")))
+    tslug = tourn.get("slug", tid)
+
+    # 1. Check tournament lifecycle state
+    t_status = str(tourn.get("status", "")).upper()
+    is_admin = current_user.role in ["SUPER_ADMIN", "ADMIN"]
+    if t_status in ["LIVE", "IN_PROGRESS", "ACTIVE", "COMPLETED", "ENDED"] and not is_admin:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot unregister: Tournament matches are already active or concluded."
+        )
+
+    valid_user_ids = {str(current_user.id)}
+    if getattr(current_user, "clerk_user_id", None):
+        valid_user_ids.add(str(current_user.clerk_user_id))
+
+    # Find the user's teams
+    user_teams = await db.teams.find({"captain_id": {"$in": list(valid_user_ids)}}).to_list(length=50)
+    user_team_ids = [str(t.get("_id", t.get("id"))) for t in user_teams]
+
+    # 2. Find active registration
+    reg_query = {
+        "$and": [
+            {"$or": [{"tournament_id": tid}, {"tournament_id": tslug}]},
+            {"payment_status": {"$in": ["PAID", "FREE", "PENDING", "PENDING_VERIFICATION"]}},
+            {"$or": [
+                {"player_id": {"$in": list(valid_user_ids)}},
+                {"user_id": {"$in": list(valid_user_ids)}},
+                {"team_id": {"$in": user_team_ids}}
+            ]}
+        ]
+    }
+    reg = await db.tournament_registrations.find_one(reg_query)
+    if not reg:
+        raise HTTPException(status_code=404, detail="No active registration found for this tournament.")
+
+    # 3. Prevent unregistration if this participant is in an active or completed match
+    part_id = str(reg.get("team_id") or reg.get("player_id") or reg.get("user_id"))
+    active_match = await db.matches.find_one({
+        "$and": [
+            {"$or": [{"tournament_id": tid}, {"tournament_id": tslug}]},
+            {"$or": [
+                {"team_a_id": part_id},
+                {"team_b_id": part_id},
+                {"registered_participant_ids": part_id},
+            ]},
+            {"status": {"$in": ["LIVE", "COMPLETED", "RESULTS_SAVED"]}}
+        ]
+    })
+    if active_match and not is_admin:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot unregister: You are participating in a match that is live or completed."
+        )
+
+    # 4. Handle refund if entry fee was paid via wallet
+    refunded_inr = 0
+    now = datetime.now(timezone.utc)
+    is_paid = reg.get("payment_status") == "PAID"
+    paid_via_wallet = reg.get("payment_method") in ["WALLET", None] or "amount_paid" in reg
+    if is_paid and paid_via_wallet:
+        fee_inr = int(tourn.get("entry_fee_inr") or tourn.get("entry_fee") or reg.get("amount_paid") or 0)
+        if fee_inr > 0:
+            fee_paise = int(round(fee_inr * 100))
+            refund_ref = f"refund_{reg.get('id')}_{uuid.uuid4().hex[:8]}"
+            await credit_wallet_funds(
+                db=db,
+                user_id=reg.get("player_id") or reg.get("user_id") or current_user.id,
+                amount_paise=fee_paise,
+                txn_type="REFUND",
+                reference_id=refund_ref,
+                description=f"Entry fee refund: Cancelled registration for {tourn.get('title')}",
+            )
+            refunded_inr = fee_inr
+
+    # 5. Mark registration as CANCELLED
+    await db.tournament_registrations.update_one(
+        {"_id": reg["_id"]},
+        {"$set": {
+            "payment_status": "CANCELLED",
+            "status": "CANCELLED",
+            "cancelled_at": now,
+            "cancelled_by": current_user.username,
+            "refunded_inr": refunded_inr,
+        }}
+    )
+
+    # 6. Remove from any scheduled upcoming round eligible_contenders
+    await db.tournament_rounds.update_many(
+        {
+            "$and": [
+                {"$or": [{"tournament_id": tid}, {"tournament_id": tslug}]},
+                {"status": {"$in": ["UPCOMING", "SCHEDULED"]}}
+            ]
+        },
+        {"$pull": {"eligible_contenders": {"id": part_id}}}
+    )
+
+    # 7. Decrement participant counts and reopen registration if closed
+    t_updates: Dict[str, Any] = {}
+    if (tourn.get("current_participants") or 0) > 0:
+        t_updates["current_participants"] = max(0, int(tourn.get("current_participants", 1)) - 1)
+    if (tourn.get("current_teams") or 0) > 0:
+        t_updates["current_teams"] = max(0, int(tourn.get("current_teams", 1)) - 1)
+    if tourn.get("status") == "REGISTRATION_CLOSED" and not tourn.get("is_registration_closed"):
+        t_updates["status"] = "REGISTRATION_OPEN"
+
+    if t_updates:
+        await db.tournaments.update_one(
+            {"_id": tourn["_id"]},
+            {"$set": t_updates}
+        )
+
+    # 8. Create in-app notification
+    await create_notification(
+        db=db,
+        user_id=current_user.id,
+        title="Tournament Registration Cancelled",
+        message=f'Your registration for "{tourn.get("title")}" has been cancelled.' + (f' ₹{refunded_inr} has been refunded to your wallet.' if refunded_inr > 0 else ''),
+        notification_type="REGISTRATION",
+        category="REGISTRATION",
+        link=f"/tournaments/{tslug}",
+    )
+
+    return {
+        "status": "success",
+        "message": f'Registration cancelled successfully.' + (f' ₹{refunded_inr} refunded to your wallet.' if refunded_inr > 0 else ''),
+        "refunded_amount_inr": refunded_inr,
+    }
+
+@router.get("/{id}/credentials")
+async def get_tournament_participant_credentials(
+    id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Returns official match room credentials for registered participants when released.
+    """
+    tourn = await find_tournament_by_id_or_slug(db, id)
+    if not tourn:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+
+    tid = str(tourn.get("_id", tourn.get("id")))
+    tslug = tourn.get("slug", tid)
+
+    is_admin = current_user.role in ["SUPER_ADMIN", "ADMIN", "ORGANIZER"]
+
+    valid_user_ids = {str(current_user.id)}
+    if getattr(current_user, "clerk_user_id", None):
+        valid_user_ids.add(str(current_user.clerk_user_id))
+
+    # Check registration
+    reg = await db.tournament_registrations.find_one({
+        "$and": [
+            {"$or": [{"tournament_id": tid}, {"tournament_id": tslug}]},
+            {"payment_status": {"$in": ["PAID", "FREE"]}},
+            {"$or": [
+                {"player_id": {"$in": list(valid_user_ids)}},
+                {"team_id": {"$exists": True}}
+            ]}
+        ]
+    })
+    is_registered = bool(reg) or is_admin
+    if not is_registered and not is_admin:
+        # Check team membership
+        user_teams = await db.teams.find({
+            "$or": [
+                {"captain_id": {"$in": list(valid_user_ids)}},
+                {"members.user_id": {"$in": list(valid_user_ids)}}
+            ]
+        }).to_list(length=20)
+        team_ids = [str(t.get("_id", t.get("id"))) for t in user_teams]
+        if team_ids:
+            team_reg = await db.tournament_registrations.find_one({
+                "$or": [{"tournament_id": tid}, {"tournament_id": tslug}],
+                "team_id": {"$in": team_ids},
+                "payment_status": {"$in": ["PAID", "FREE"]},
+            })
+            if team_reg:
+                is_registered = True
+
+    if not is_registered:
+        raise HTTPException(status_code=403, detail="Only registered participants can access match room credentials.")
+
+    # 1. Check user active match in this tournament
+    user_part_ids = list(valid_user_ids)
+    if reg and reg.get("team_id"):
+        user_part_ids.append(str(reg.get("team_id")))
+
+    user_match = await db.matches.find_one({
+        "$and": [
+            {"$or": [{"tournament_id": tid}, {"tournament_id": tslug}]},
+            {"$or": [
+                {"team_a_id": {"$in": user_part_ids}},
+                {"team_b_id": {"$in": user_part_ids}},
+                {"registered_participant_ids": {"$in": user_part_ids}},
+            ]},
+            {"status": {"$ne": "DELETED"}},
+        ]
+    })
+    if user_match:
+        m_stat = str(user_match.get("status", "")).upper()
+        m_released = bool(user_match.get("credentials_released")) or m_stat == "LIVE" or is_admin
+        if m_released and user_match.get("room_id"):
+            return {
+                "status": "success",
+                "is_released": True,
+                "room_id": user_match.get("room_id"),
+                "room_password": user_match.get("room_password") or "None",
+                "custom_instructions": user_match.get("custom_instructions"),
+                "server_region": user_match.get("server_region") or tourn.get("server_region", "AWS Mumbai (ap-south-1)"),
+                "round_name": user_match.get("round_name") or "Match",
+                "match_number": user_match.get("match_number", 1),
+            }
+
+    # 2. Check active round in tournament_rounds
+    active_round = await db.tournament_rounds.find_one({
+        "$and": [
+            {"$or": [{"tournament_id": tid}, {"tournament_id": tslug}]},
+            {"status": {"$in": ["LIVE", "UPCOMING", "SCHEDULED"]}},
+        ]
+    })
+    if active_round:
+        r_stat = str(active_round.get("status", "")).upper()
+        r_released = bool(active_round.get("credentials_released")) or r_stat == "LIVE" or is_admin
+        if r_released and active_round.get("room_id"):
+            return {
+                "status": "success",
+                "is_released": True,
+                "room_id": active_round.get("room_id"),
+                "room_password": active_round.get("room_password") or "None",
+                "custom_instructions": active_round.get("custom_instructions"),
+                "server_region": tourn.get("server_region", "AWS Mumbai (ap-south-1)"),
+                "round_name": active_round.get("stage_name") or active_round.get("round_name"),
+            }
+
+    # 3. Check tournament-level customRoomId
+    t_room_id = tourn.get("custom_room_id") or tourn.get("customRoomId")
+    if t_room_id and (tourn.get("status") == "LIVE" or is_admin):
+        return {
+            "status": "success",
+            "is_released": True,
+            "room_id": t_room_id,
+            "room_password": tourn.get("custom_room_password") or tourn.get("customRoomPassword") or "None",
+            "custom_instructions": tourn.get("custom_instructions"),
+            "server_region": tourn.get("server_region", "AWS Mumbai (ap-south-1)"),
+        }
+
+    return {
+        "status": "success",
+        "is_released": False,
+        "message": "Credentials will be live prior to the game.",
+    }
+
 
 @router.post("/{id}/register-upi", response_model=TournamentRegisterUpiResponse)
 @router.post("/{id}/register/upi", response_model=TournamentRegisterUpiResponse)

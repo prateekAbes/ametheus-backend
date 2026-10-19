@@ -140,10 +140,51 @@ async def sync_live_match_for_tournament(
         if e.get("roster_status") != "DRAFT"
     ]
 
-    # If the tournament has no persisted matches in db.matches, it has NO live or upcoming match
+    # Check for tournament rounds in db.tournament_rounds (e.g. Battle Royale or round-managed tournaments)
+    rounds_cursor = db.tournament_rounds.find({
+        "$or": [{"tournament_id": tid}, {"tournament_id": tslug}],
+        "status": {"$nin": ["CANCELLED", "DELETED"]},
+    }).sort("round_number", 1)
+    rounds = await rounds_cursor.to_list(length=100)
+
+    # If the tournament has no persisted matches in db.matches, synthesize encounters from tournament_rounds
+    if not valid_encounters and rounds:
+        for r in rounds:
+            r_st = str(r.get("status", "UPCOMING")).upper()
+            enc_status = "LIVE" if r_st in ["LIVE", "IN_PROGRESS"] else ("COMPLETED" if r_st == "COMPLETED" else "SCHEDULED")
+            synth_enc = {
+                "_id": str(r.get("_id", r.get("id"))),
+                "id": str(r.get("_id", r.get("id"))),
+                "tournament_id": tid,
+                "round_number": r.get("round_number", 1),
+                "round_name": r.get("round_name") or r.get("stage_name") or f"Round {r.get('round_number', 1)}",
+                "stage": r.get("stage_name") or r.get("round_name") or f"Round {r.get('round_number', 1)}",
+                "format": r.get("format", "Battle Royale"),
+                "status": enc_status,
+                "room_id": r.get("room_id"),
+                "room_password": r.get("room_password"),
+                "lobby_code": r.get("room_id"),
+                "lobby_password": r.get("room_password"),
+                "credentials_released": bool(r.get("credentials_released", False)),
+                "teams": r.get("eligible_contenders") or [],
+                "team_ids": [c.get("id") for c in (r.get("eligible_contenders") or []) if c.get("id")],
+                "squads_count": len(r.get("eligible_contenders") or []),
+                "qualifier_team_ids": r.get("qualifier_ids") or [],
+                "eliminated_ids": r.get("eliminated_ids") or [],
+                "placements": r.get("placements") or [],
+                "winner_team_id": r.get("winner_id") or r.get("winner_team_id"),
+                "order": r.get("round_number", 1),
+                "scheduled_at": r.get("scheduled_at") or tourn.get("starts_at"),
+            }
+            valid_encounters.append(synth_enc)
+
+    # If the tournament has neither matches nor rounds, it has NO live or upcoming match
     if not valid_encounters:
         await db.live_matches.delete_one({"tournament_id": tid})
         return None
+
+    # Check if any tournament round is currently LIVE
+    active_live_round = next((r for r in rounds if str(r.get("status", "")).upper() in ["LIVE", "IN_PROGRESS"]), None)
 
     # 4. Determine current encounter
     current_encounter, calculated_status = determine_current_encounter(valid_encounters, tourn)
@@ -151,10 +192,10 @@ async def sync_live_match_for_tournament(
         await db.live_matches.delete_one({"tournament_id": tid})
         return None
 
-    # Tournament status override
+    # Round or Tournament status override
     if tourn_status == "COMPLETED":
         calculated_status = "COMPLETED"
-    elif tourn_status in ["LIVE", "ONGOING"] and calculated_status != "COMPLETED":
+    elif (tourn_status in ["LIVE", "ONGOING"] or active_live_round is not None) and calculated_status != "COMPLETED":
         calculated_status = "LIVE"
 
     fmt = tourn.get("format") or tourn.get("tournament_type") or "Knockout"

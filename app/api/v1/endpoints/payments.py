@@ -211,12 +211,20 @@ async def submit_payment_utr(
     if existing_utr:
         raise HTTPException(status_code=400, detail="This UPI Transaction ID / UTR has already been submitted for another payment.")
 
+    if payment.get("payment_type") == "WALLET_TOPUP":
+        if not payload.screenshot_url or not str(payload.screenshot_url).strip():
+            raise HTTPException(
+                status_code=400,
+                detail="Payment screenshot is required for wallet add-money verification. Please upload your payment screenshot before submitting.",
+            )
+
     await db.game_payments.update_one(
         {"_id": payment["_id"]},
         {
             "$set": {
                 "utr": clean_utr,
                 "screenshot_url": payload.screenshot_url,
+                "proof_url": payload.screenshot_url,
                 "status": "PENDING",
             }
         }

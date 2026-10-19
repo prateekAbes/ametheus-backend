@@ -1213,5 +1213,26 @@ class KnockoutMatchResultPayload(BaseModel):
     score_a: Optional[int] = 0
     score_b: Optional[int] = 0
 
+class TournamentRoundUpdatePayload(BaseModel):
+    stage_name: Optional[str] = None
+    round_name: Optional[str] = None
+    name: Optional[str] = None
+    format: Optional[str] = None
+    competition_format: Optional[str] = None
+    is_final_round: Optional[bool] = None
+    scheduled_time: Optional[str] = None
+    scheduled_date: Optional[str] = None
+    status: Optional[str] = None
+
+class KnockoutMatchUpdatePayload(BaseModel):
+    match_number: Optional[int] = None
+    team_a_id: Optional[str] = None
+    team_b_id: Optional[str] = None
+    scheduled_time: Optional[str] = None
+    room_id: Optional[str] = None
+    room_password: Optional[str] = None
+    custom_instructions: Optional[str] = None
+    status: Optional[str] = None
+
 
 

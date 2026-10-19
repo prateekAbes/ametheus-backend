@@ -1199,3 +1199,92 @@ async def send_match_roster_notification_email(
     return ok, err_det
 
 
+async def send_credentials_release_email(
+    to_email: str,
+    recipient_name: str,
+    tournament_title: str,
+    round_or_match_name: str,
+    room_id: str,
+    room_password: Optional[str] = None,
+    custom_instructions: Optional[str] = None,
+    tournament_slug: Optional[str] = None,
+) -> Tuple[bool, Optional[str]]:
+    """
+    Sends official match room credentials to an authorized participant when released by an organizer.
+    """
+    to_email_clean = (to_email or "").strip().lower()
+    if not to_email_clean or "@" not in to_email_clean:
+        return False, "Recipient email is invalid or missing"
+
+    subject = f"[Ametheus] Match Credentials Released: {tournament_title} — {round_or_match_name}"
+    
+    pass_text = f"Room Password: {room_password}" if room_password and room_password != "None" else "Room Password: None (No password required)"
+    instructions_text = f"\nHost Instructions: {custom_instructions}" if custom_instructions else ""
+    link_url = f"https://www.ametheus.games/tournaments/{tournament_slug}" if tournament_slug else "https://www.ametheus.games"
+
+    text_body = f"""Hello {recipient_name},
+
+Official match room credentials for {tournament_title} ({round_or_match_name}) are now LIVE.
+
+Room ID: {room_id}
+{pass_text}{instructions_text}
+
+Reporting Window: Join the lobby 15 minutes prior to kickoff.
+Access your Competitor Hub and Tournament details: {link_url}
+
+Good luck and play fair!
+— The Ametheus Esports Operations Team
+"""
+
+    pass_html = f'<p style="margin: 6px 0; font-size: 15px; color: #f59e0b;"><strong>Room Password:</strong> <code style="background: #1e1b4b; padding: 3px 8px; border-radius: 4px; font-weight: bold; color: #fbbf24;">{room_password}</code></p>' if room_password and room_password != "None" else '<p style="margin: 6px 0; font-size: 14px; color: #94a3b8;"><strong>Room Password:</strong> None (No password required)</p>'
+    instructions_html = f'<div style="margin-top: 12px; padding: 10px; background: #0f172a; border-left: 3px solid #06b6d4; font-size: 13px; color: #cbd5e1;"><strong>Host Instructions:</strong> {custom_instructions}</div>' if custom_instructions else ""
+
+    html_body = f"""<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body style="background: #020617; color: #f8fafc; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; padding: 24px; margin: 0;">
+  <div style="max-width: 580px; margin: 0 auto; background: #090d16; border: 1px solid rgba(6, 182, 212, 0.3); border-radius: 8px; overflow: hidden; box-shadow: 0 10px 30px rgba(0,0,0,0.5);">
+    <div style="background: linear-gradient(135deg, #0e1e38 0%, #030712 100%); padding: 24px; border-bottom: 1px solid rgba(255,255,255,0.1);">
+      <h1 style="margin: 0; font-size: 20px; font-weight: 800; color: #06b6d4; text-transform: uppercase; letter-spacing: 0.05em;">AMETHEUS COMPETITIVE</h1>
+      <p style="margin: 4px 0 0; font-size: 13px; color: #94a3b8;">Match Room Credentials Release</p>
+    </div>
+    <div style="padding: 24px;">
+      <p style="font-size: 15px; line-height: 1.5; color: #e2e8f0;">Hello <strong>{recipient_name}</strong>,</p>
+      <p style="font-size: 14px; line-height: 1.5; color: #94a3b8;">Your match room credentials for <strong>{tournament_title}</strong> (<em>{round_or_match_name}</em>) have been published and are active.</p>
+      
+      <div style="margin: 20px 0; padding: 18px; background: #040814; border: 1px solid rgba(6, 182, 212, 0.4); border-radius: 6px;">
+        <span style="display: block; font-size: 11px; text-transform: uppercase; font-weight: 700; color: #06b6d4; letter-spacing: 0.1em; margin-bottom: 6px;">Official Room Credentials</span>
+        <p style="margin: 6px 0; font-size: 18px; color: #06b6d4;"><strong>Room ID:</strong> <code style="background: #0e2a47; padding: 4px 10px; border-radius: 4px; font-weight: 800; color: #38bdf8; letter-spacing: 0.05em;">{room_id}</code></p>
+        {pass_html}
+        {instructions_html}
+      </div>
+
+      <p style="font-size: 13px; color: #94a3b8; line-height: 1.5;">Reporting Window: Please enter the lobby at least <strong>15 minutes prior</strong> to kickoff.</p>
+      
+      <div style="margin-top: 24px; text-align: center;">
+        <a href="{link_url}" style="display: inline-block; background: #06b6d4; color: #020617; font-weight: 800; font-size: 13px; text-transform: uppercase; padding: 12px 24px; text-decoration: none; border-radius: 4px; letter-spacing: 0.05em;">Open Tournament Hub</a>
+      </div>
+    </div>
+    <div style="background: #040711; padding: 14px 24px; border-top: 1px solid rgba(255,255,255,0.06); font-size: 11px; color: #64748b; text-align: center;">
+      Ametheus Platform · Automated Match Dispatch · Play Fair
+    </div>
+  </div>
+</body>
+</html>
+"""
+
+    ok, err_code, err_det, msg_id, _ = await asyncio.to_thread(
+        _send_identity_smtp_sync,
+        "noreply",
+        to_email_clean,
+        subject,
+        text_body,
+        html_body,
+        settings.NOREPLY_REPLY_TO.strip(),
+        None,
+        None,
+    )
+    return ok, err_det
+
+
+
