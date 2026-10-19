@@ -1523,7 +1523,7 @@ async def get_tournament_participant_credentials(
             {"payment_status": {"$in": ["PAID", "FREE"]}},
             {"$or": [
                 {"player_id": {"$in": list(valid_user_ids)}},
-                {"team_id": {"$exists": True}}
+                {"user_id": {"$in": list(valid_user_ids)}},
             ]}
         ]
     })
@@ -1554,12 +1554,27 @@ async def get_tournament_participant_credentials(
     if reg and reg.get("team_id"):
         user_part_ids.append(str(reg.get("team_id")))
 
+    # Also include all team IDs the user belongs to (for BR where team participates)
+    if not (reg and reg.get("team_id")):
+        user_teams_for_match = await db.teams.find({
+            "$or": [
+                {"captain_id": {"$in": list(valid_user_ids)}},
+                {"members.user_id": {"$in": list(valid_user_ids)}}
+            ]
+        }).to_list(length=20)
+        for t in user_teams_for_match:
+            tid_str = str(t.get("_id", t.get("id")))
+            if tid_str and tid_str not in user_part_ids:
+                user_part_ids.append(tid_str)
+
     user_match = await db.matches.find_one({
         "$and": [
             {"$or": [{"tournament_id": tid}, {"tournament_id": tslug}]},
             {"$or": [
                 {"team_a_id": {"$in": user_part_ids}},
                 {"team_b_id": {"$in": user_part_ids}},
+                {"team_ids": {"$in": user_part_ids}},
+                {"teams.id": {"$in": user_part_ids}},
                 {"registered_participant_ids": {"$in": user_part_ids}},
             ]},
             {"status": {"$ne": "DELETED"}},
@@ -1572,6 +1587,7 @@ async def get_tournament_participant_credentials(
             return {
                 "status": "success",
                 "is_released": True,
+                "credentials_released": True,
                 "room_id": user_match.get("room_id"),
                 "room_password": user_match.get("room_password") or "None",
                 "custom_instructions": user_match.get("custom_instructions"),
@@ -1580,13 +1596,15 @@ async def get_tournament_participant_credentials(
                 "match_number": user_match.get("match_number", 1),
             }
 
-    # 2. Check active round in tournament_rounds
-    active_round = await db.tournament_rounds.find_one({
+    # 2. Check active round in tournament_rounds (sorted by round_number DESC to get the latest active round)
+    active_round_cursor = db.tournament_rounds.find({
         "$and": [
             {"$or": [{"tournament_id": tid}, {"tournament_id": tslug}]},
             {"status": {"$in": ["LIVE", "UPCOMING", "SCHEDULED"]}},
         ]
-    })
+    }).sort("round_number", -1).limit(1)
+    active_rounds = await active_round_cursor.to_list(length=1)
+    active_round = active_rounds[0] if active_rounds else None
     if active_round:
         r_stat = str(active_round.get("status", "")).upper()
         r_released = bool(active_round.get("credentials_released")) or r_stat == "LIVE" or is_admin
@@ -1594,6 +1612,7 @@ async def get_tournament_participant_credentials(
             return {
                 "status": "success",
                 "is_released": True,
+                "credentials_released": True,
                 "room_id": active_round.get("room_id"),
                 "room_password": active_round.get("room_password") or "None",
                 "custom_instructions": active_round.get("custom_instructions"),
@@ -1607,6 +1626,7 @@ async def get_tournament_participant_credentials(
         return {
             "status": "success",
             "is_released": True,
+            "credentials_released": True,
             "room_id": t_room_id,
             "room_password": tourn.get("custom_room_password") or tourn.get("customRoomPassword") or "None",
             "custom_instructions": tourn.get("custom_instructions"),
@@ -1616,6 +1636,7 @@ async def get_tournament_participant_credentials(
     return {
         "status": "success",
         "is_released": False,
+        "credentials_released": False,
         "message": "Credentials will be live prior to the game.",
     }
 

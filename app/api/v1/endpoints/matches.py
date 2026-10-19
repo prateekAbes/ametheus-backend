@@ -18,10 +18,14 @@ def normalize_match_format(fmt: Optional[str]) -> str:
     if not fmt:
         return "Best of 1"
     f = fmt.strip().lower()
+    if "battle royale" in f or "battle_royale" in f or f == "br":
+        return "Battle Royale"
     if f in ["bo1", "best of 1"]:
         return "Best of 1"
-    if f in ["bo3", "best of 3", "bo5", "best of 5"]:
+    if f in ["bo3", "best of 3"]:
         return "Best of 3"
+    if f in ["bo5", "best of 5"]:
+        return "Best of 5"
     return "Best of 1"
 
 @router.get("", response_model=List[MatchResponse])
@@ -48,10 +52,14 @@ async def list_matches(
             "is_dummy": {"$ne": True},
             "roster_status": {"$ne": "DRAFT"},
         })
+        active_tournaments_with_rounds = await db.tournament_rounds.distinct("tournament_id", {
+            "status": {"$nin": ["CANCELLED", "DELETED"]},
+        })
+        active_tournaments = list(set(active_tournaments_with_matches + active_tournaments_with_rounds))
         lm_count = await db.live_matches.count_documents({
             "current_encounter_id": {"$ne": None, "$exists": True}
         })
-        if lm_count < len(active_tournaments_with_matches):
+        if lm_count < len(active_tournaments):
             from app.services.live_match_service import reconcile_all_live_matches
             await reconcile_all_live_matches(db)
 
@@ -90,9 +98,38 @@ async def list_matches(
                 "is_dummy": {"$ne": True},
             })
             if not real_match:
-                # Purge stale live match
-                await db.live_matches.delete_one({"_id": lm["_id"]})
-                continue
+                # Check if this encounter is a round from tournament_rounds (e.g. Battle Royale format)
+                real_round = await db.tournament_rounds.find_one({
+                    "$or": enc_q,
+                    "status": {"$nin": ["CANCELLED", "DELETED"]},
+                })
+                if real_round:
+                    r_st = str(real_round.get("status", "UPCOMING")).upper()
+                    enc_status = "LIVE" if r_st in ["LIVE", "IN_PROGRESS"] else ("COMPLETED" if r_st == "COMPLETED" else "SCHEDULED")
+                    real_match = {
+                        "_id": real_round.get("_id"),
+                        "id": str(real_round.get("_id", real_round.get("id"))),
+                        "tournament_id": real_round.get("tournament_id"),
+                        "status": enc_status,
+                        "format": real_round.get("format", "Battle Royale"),
+                        "round_number": real_round.get("round_number", 1),
+                        "round_name": real_round.get("round_name") or real_round.get("stage_name") or f"Round {real_round.get('round_number', 1)}",
+                        "stage": real_round.get("stage_name") or real_round.get("round_name") or f"Round {real_round.get('round_number', 1)}",
+                        "teams": real_round.get("eligible_contenders") or [],
+                        "team_ids": [c.get("id") for c in (real_round.get("eligible_contenders") or []) if c.get("id")],
+                        "squads_count": len(real_round.get("eligible_contenders") or []),
+                        "room_id": real_round.get("room_id"),
+                        "room_password": real_round.get("room_password"),
+                        "lobby_code": real_round.get("room_id"),
+                        "lobby_password": real_round.get("room_password"),
+                        "credentials_released": bool(real_round.get("credentials_released", False)),
+                        "scheduled_at": real_round.get("scheduled_at"),
+                        "youtube_live_url": lm.get("youtube_live_url"),
+                    }
+                else:
+                    # Purge stale live match only if not in matches and not in tournament_rounds
+                    await db.live_matches.delete_one({"_id": lm["_id"]})
+                    continue
 
             real_mid = str(real_match.get("_id", real_match.get("id")))
             tourn_id_val = str(lm.get("tournament_id") or real_match.get("tournament_id") or "")

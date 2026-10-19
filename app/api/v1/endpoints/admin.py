@@ -3828,7 +3828,11 @@ async def update_match_details_admin(
     """
     Allows admin to modify match parameters: swap teams, placeholders, change stage/round, series format, schedule, scores, or YouTube URL.
     """
-    match = await db.matches.find_one({"$or": [{"_id": id}, {"id": id}]})
+    from bson import ObjectId
+    m_query = {"$or": [{"_id": id}, {"id": id}]}
+    if ObjectId.is_valid(id):
+        m_query["$or"].append({"_id": ObjectId(id)})
+    match = await db.matches.find_one(m_query)
     if not match:
         raise HTTPException(status_code=404, detail="Match not found")
 
@@ -4155,7 +4159,11 @@ async def mark_match_live_admin(
     """
     from app.core.ws import ws_manager
 
-    match = await db.matches.find_one({"$or": [{"_id": id}, {"id": id}]})
+    from bson import ObjectId
+    m_query = {"$or": [{"_id": id}, {"id": id}]}
+    if ObjectId.is_valid(id):
+        m_query["$or"].append({"_id": ObjectId(id)})
+    match = await db.matches.find_one(m_query)
     if not match:
         raise HTTPException(status_code=404, detail="Match not found")
 
@@ -5675,10 +5683,15 @@ async def save_knockout_match_credentials_admin(
     tid = str(tourn.get("_id", tourn.get("id")))
     tslug = tourn.get("slug", tid)
 
+    from bson import ObjectId
+    match_query = [{"_id": match_id}, {"id": match_id}]
+    if ObjectId.is_valid(match_id):
+        match_query.append({"_id": ObjectId(match_id)})
+
     m = await db.matches.find_one({
         "$and": [
             {"$or": [{"tournament_id": tid}, {"tournament_id": tslug}]},
-            {"$or": [{"_id": match_id}, {"id": match_id}]},
+            {"$or": match_query},
         ]
     })
     if not m:
@@ -5731,10 +5744,15 @@ async def release_knockout_match_credentials_admin(
     tid = str(tourn.get("_id", tourn.get("id")))
     tslug = tourn.get("slug", tid)
 
+    from bson import ObjectId
+    match_query = [{"_id": match_id}, {"id": match_id}]
+    if ObjectId.is_valid(match_id):
+        match_query.append({"_id": ObjectId(match_id)})
+
     m = await db.matches.find_one({
         "$and": [
             {"$or": [{"tournament_id": tid}, {"tournament_id": tslug}]},
-            {"$or": [{"_id": match_id}, {"id": match_id}]},
+            {"$or": match_query},
         ]
     })
     if not m:
@@ -6491,7 +6509,11 @@ async def publish_match_roster_endpoint(
     and notifies affected Team Leaders via in-app notification & branded email.
     """
     from app.services.match_notification_service import notify_roster_published
-    match = await db.matches.find_one({"$or": [{"_id": id}, {"id": id}]})
+    from bson import ObjectId
+    m_query = {"$or": [{"_id": id}, {"id": id}]}
+    if ObjectId.is_valid(id):
+        m_query["$or"].append({"_id": ObjectId(id)})
+    match = await db.matches.find_one(m_query)
     if not match:
         raise HTTPException(status_code=404, detail="Match not found")
 

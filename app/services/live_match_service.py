@@ -147,14 +147,26 @@ async def sync_live_match_for_tournament(
     }).sort("round_number", 1)
     rounds = await rounds_cursor.to_list(length=100)
 
-    # If the tournament has no persisted matches in db.matches, synthesize encounters from tournament_rounds
-    if not valid_encounters and rounds:
+    # Always merge tournament_rounds into valid_encounters.
+    # Previously this block was gated on `not valid_encounters`, which meant any stale
+    # db.matches record would prevent Battle Royale rounds from appearing at all.
+    # Now we synthesize an encounter for each tournament_round whose ID is not already
+    # represented in valid_encounters from db.matches.
+    if rounds:
+        existing_ids = {
+            str(e.get("_id", e.get("id", "")))
+            for e in valid_encounters
+        }
         for r in rounds:
+            r_id = str(r.get("_id", r.get("id", "")))
+            if r_id in existing_ids:
+                # Already covered by a real db.matches record — skip synthesis
+                continue
             r_st = str(r.get("status", "UPCOMING")).upper()
             enc_status = "LIVE" if r_st in ["LIVE", "IN_PROGRESS"] else ("COMPLETED" if r_st == "COMPLETED" else "SCHEDULED")
             synth_enc = {
-                "_id": str(r.get("_id", r.get("id"))),
-                "id": str(r.get("_id", r.get("id"))),
+                "_id": r_id,
+                "id": r_id,
                 "tournament_id": tid,
                 "round_number": r.get("round_number", 1),
                 "round_name": r.get("round_name") or r.get("stage_name") or f"Round {r.get('round_number', 1)}",
@@ -214,10 +226,7 @@ async def sync_live_match_for_tournament(
         current_encounter.get("stage") or
         f"Round {current_round_no}"
     )
-    current_enc_title = (
-        current_encounter.get("stage") or
-        f"Match {current_enc_no}"
-    )
+    current_enc_title = f"Match {current_enc_no}"
     team_a_id = None
     team_b_id = None
     team_a_name = None
@@ -254,10 +263,7 @@ async def sync_live_match_for_tournament(
             current_encounter.get("stage") or
             f"Round {current_round_no}"
         )
-        current_enc_title = (
-            current_encounter.get("stage") or
-            f"Match {current_enc_no}"
-        )
+        current_enc_title = f"Match {current_enc_no}"
 
         team_a_id = current_encounter.get("team_a_id")
         team_b_id = current_encounter.get("team_b_id")

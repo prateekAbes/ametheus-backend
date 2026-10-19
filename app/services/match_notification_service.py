@@ -351,7 +351,11 @@ async def notify_roster_published(
     """
     from app.services.email_service import send_match_roster_notification_email
 
-    match_doc = await db.matches.find_one({"$or": [{"_id": match_id}, {"id": match_id}]})
+    from bson import ObjectId
+    m_query = [{"_id": match_id}, {"id": match_id}]
+    if ObjectId.is_valid(match_id):
+        m_query.append({"_id": ObjectId(match_id)})
+    match_doc = await db.matches.find_one({"$or": m_query})
     if not match_doc:
         return {"status": "error", "message": "Match not found", "notified_count": 0}
 
