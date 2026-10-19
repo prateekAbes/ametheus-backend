@@ -96,6 +96,9 @@ class TournamentCreatePayload(BaseModel):
     whatsapp_group_url: Optional[str] = None
     discord_url: Optional[str] = None
     community_link: Optional[str] = None
+    enable_mvp: Optional[bool] = False
+    prize_distribution: Optional[List[Dict[str, Any]]] = None
+    results_display_duration_days: Optional[int] = 30
 
 class TournamentUpdatePayload(BaseModel):
     title: Optional[str] = None
@@ -138,6 +141,9 @@ class TournamentUpdatePayload(BaseModel):
     whatsapp_group_url: Optional[str] = None
     discord_url: Optional[str] = None
     community_link: Optional[str] = None
+    enable_mvp: Optional[bool] = None
+    prize_distribution: Optional[List[Dict[str, Any]]] = None
+    results_display_duration_days: Optional[int] = None
 
 def parse_iso_datetime(dt_str: str) -> datetime:
     s = dt_str.strip().replace("Z", "+00:00")
@@ -269,6 +275,13 @@ def serialize_tournament_response(t: dict, game_obj: Optional[dict], reg_count: 
         discord_url=t.get("discord_url"),
         community_link=t.get("community_link"),
         media_config=t.get("media_config", {}),
+        enable_mvp=bool(t.get("enable_mvp", False)),
+        prize_distribution=t.get("prize_distribution") or [],
+        champion=t.get("champion"),
+        tournament_mvp=t.get("tournament_mvp"),
+        final_results=t.get("final_results") or [],
+        results_display_duration_days=int(t.get("results_display_duration_days", 30)),
+        completed_at=str(t["completed_at"]) if t.get("completed_at") else None,
     )
 
 
@@ -426,6 +439,9 @@ async def create_tournament(
         whatsapp_group_url=payload.whatsapp_group_url,
         discord_url=payload.discord_url,
         community_link=payload.community_link,
+        enable_mvp=bool(payload.enable_mvp),
+        prize_distribution=payload.prize_distribution or [],
+        results_display_duration_days=payload.results_display_duration_days or 30,
     )
     if payload.media_config is not None:
         tourn.media_config = payload.media_config
@@ -630,6 +646,12 @@ async def update_tournament(
         update_fields["registration_open_date"] = payload.registration_open_date
     if payload.announcement_text is not None:
         update_fields["announcement_text"] = payload.announcement_text
+    if payload.enable_mvp is not None:
+        update_fields["enable_mvp"] = bool(payload.enable_mvp)
+    if payload.prize_distribution is not None:
+        update_fields["prize_distribution"] = payload.prize_distribution
+    if payload.results_display_duration_days is not None:
+        update_fields["results_display_duration_days"] = payload.results_display_duration_days
 
     if update_fields:
         await db.tournaments.update_one({"_id": tourn["_id"]}, {"$set": update_fields})

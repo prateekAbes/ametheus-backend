@@ -11,7 +11,7 @@ from app.models.admin import (
     AuditLog,
 )
 from app.models.match import Match
-from app.models.tournament import Tournament, TournamentStage, StageRound
+from app.models.tournament import Tournament, TournamentStage, StageRound, TournamentRound
 from app.models.dispute import Dispute
 from app.schemas import (
     AdminAssignmentCreate,
@@ -56,6 +56,14 @@ from app.schemas import (
     RoundPlayerRatingItem,
     RoundRatingsSubmitPayload,
     RoundFinalizePayload,
+    TournamentRoundCreatePayload,
+    TournamentRoundCredentialsPayload,
+    TournamentRoundQualifiersPayload,
+    TournamentRoundMvpPayload,
+    TournamentFinalMvpPayload,
+    TournamentFinalResultsPayload,
+    KnockoutMatchCreatePayload,
+    KnockoutMatchResultPayload,
 )
 from app.services.rating_service import (
     get_rating_management_hierarchy,
@@ -4359,39 +4367,915 @@ async def complete_match_admin(
         "winner_team_id": winner_id,
     }
 
+# Helper to fetch confirmed entrants for Round 1
+async def get_tournament_confirmed_entrants(db: AsyncIOMotorDatabase, tourn: dict) -> List[Dict[str, Any]]:
+    tid = str(tourn.get("_id", tourn.get("id")))
+    tslug = tourn.get("slug", tid)
+    raw_p_mode = str(tourn.get("participation_mode") or "").upper().strip()
+    is_solo = raw_p_mode == "SOLO" or bool(tourn.get("is_solo")) or tourn.get("registration_type") == "SOLO"
+
+    reg_cursor = db.tournament_registrations.find({
+        "$or": [{"tournament_id": tid}, {"tournament_id": tslug}],
+        "payment_status": {"$nin": ["REJECTED", "CANCELLED", "REFUNDED"]},
+    })
+    regs = await reg_cursor.to_list(length=300)
+
+    contenders: List[Dict[str, Any]] = []
+    seen_ids = set()
+
+    for r in regs:
+        if is_solo:
+            uid = r.get("player_id") or r.get("user_id") or r.get("captain_id")
+            if uid and str(uid) not in seen_ids:
+                seen_ids.add(str(uid))
+                u = await db.users.find_one({"$or": [{"_id": uid}, {"id": uid}]})
+                if u:
+                    name = u.get("display_name") or u.get("username", "Contender")
+                    contenders.append({
+                        "id": str(u.get("_id", u.get("id"))),
+                        "name": name,
+                        "tag": "SOLO",
+                        "type": "SOLO",
+                        "captain_name": name,
+                        "avatar_url": u.get("avatar_url"),
+                    })
+        else:
+            team_id = r.get("team_id")
+            if team_id and str(team_id) not in seen_ids:
+                seen_ids.add(str(team_id))
+                t = await db.teams.find_one({"$or": [{"_id": team_id}, {"id": team_id}]})
+                if t:
+                    cap_user = await db.users.find_one({"$or": [{"_id": t.get("captain_id")}, {"id": t.get("captain_id")}]}) if t.get("captain_id") else None
+                    contenders.append({
+                        "id": str(t.get("_id", t.get("id"))),
+                        "name": t.get("name"),
+                        "tag": t.get("tag", "TEAM"),
+                        "type": "TEAM",
+                        "captain_name": (cap_user.get("full_name") or cap_user.get("username")) if cap_user else (t.get("captain_handle") or "Captain"),
+                        "member_count": len(t.get("members") or []),
+                        "logo_url": t.get("logo_url"),
+                    })
+    return contenders
+
 @router.post("/tournaments/{id}/rounds")
 async def add_custom_tournament_round(
     id: str,
-    payload: CreateRoundPayload,
+    payload: Dict[str, Any],
     admin_user: User = Depends(require_organizer),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """
-    Rule 1: Admin dynamically creates and names a new tournament round.
+    Manual Round Creation (Strictly 3 fields: Stage Name, Competition Format, Final Round toggle).
+    Inherits Game Mode from tournament.
     """
     tourn = await db.tournaments.find_one({"$or": [{"_id": id}, {"id": id}, {"slug": id}]})
     if not tourn:
         raise HTTPException(status_code=404, detail="Tournament not found")
 
-    clean_name = payload.round_name.strip()
+    if tourn.get("status") == "COMPLETED":
+        raise HTTPException(status_code=400, detail="Tournament has already been finalized as COMPLETED. No further rounds can be created.")
+
+    clean_name = str(payload.get("stage_name") or payload.get("round_stage_name") or payload.get("round_name") or payload.get("name") or "").strip()
     if not clean_name:
-        raise HTTPException(status_code=400, detail="Round name cannot be empty")
+        raise HTTPException(status_code=400, detail="Round stage name cannot be empty.")
+
+    raw_format = str(payload.get("competition_format") or payload.get("format") or tourn.get("format") or "BATTLE_ROYALE").strip()
+    if "robin" in raw_format.lower():
+        raise HTTPException(status_code=400, detail="Round Robin format is not supported. Competition format must be either Battle Royale or Knockout.")
+
+    if "battle" in raw_format.lower() or "br" in raw_format.lower() or "royale" in raw_format.lower():
+        norm_format = "BATTLE_ROYALE"
+    else:
+        norm_format = "KNOCKOUT"
+
+    is_final = bool(payload.get("is_final_round", False))
+    tid = str(tourn.get("_id", tourn.get("id")))
+    tslug = tourn.get("slug", tid)
+
+    # Compute round number
+    existing_rounds = await db.tournament_rounds.find({"$or": [{"tournament_id": tid}, {"tournament_id": tslug}]}).sort("round_number", 1).to_list(length=100)
+    round_number = len(existing_rounds) + 1
+
+    # Check for duplicate round name in this tournament
+    if any(r.get("round_name", "").lower() == clean_name.lower() or r.get("stage_name", "").lower() == clean_name.lower() for r in existing_rounds):
+        raise HTTPException(status_code=400, detail=f'A round named "{clean_name}" already exists in this tournament.')
+
+    if round_number == 1:
+        eligible_contenders = await get_tournament_confirmed_entrants(db, tourn)
+    else:
+        prev_round = existing_rounds[-1]
+        prev_quals = prev_round.get("qualifier_ids") or []
+        if not prev_quals:
+            raise HTTPException(status_code=400, detail=f'Cannot create "{clean_name}": preceding round "{prev_round.get("round_name")}" does not have confirmed qualifiers.')
+        prev_quals_set = set(str(q) for q in prev_quals)
+        eligible_contenders = [c for c in (prev_round.get("eligible_contenders") or []) if str(c.get("id")) in prev_quals_set]
+
+    new_round = TournamentRound(
+        tournament_id=tid,
+        round_number=round_number,
+        round_name=clean_name,
+        stage_name=clean_name,
+        format=norm_format,
+        is_final_round=is_final,
+        status="UPCOMING",
+        eligible_contenders=eligible_contenders,
+    )
+    round_doc = new_round.to_mongo()
+    await db.tournament_rounds.insert_one(round_doc)
 
     await db.tournaments.update_one(
         {"_id": tourn["_id"]},
         {"$addToSet": {"custom_rounds": clean_name}}
     )
 
-    existing_rounds = list(tourn.get("custom_rounds") or [])
-    if clean_name not in existing_rounds:
-        existing_rounds.append(clean_name)
+    round_doc["id"] = str(round_doc.get("_id", round_doc.get("id")))
+    existing_custom = list(tourn.get("custom_rounds") or [])
+    if clean_name not in existing_custom:
+        existing_custom.append(clean_name)
 
     return {
         "status": "success",
         "message": f'Round "{clean_name}" created successfully.',
+        "round": round_doc,
         "round_name": clean_name,
-        "custom_rounds": existing_rounds,
+        "custom_rounds": existing_custom,
     }
+
+@router.get("/tournaments/{id}/rounds")
+async def get_tournament_rounds_admin(
+    id: str,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Returns all rounds for this tournament with eligible contenders, qualifiers, MVP, and matches.
+    """
+    tourn = await db.tournaments.find_one({"$or": [{"_id": id}, {"id": id}, {"slug": id}]})
+    if not tourn:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+    tid = str(tourn.get("_id", tourn.get("id")))
+    tslug = tourn.get("slug", tid)
+
+    rounds_cursor = db.tournament_rounds.find({
+        "$or": [{"tournament_id": tid}, {"tournament_id": tslug}]
+    }).sort("round_number", 1)
+    rounds = await rounds_cursor.to_list(length=100)
+
+    # Enrich each round with matches if format is KNOCKOUT
+    enriched_rounds = []
+    for r in rounds:
+        r_id = str(r.get("_id", r.get("id")))
+        r["id"] = r_id
+        match_ids = r.get("match_ids") or []
+        if match_ids:
+            matches_cursor = db.matches.find({"$or": [{"_id": {"$in": match_ids}}, {"id": {"$in": match_ids}}]})
+            r["matches"] = await matches_cursor.to_list(length=100)
+            for m in r["matches"]:
+                m["id"] = str(m.get("_id", m.get("id")))
+        else:
+            r["matches"] = []
+        enriched_rounds.append(r)
+
+    return {
+        "status": "success",
+        "tournament_id": tid,
+        "rounds": enriched_rounds,
+        "total_rounds": len(enriched_rounds),
+    }
+
+@router.get("/tournaments/{id}/rounds/{round_id}")
+async def get_tournament_round_detail_admin(
+    id: str,
+    round_id: str,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Returns single round detail with its matches and contenders.
+    """
+    tourn = await db.tournaments.find_one({"$or": [{"_id": id}, {"id": id}, {"slug": id}]})
+    if not tourn:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+    tid = str(tourn.get("_id", tourn.get("id")))
+    tslug = tourn.get("slug", tid)
+
+    r = await db.tournament_rounds.find_one({
+        "$and": [
+            {"$or": [{"tournament_id": tid}, {"tournament_id": tslug}]},
+            {"$or": [{"_id": round_id}, {"id": round_id}, {"round_name": round_id}, {"stage_name": round_id}]},
+        ]
+    })
+    if not r:
+        raise HTTPException(status_code=404, detail="Round not found")
+
+    r_id = str(r.get("_id", r.get("id")))
+    r["id"] = r_id
+    match_ids = r.get("match_ids") or []
+    if match_ids:
+        matches_cursor = db.matches.find({"$or": [{"_id": {"$in": match_ids}}, {"id": {"$in": match_ids}}]})
+        r["matches"] = await matches_cursor.to_list(length=100)
+        for m in r["matches"]:
+            m["id"] = str(m.get("_id", m.get("id")))
+    else:
+        r["matches"] = []
+
+    return {"status": "success", "round": r}
+
+@router.patch("/tournaments/{id}/rounds/{round_id}/credentials")
+async def save_round_credentials_admin(
+    id: str,
+    round_id: str,
+    payload: Dict[str, Any],
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Save round credentials (Room ID and optional Room Password).
+    Does NOT release credentials (credentials_released stays False).
+    """
+    tourn = await db.tournaments.find_one({"$or": [{"_id": id}, {"id": id}, {"slug": id}]})
+    if not tourn:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+    tid = str(tourn.get("_id", tourn.get("id")))
+    tslug = tourn.get("slug", tid)
+
+    r = await db.tournament_rounds.find_one({
+        "$and": [
+            {"$or": [{"tournament_id": tid}, {"tournament_id": tslug}]},
+            {"$or": [{"_id": round_id}, {"id": round_id}, {"round_name": round_id}, {"stage_name": round_id}]},
+        ]
+    })
+    if not r:
+        raise HTTPException(status_code=404, detail="Round not found")
+
+    room_id = str(payload.get("room_id") or "").strip()
+    if not room_id:
+        raise HTTPException(status_code=400, detail="Room ID is required.")
+
+    room_password = str(payload.get("room_password") or "").strip() or None
+    custom_instructions = str(payload.get("custom_instructions") or "").strip() or None
+
+    update_fields = {
+        "room_id": room_id,
+        "room_password": room_password,
+        "custom_instructions": custom_instructions,
+        "updated_at": datetime.now(timezone.utc),
+    }
+
+    await db.tournament_rounds.update_one({"_id": r["_id"]}, {"$set": update_fields})
+
+    # Sync room_id and room_password to matches in this round if Knockout
+    match_ids = r.get("match_ids") or []
+    if match_ids:
+        await db.matches.update_many(
+            {"$or": [{"_id": {"$in": match_ids}}, {"id": {"$in": match_ids}}]},
+            {"$set": {"room_id": room_id, "room_password": room_password}}
+        )
+
+    return {
+        "status": "success",
+        "message": "Round credentials saved successfully.",
+        "room_id": room_id,
+        "room_password": room_password,
+        "credentials_released": bool(r.get("credentials_released", False)),
+    }
+
+@router.post("/tournaments/{id}/rounds/{round_id}/release-credentials")
+async def release_round_credentials_admin(
+    id: str,
+    round_id: str,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Send credentials to all currently eligible participants in this round.
+    Sets credentials_released to True.
+    """
+    tourn = await db.tournaments.find_one({"$or": [{"_id": id}, {"id": id}, {"slug": id}]})
+    if not tourn:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+    tid = str(tourn.get("_id", tourn.get("id")))
+    tslug = tourn.get("slug", tid)
+
+    r = await db.tournament_rounds.find_one({
+        "$and": [
+            {"$or": [{"tournament_id": tid}, {"tournament_id": tslug}]},
+            {"$or": [{"_id": round_id}, {"id": round_id}, {"round_name": round_id}, {"stage_name": round_id}]},
+        ]
+    })
+    if not r:
+        raise HTTPException(status_code=404, detail="Round not found")
+
+    if not r.get("room_id"):
+        raise HTTPException(status_code=400, detail="Cannot send credentials: Room ID has not been saved yet.")
+
+    now = datetime.now(timezone.utc)
+    await db.tournament_rounds.update_one(
+        {"_id": r["_id"]},
+        {"$set": {"credentials_released": True, "credentials_released_at": now, "updated_at": now}}
+    )
+
+    # Also mark matches in this round
+    match_ids = r.get("match_ids") or []
+    if match_ids:
+        await db.matches.update_many(
+            {"$or": [{"_id": {"$in": match_ids}}, {"id": {"$in": match_ids}}]},
+            {"$set": {"credentials_released": True, "credentials_released_at": now}}
+        )
+
+    # Deliver notifications to all eligible participants
+    eligible = r.get("eligible_contenders") or []
+    target_user_ids = []
+    for c in eligible:
+        if c.get("type") == "SOLO":
+            target_user_ids.append(c["id"])
+        else:
+            team_doc = await db.teams.find_one({"$or": [{"_id": c["id"]}, {"id": c["id"]}]})
+            if team_doc:
+                if team_doc.get("captain_id"):
+                    target_user_ids.append(team_doc["captain_id"])
+                for m in team_doc.get("members") or []:
+                    if m.get("user_id"):
+                        target_user_ids.append(m["user_id"])
+
+    target_user_ids = list(set(str(u) for u in target_user_ids if u))
+    if target_user_ids:
+        notifs = [{
+            "user_id": uid,
+            "title": f'Match Credentials Released — {r.get("round_name")}',
+            "message": f'Room ID and Password are now live for {tourn.get("title")}: {r.get("round_name")}. Enter match room promptly.',
+            "type": "MATCH_CREDENTIALS",
+            "category": "TOURNAMENT",
+            "link": f'/tournaments/{tslug}',
+            "is_read": False,
+            "created_at": now,
+        } for uid in target_user_ids]
+        await db.notifications.insert_many(notifs)
+
+    return {
+        "status": "success",
+        "message": f'Credentials successfully released to {len(eligible)} contenders in round "{r.get("round_name")}".',
+        "credentials_released": True,
+        "credentials_released_at": now.isoformat(),
+        "delivered_to_count": len(target_user_ids),
+    }
+
+@router.post("/tournaments/{id}/rounds/{round_id}/go-live")
+async def start_round_live_admin(
+    id: str,
+    round_id: str,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Go Live for this round. Hides/disables once live.
+    """
+    tourn = await db.tournaments.find_one({"$or": [{"_id": id}, {"id": id}, {"slug": id}]})
+    if not tourn:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+    tid = str(tourn.get("_id", tourn.get("id")))
+    tslug = tourn.get("slug", tid)
+
+    r = await db.tournament_rounds.find_one({
+        "$and": [
+            {"$or": [{"tournament_id": tid}, {"tournament_id": tslug}]},
+            {"$or": [{"_id": round_id}, {"id": round_id}, {"round_name": round_id}, {"stage_name": round_id}]},
+        ]
+    })
+    if not r:
+        raise HTTPException(status_code=404, detail="Round not found")
+
+    now = datetime.now(timezone.utc)
+    await db.tournament_rounds.update_one(
+        {"_id": r["_id"]},
+        {"$set": {"status": "LIVE", "started_at": now, "updated_at": now}}
+    )
+
+    if tourn.get("status") != "LIVE":
+        await db.tournaments.update_one(
+            {"_id": tourn["_id"]},
+            {"$set": {"status": "LIVE", "updated_at": now}}
+        )
+
+    # Sync live status to matches in this round if Knockout
+    match_ids = r.get("match_ids") or []
+    if match_ids:
+        await db.matches.update_many(
+            {"$or": [{"_id": {"$in": match_ids}}, {"id": {"$in": match_ids}}]},
+            {"$set": {"status": "LIVE"}}
+        )
+
+    return {
+        "status": "success",
+        "message": f'Round "{r.get("round_name")}" is now LIVE.',
+        "round_status": "LIVE",
+        "tournament_status": "LIVE",
+    }
+
+@router.post("/tournaments/{id}/rounds/{round_id}/qualifiers")
+async def set_round_qualifiers_admin(
+    id: str,
+    round_id: str,
+    payload: Dict[str, Any],
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Manual qualifiers selection for Battle Royale.
+    Advances saved qualifiers to next round; non-qualifiers marked eliminated.
+    If final round: selects exactly ONE champion.
+    """
+    tourn = await db.tournaments.find_one({"$or": [{"_id": id}, {"id": id}, {"slug": id}]})
+    if not tourn:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+    tid = str(tourn.get("_id", tourn.get("id")))
+    tslug = tourn.get("slug", tid)
+
+    r = await db.tournament_rounds.find_one({
+        "$and": [
+            {"$or": [{"tournament_id": tid}, {"tournament_id": tslug}]},
+            {"$or": [{"_id": round_id}, {"id": round_id}, {"round_name": round_id}, {"stage_name": round_id}]},
+        ]
+    })
+    if not r:
+        raise HTTPException(status_code=404, detail="Round not found")
+
+    eligible = r.get("eligible_contenders") or []
+    eligible_id_map = {str(c["id"]): c for c in eligible}
+
+    raw_qualifiers = payload.get("qualifier_ids") or []
+    qualifier_ids = [str(q) for q in raw_qualifiers if str(q) in eligible_id_map]
+
+    is_final = bool(r.get("is_final_round"))
+    champion_id = payload.get("champion_id")
+    champion_name = payload.get("champion_name")
+
+    if is_final:
+        if not champion_id:
+            if qualifier_ids:
+                champion_id = qualifier_ids[0]
+            else:
+                raise HTTPException(status_code=400, detail="A single tournament champion must be selected for the final round.")
+        champion_id = str(champion_id)
+        if champion_id not in eligible_id_map:
+            raise HTTPException(status_code=400, detail="Champion must be an eligible contender in this round.")
+        if not champion_name:
+            champion_name = eligible_id_map[champion_id].get("name")
+        qualifier_ids = [champion_id]
+
+    eliminated_ids = [cid for cid in eligible_id_map.keys() if cid not in set(qualifier_ids)]
+
+    now = datetime.now(timezone.utc)
+    update_data = {
+        "qualifier_ids": qualifier_ids,
+        "eliminated_ids": eliminated_ids,
+        "updated_at": now,
+    }
+    if is_final and champion_id:
+        update_data["champion_id"] = champion_id
+        update_data["champion_name"] = champion_name
+        is_solo = tourn.get("participation_mode") == "SOLO" or bool(tourn.get("is_solo"))
+        champ_obj = {
+            "id": champion_id,
+            "name": champion_name,
+            "type": "PLAYER" if is_solo else "TEAM",
+        }
+        await db.tournaments.update_one({"_id": tourn["_id"]}, {"$set": {"champion": champ_obj, "updated_at": now}})
+
+    await db.tournament_rounds.update_one({"_id": r["_id"]}, {"$set": update_data})
+
+    return {
+        "status": "success",
+        "message": "Qualifiers updated successfully.",
+        "qualifier_ids": qualifier_ids,
+        "eliminated_ids": eliminated_ids,
+        "champion_id": champion_id,
+        "champion_name": champion_name,
+    }
+
+@router.post("/tournaments/{id}/rounds/{round_id}/matches")
+async def create_knockout_match_admin(
+    id: str,
+    round_id: str,
+    payload: Dict[str, Any],
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Knockout Match Creation with ONLY 3 fields: Match Number, Contenders (A vs B), and Schedule Time.
+    """
+    tourn = await db.tournaments.find_one({"$or": [{"_id": id}, {"id": id}, {"slug": id}]})
+    if not tourn:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+    tid = str(tourn.get("_id", tourn.get("id")))
+    tslug = tourn.get("slug", tid)
+
+    r = await db.tournament_rounds.find_one({
+        "$and": [
+            {"$or": [{"tournament_id": tid}, {"tournament_id": tslug}]},
+            {"$or": [{"_id": round_id}, {"id": round_id}, {"round_name": round_id}, {"stage_name": round_id}]},
+        ]
+    })
+    if not r:
+        raise HTTPException(status_code=404, detail="Round not found")
+
+    if r.get("format") == "BATTLE_ROYALE":
+        raise HTTPException(status_code=400, detail="Battle Royale is a round-level competition and does not use individual matches.")
+
+    match_number = int(payload.get("match_number") or len(r.get("match_ids") or []) + 1)
+    team_a_id = str(payload.get("team_a_id") or "").strip()
+    team_b_id = str(payload.get("team_b_id") or "").strip()
+    scheduled_time = str(payload.get("scheduled_time") or "TBD").strip()
+
+    if not team_a_id or not team_b_id:
+        raise HTTPException(status_code=400, detail="Both Contender A and Contender B must be selected.")
+    if team_a_id == team_b_id:
+        raise HTTPException(status_code=400, detail="Contender A and Contender B cannot be the same.")
+
+    eligible = r.get("eligible_contenders") or []
+    eligible_map = {str(c["id"]): c for c in eligible}
+
+    if team_a_id not in eligible_map or team_b_id not in eligible_map:
+        raise HTTPException(status_code=400, detail="Selected contenders must belong to this round's eligible contenders.")
+
+    name_a = eligible_map[team_a_id].get("name", "Contender A")
+    name_b = eligible_map[team_b_id].get("name", "Contender B")
+
+    is_solo = tourn.get("participation_mode") == "SOLO" or bool(tourn.get("is_solo"))
+    now = datetime.now(timezone.utc)
+
+    new_match = Match(
+        tournament_id=tid,
+        round_name=r.get("round_name"),
+        stage_name=r.get("stage_name"),
+        round_number=r.get("round_number", 1),
+        match_number=match_number,
+        team_a_id=team_a_id,
+        team_b_id=team_b_id,
+        team_a_name=name_a,
+        team_b_name=name_b,
+        scheduled_time=scheduled_time,
+        format="BO1",
+        series_format="BO1",
+        status="SCHEDULED",
+        is_solo=is_solo,
+        server_region=tourn.get("server_region", "AWS Mumbai (ap-south-1)"),
+        room_id=r.get("room_id"),
+        room_password=r.get("room_password"),
+        credentials_released=bool(r.get("credentials_released", False)),
+    )
+    match_doc = new_match.to_mongo()
+    await db.matches.insert_one(match_doc)
+    m_id = str(match_doc.get("_id", match_doc.get("id")))
+
+    await db.tournament_rounds.update_one(
+        {"_id": r["_id"]},
+        {"$addToSet": {"match_ids": m_id}, "$set": {"updated_at": now}}
+    )
+
+    return {
+        "status": "success",
+        "message": f"Match #{match_number} created successfully.",
+        "match": Match.from_mongo(match_doc).model_dump(),
+    }
+
+@router.post("/tournaments/{id}/rounds/{round_id}/matches/{match_id}/result")
+async def record_knockout_match_result_admin(
+    id: str,
+    round_id: str,
+    match_id: str,
+    payload: Dict[str, Any],
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Score entry and winner selection for a Knockout match.
+    Updates round qualifiers and champion if final round.
+    """
+    tourn = await db.tournaments.find_one({"$or": [{"_id": id}, {"id": id}, {"slug": id}]})
+    if not tourn:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+    tid = str(tourn.get("_id", tourn.get("id")))
+    tslug = tourn.get("slug", tid)
+
+    r = await db.tournament_rounds.find_one({
+        "$and": [
+            {"$or": [{"tournament_id": tid}, {"tournament_id": tslug}]},
+            {"$or": [{"_id": round_id}, {"id": round_id}, {"round_name": round_id}, {"stage_name": round_id}]},
+        ]
+    })
+    if not r:
+        raise HTTPException(status_code=404, detail="Round not found")
+
+    m = await db.matches.find_one({
+        "$and": [
+            {"$or": [{"tournament_id": tid}, {"tournament_id": tslug}]},
+            {"$or": [{"_id": match_id}, {"id": match_id}]},
+        ]
+    })
+    if not m:
+        raise HTTPException(status_code=404, detail="Match not found")
+
+    winner_id = str(payload.get("winner_id") or payload.get("winner_team_id") or "").strip()
+    score_a = int(payload.get("score_a", 0))
+    score_b = int(payload.get("score_b", 0))
+
+    if winner_id not in [str(m.get("team_a_id")), str(m.get("team_b_id"))]:
+        raise HTTPException(status_code=400, detail="Winner must be either Contender A or Contender B.")
+
+    now = datetime.now(timezone.utc)
+    await db.matches.update_one(
+        {"_id": m["_id"]},
+        {"$set": {
+            "score_a": score_a,
+            "score_b": score_b,
+            "winner_team_id": winner_id,
+            "status": "COMPLETED",
+            "updated_at": now,
+        }}
+    )
+
+    # Check all matches in round
+    match_ids = r.get("match_ids") or []
+    all_matches = await db.matches.find({"$or": [{"_id": {"$in": match_ids}}, {"id": {"$in": match_ids}}]}).to_list(length=100)
+    all_completed = len(all_matches) > 0 and all(mat.get("status") == "COMPLETED" for mat in all_matches)
+
+    qualifiers = []
+    eliminated = []
+    champion_id = None
+    champion_name = None
+
+    if all_completed:
+        for mat in all_matches:
+            w = mat.get("winner_team_id")
+            if w:
+                qualifiers.append(w)
+                loser = mat.get("team_b_id") if w == mat.get("team_a_id") else mat.get("team_a_id")
+                if loser:
+                    eliminated.append(loser)
+
+        round_updates = {
+            "qualifier_ids": qualifiers,
+            "eliminated_ids": eliminated,
+            "updated_at": now,
+        }
+        if r.get("is_final_round") and len(qualifiers) == 1:
+            champion_id = qualifiers[0]
+            champ_contender = next((c for c in (r.get("eligible_contenders") or []) if str(c["id"]) == champion_id), None)
+            champion_name = champ_contender.get("name") if champ_contender else (m.get("team_a_name") if champion_id == m.get("team_a_id") else m.get("team_b_name"))
+            round_updates["champion_id"] = champion_id
+            round_updates["champion_name"] = champion_name
+
+            is_solo = tourn.get("participation_mode") == "SOLO" or bool(tourn.get("is_solo"))
+            await db.tournaments.update_one(
+                {"_id": tourn["_id"]},
+                {"$set": {
+                    "champion": {"id": champion_id, "name": champion_name, "type": "PLAYER" if is_solo else "TEAM"},
+                    "updated_at": now,
+                }}
+            )
+
+        await db.tournament_rounds.update_one({"_id": r["_id"]}, {"$set": round_updates})
+
+    return {
+        "status": "success",
+        "message": "Match result saved.",
+        "winner_id": winner_id,
+        "round_completed": all_completed,
+        "qualifier_ids": qualifiers,
+        "champion_id": champion_id,
+    }
+
+@router.post("/tournaments/{id}/rounds/{round_id}/mvp")
+async def set_round_mvp_admin(
+    id: str,
+    round_id: str,
+    payload: Dict[str, Any],
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Save round MVP selection for an individual player.
+    """
+    tourn = await db.tournaments.find_one({"$or": [{"_id": id}, {"id": id}, {"slug": id}]})
+    if not tourn:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+    tid = str(tourn.get("_id", tourn.get("id")))
+    tslug = tourn.get("slug", tid)
+
+    r = await db.tournament_rounds.find_one({
+        "$and": [
+            {"$or": [{"tournament_id": tid}, {"tournament_id": tslug}]},
+            {"$or": [{"_id": round_id}, {"id": round_id}, {"round_name": round_id}, {"stage_name": round_id}]},
+        ]
+    })
+    if not r:
+        raise HTTPException(status_code=404, detail="Round not found")
+
+    player_id = str(payload.get("player_id") or "").strip()
+    player_name = str(payload.get("player_name") or "").strip()
+    stats = str(payload.get("stats") or "").strip() or None
+    notes = str(payload.get("notes") or "").strip() or None
+
+    if not player_id or not player_name:
+        raise HTTPException(status_code=400, detail="Player ID and Player Name are required for MVP.")
+
+    now = datetime.now(timezone.utc)
+    await db.tournament_rounds.update_one(
+        {"_id": r["_id"]},
+        {"$set": {
+            "mvp_player_id": player_id,
+            "mvp_player_name": player_name,
+            "mvp_stats": stats,
+            "mvp_notes": notes,
+            "updated_at": now,
+        }}
+    )
+
+    return {
+        "status": "success",
+        "message": f'Round MVP saved: {player_name}',
+        "mvp_player_id": player_id,
+        "mvp_player_name": player_name,
+    }
+
+@router.post("/tournaments/{id}/tournament-mvp")
+async def set_tournament_mvp_admin(
+    id: str,
+    payload: Dict[str, Any],
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Save overall Tournament MVP selection.
+    """
+    tourn = await db.tournaments.find_one({"$or": [{"_id": id}, {"id": id}, {"slug": id}]})
+    if not tourn:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+
+    player_id = str(payload.get("player_id") or "").strip()
+    player_name = str(payload.get("player_name") or "").strip()
+    stats = str(payload.get("stats") or "").strip() or None
+    notes = str(payload.get("notes") or "").strip() or None
+
+    if not player_id or not player_name:
+        raise HTTPException(status_code=400, detail="Player ID and Player Name are required for Tournament MVP.")
+
+    mvp_obj = {
+        "player_id": player_id,
+        "player_name": player_name,
+        "stats": stats,
+        "notes": notes,
+    }
+
+    now = datetime.now(timezone.utc)
+    await db.tournaments.update_one(
+        {"_id": tourn["_id"]},
+        {"$set": {"tournament_mvp": mvp_obj, "updated_at": now}}
+    )
+
+    return {
+        "status": "success",
+        "message": f"Tournament MVP saved: {player_name}",
+        "tournament_mvp": mvp_obj,
+    }
+
+@router.post("/tournaments/{id}/final-results")
+async def save_final_tournament_results_admin(
+    id: str,
+    payload: Dict[str, Any],
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Save configurable final tournament results & award recipients.
+    Detects conflict if First Place recipient differs from tournament champion.
+    """
+    tourn = await db.tournaments.find_one({"$or": [{"_id": id}, {"id": id}, {"slug": id}]})
+    if not tourn:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+
+    results = payload.get("results") or []
+    if not isinstance(results, list):
+        raise HTTPException(status_code=400, detail="Results must be a list of award rows.")
+
+    champion_id = payload.get("champion_id") or (tourn.get("champion") or {}).get("id")
+    champion_name = payload.get("champion_name") or (tourn.get("champion") or {}).get("name")
+
+    # Conflict detection: If an award is for 1st place / champion, verify recipient == champion_id
+    has_champion_conflict = False
+    for r in results:
+        aw = str(r.get("award_name") or "").lower()
+        if any(w in aw for w in ["1st", "first", "champion", "winner"]):
+            rec_id = str(r.get("recipient_id") or "")
+            if champion_id and rec_id and rec_id != str(champion_id):
+                has_champion_conflict = True
+
+    display_duration = int(payload.get("results_display_duration_days") or tourn.get("results_display_duration_days", 30))
+
+    now = datetime.now(timezone.utc)
+    update_data = {
+        "final_results": results,
+        "results_display_duration_days": display_duration,
+        "updated_at": now,
+    }
+    if champion_id and champion_name:
+        is_solo = tourn.get("participation_mode") == "SOLO" or bool(tourn.get("is_solo"))
+        update_data["champion"] = {
+            "id": str(champion_id),
+            "name": champion_name,
+            "type": "PLAYER" if is_solo else "TEAM",
+        }
+
+    await db.tournaments.update_one({"_id": tourn["_id"]}, {"$set": update_data})
+
+    return {
+        "status": "success",
+        "message": "Final tournament results saved successfully.",
+        "final_results": results,
+        "champion_conflict": has_champion_conflict,
+    }
+
+@router.post("/tournaments/{id}/rounds/{round_id}/end-round")
+async def end_tournament_round_admin(
+    id: str,
+    round_id: str,
+    admin_user: User = Depends(require_organizer),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Ends round. If final round, requires champion, MVP (if enabled), and final tournament results,
+    then finalizes tournament as COMPLETED.
+    """
+    tourn = await db.tournaments.find_one({"$or": [{"_id": id}, {"id": id}, {"slug": id}]})
+    if not tourn:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+    tid = str(tourn.get("_id", tourn.get("id")))
+    tslug = tourn.get("slug", tid)
+
+    r = await db.tournament_rounds.find_one({
+        "$and": [
+            {"$or": [{"tournament_id": tid}, {"tournament_id": tslug}]},
+            {"$or": [{"_id": round_id}, {"id": round_id}, {"round_name": round_id}, {"stage_name": round_id}]},
+        ]
+    })
+    if not r:
+        raise HTTPException(status_code=404, detail="Round not found")
+
+    # Validate qualifiers / winners
+    if r.get("format") == "BATTLE_ROYALE":
+        if not r.get("qualifier_ids"):
+            raise HTTPException(status_code=400, detail="Cannot end round: qualifiers have not been selected and saved.")
+    else:
+        match_ids = r.get("match_ids") or []
+        if match_ids:
+            matches = await db.matches.find({"$or": [{"_id": {"$in": match_ids}}, {"id": {"$in": match_ids}}]}).to_list(length=100)
+            pending = [m for m in matches if m.get("status") != "COMPLETED"]
+            if pending:
+                raise HTTPException(status_code=400, detail=f"Cannot end round: {len(pending)} match(es) are still not completed.")
+
+    # Validate MVP if enabled
+    if tourn.get("enable_mvp") and not r.get("mvp_player_id"):
+        raise HTTPException(status_code=400, detail="Round MVP must be selected before ending this round.")
+
+    is_final = bool(r.get("is_final_round"))
+    now = datetime.now(timezone.utc)
+
+    if is_final:
+        if not r.get("champion_id") and not tourn.get("champion"):
+            raise HTTPException(status_code=400, detail="Tournament champion must be selected for the final round.")
+        if tourn.get("enable_mvp") and not tourn.get("tournament_mvp"):
+            raise HTTPException(status_code=400, detail="Tournament MVP must be selected before completing the tournament.")
+        if not tourn.get("final_results"):
+            raise HTTPException(status_code=400, detail="Final tournament results and award recipients must be configured before ending the tournament.")
+
+        await db.tournament_rounds.update_one(
+            {"_id": r["_id"]},
+            {"$set": {"status": "COMPLETED", "completed_at": now, "updated_at": now}}
+        )
+        await db.tournaments.update_one(
+            {"_id": tourn["_id"]},
+            {"$set": {"status": "COMPLETED", "completed_at": now, "updated_at": now}}
+        )
+
+        return {
+            "status": "success",
+            "message": "Final round closed and tournament marked COMPLETED.",
+            "is_final_round": True,
+            "tournament_completed": True,
+        }
+    else:
+        await db.tournament_rounds.update_one(
+            {"_id": r["_id"]},
+            {"$set": {"status": "COMPLETED", "completed_at": now, "updated_at": now}}
+        )
+
+        return {
+            "status": "success",
+            "message": f'Round "{r.get("round_name")}" closed successfully.',
+            "is_final_round": False,
+            "tournament_completed": False,
+        }
 
 @router.delete("/tournaments/{id}/rounds/{round_name}")
 async def delete_tournament_round_admin(
@@ -4414,6 +5298,13 @@ async def delete_tournament_round_admin(
         {"_id": tourn["_id"]},
         {"$pull": {"custom_rounds": round_name}}
     )
+
+    await db.tournament_rounds.delete_many({
+        "$and": [
+            {"$or": [{"tournament_id": tid}, {"tournament_id": tslug}]},
+            {"$or": [{"round_name": round_name}, {"stage_name": round_name}, {"_id": round_name}, {"id": round_name}]},
+        ]
+    })
 
     await db.matches.delete_many({
         "$and": [

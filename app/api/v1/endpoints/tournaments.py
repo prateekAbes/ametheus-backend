@@ -311,6 +311,13 @@ async def list_tournaments(
                 discord_url=None,
                 community_link=None,
                 media_config=t.get("media_config", {}),
+                enable_mvp=bool(t.get("enable_mvp", False)),
+                prize_distribution=t.get("prize_distribution") or [],
+                champion=t.get("champion"),
+                tournament_mvp=t.get("tournament_mvp"),
+                final_results=t.get("final_results") or [],
+                results_display_duration_days=int(t.get("results_display_duration_days", 30)),
+                completed_at=str(t["completed_at"]) if t.get("completed_at") else None,
             )
         )
     return response
@@ -733,6 +740,13 @@ async def get_tournament_by_slug(slug: str, db: AsyncIOMotorDatabase = Depends(g
         discord_url=None,
         community_link=None,
         media_config=t.get("media_config", {}),
+        enable_mvp=bool(t.get("enable_mvp", False)),
+        prize_distribution=t.get("prize_distribution") or [],
+        champion=t.get("champion"),
+        tournament_mvp=t.get("tournament_mvp"),
+        final_results=t.get("final_results") or [],
+        results_display_duration_days=int(t.get("results_display_duration_days", 30)),
+        completed_at=str(t["completed_at"]) if t.get("completed_at") else None,
     )
 
 @router.get("/{slug}/matches", response_model=List[MatchResponse])

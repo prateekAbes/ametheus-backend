@@ -143,6 +143,13 @@ class Tournament(BaseModel):
     community_link: Optional[str] = None      # invite link URL
     whatsapp_group_url: Optional[str] = None  # dedicated WhatsApp group invite URL
     discord_url: Optional[str] = None         # dedicated Discord server invite URL
+    enable_mvp: bool = False
+    prize_distribution: List[Dict[str, Any]] = Field(default_factory=list)
+    champion: Optional[Dict[str, Any]] = None
+    tournament_mvp: Optional[Dict[str, Any]] = None
+    final_results: List[Dict[str, Any]] = Field(default_factory=list)
+    results_display_duration_days: int = 30
+    completed_at: Optional[datetime] = None
     created_at: datetime = Field(default_factory=get_utc_now)
     updated_at: datetime = Field(default_factory=get_utc_now)
 
@@ -267,6 +274,15 @@ class Tournament(BaseModel):
         if not d.get("starts_at"):
             d["starts_at"] = datetime.now(timezone.utc).isoformat()
 
+        # New tournament fields: MVP, Prize Distribution, Final Results
+        d["enable_mvp"] = bool(d.get("enable_mvp", False))
+        d["prize_distribution"] = list(d.get("prize_distribution") or [])
+        d["champion"] = d.get("champion") or None
+        d["tournament_mvp"] = d.get("tournament_mvp") or None
+        d["final_results"] = list(d.get("final_results") or [])
+        d["results_display_duration_days"] = int(d.get("results_display_duration_days", 30))
+        d["completed_at"] = d.get("completed_at") or None
+
         return cls(**d)
 
 class TournamentRegistration(BaseModel):
@@ -287,6 +303,63 @@ class TournamentRegistration(BaseModel):
     position: Optional[int] = None
     check_in_status: str = "PENDING"  # PENDING, CHECKED_IN
     registered_at: datetime = Field(default_factory=get_utc_now)
+    created_at: datetime = Field(default_factory=get_utc_now)
+    updated_at: datetime = Field(default_factory=get_utc_now)
+
+    def to_mongo(self) -> dict:
+        d = self.model_dump()
+        tid = d.get("id") or generate_uuid()
+        d["_id"] = tid
+        d["id"] = tid
+        return d
+
+    @classmethod
+    def from_mongo(cls, doc: Optional[dict]):
+        if not doc:
+            return None
+        d = dict(doc)
+        if "_id" in d and "id" not in d:
+            d["id"] = str(d.pop("_id"))
+        return cls(**d)
+
+class TournamentRound(BaseModel):
+    id: str = Field(default_factory=generate_uuid)
+    tournament_id: str
+    round_number: int = 1
+    round_name: str = "Round 1"
+    stage_name: str = "Round 1"
+    format: str = "BATTLE_ROYALE"  # "BATTLE_ROYALE" or "KNOCKOUT"
+    is_final_round: bool = False
+    status: str = "UPCOMING"  # UPCOMING, LIVE, COMPLETED
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+
+    # Credentials (Battle Royale or round-level)
+    room_id: Optional[str] = None
+    room_password: Optional[str] = None
+    credentials_released: bool = False
+    credentials_released_at: Optional[datetime] = None
+    custom_instructions: Optional[str] = None
+
+    # Participants & Progression
+    eligible_contenders: List[Dict[str, Any]] = Field(default_factory=list)
+    qualifier_ids: List[str] = Field(default_factory=list)
+    eliminated_ids: List[str] = Field(default_factory=list)
+    champion_id: Optional[str] = None
+    champion_name: Optional[str] = None
+
+    # MVP
+    mvp_player_id: Optional[str] = None
+    mvp_player_name: Optional[str] = None
+    mvp_stats: Optional[str] = None
+    mvp_notes: Optional[str] = None
+
+    # Matches (for Knockout)
+    match_ids: List[str] = Field(default_factory=list)
+
+    # Standings / scores
+    scores: Optional[Dict[str, Any]] = None
+
     created_at: datetime = Field(default_factory=get_utc_now)
     updated_at: datetime = Field(default_factory=get_utc_now)
 

@@ -451,6 +451,13 @@ class TournamentResponse(BaseModel):
     discord_url: Optional[str] = None
     community_link: Optional[str] = None
     media_config: Optional[Dict[str, Any]] = None
+    enable_mvp: Optional[bool] = False
+    prize_distribution: Optional[List[Dict[str, Any]]] = None
+    champion: Optional[Dict[str, Any]] = None
+    tournament_mvp: Optional[Dict[str, Any]] = None
+    final_results: Optional[List[Dict[str, Any]]] = None
+    results_display_duration_days: Optional[int] = 30
+    completed_at: Optional[str] = None
     model_config = ConfigDict(from_attributes=True, extra="allow")
 
 class TournamentRegisterRequest(BaseModel):
@@ -1143,5 +1150,68 @@ class ReviewSummaryResponse(BaseModel):
     rating_distribution: Dict[str, int]
     reviews: List[ReviewResponse]
     featured_review: Optional[ReviewResponse] = None
+
+# Tournament Round & Results Schemas
+class TournamentRoundCreatePayload(BaseModel):
+    stage_name: Optional[str] = None
+    round_stage_name: Optional[str] = None
+    name: Optional[str] = None
+    format: Optional[str] = "BATTLE_ROYALE"
+    competition_format: Optional[str] = None
+    is_final_round: bool = False
+
+    def get_stage_name(self) -> str:
+        val = self.stage_name or self.round_stage_name or self.name or "Round 1"
+        return str(val).strip()
+
+    def get_format(self) -> str:
+        raw = str(self.competition_format or self.format or "BATTLE_ROYALE").strip()
+        low = raw.lower()
+        if "battle" in low or "br" in low:
+            return "BATTLE_ROYALE"
+        return "KNOCKOUT"
+
+class TournamentRoundCredentialsPayload(BaseModel):
+    room_id: str
+    room_password: Optional[str] = None
+    custom_instructions: Optional[str] = None
+
+class TournamentRoundQualifiersPayload(BaseModel):
+    qualifier_ids: Optional[List[str]] = None
+    champion_id: Optional[str] = None
+    champion_name: Optional[str] = None
+
+class TournamentRoundMvpPayload(BaseModel):
+    player_id: str
+    player_name: str
+    stats: Optional[str] = None
+    notes: Optional[str] = None
+
+class TournamentFinalMvpPayload(BaseModel):
+    player_id: str
+    player_name: str
+    stats: Optional[str] = None
+    notes: Optional[str] = None
+
+class TournamentFinalResultsPayload(BaseModel):
+    results: List[Dict[str, Any]] = Field(default_factory=list)
+    champion_id: Optional[str] = None
+    champion_name: Optional[str] = None
+    tournament_mvp: Optional[Dict[str, Any]] = None
+    results_display_duration_days: Optional[int] = 30
+
+class KnockoutMatchCreatePayload(BaseModel):
+    match_number: int = 1
+    team_a_id: str
+    team_b_id: str
+    team_a_name: Optional[str] = None
+    team_b_name: Optional[str] = None
+    scheduled_time: Optional[str] = "TBD"
+
+class KnockoutMatchResultPayload(BaseModel):
+    winner_id: str
+    score_a: Optional[int] = 0
+    score_b: Optional[int] = 0
+
 
 
