@@ -12,7 +12,6 @@ from app.api.v1.endpoints import (
     leaderboard,
     organizer,
     tournaments,
-    matches,
     support,
     regulations,
     email_settings,
@@ -49,7 +48,6 @@ api_router.include_router(notifications.router, prefix="/notifications", tags=["
 api_router.include_router(media.router, prefix="/media", tags=["Media & Image Uploads"])
 api_router.include_router(organizer.router, prefix="/organizer", tags=["Tournament Organizer"])
 api_router.include_router(tournaments.router, prefix="/tournaments", tags=["Tournaments"])
-api_router.include_router(matches.router, prefix="/matches", tags=["Matches"])
 api_router.include_router(support.router, prefix="/support", tags=["Support & Tickets"])
 api_router.include_router(regulations.router, prefix="/regulations", tags=["Tournament Regulations & Discipline"])
 api_router.include_router(webhooks.router, prefix="/webhooks", tags=["Inbound Webhooks"])

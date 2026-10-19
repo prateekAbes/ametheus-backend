@@ -2104,169 +2104,7 @@ async def reject_payout(
 
     return {"status": "success", "message": "Payout rejected and reserved funds returned to available balance."}
 
-# ----------------- ADMIN LIVE MATCHES & PAIRING SYSTEM -----------------
-
-@router.get("/matches/live-dashboard")
-async def get_live_matches_dashboard(
-    admin_user: User = Depends(require_organizer),
-    db: AsyncIOMotorDatabase = Depends(get_db),
-):
-    """
-    Returns aggregated dashboard data for the 4-tab Live Matches workflow:
-    1. Tournaments ready for match creation (with registered teams & pairing status)
-    2. Scheduled matches
-    3. Live Now matches
-    4. Completed matches
-    """
-    from datetime import datetime
-
-    tournaments = await db.tournaments.find({
-        "status": {"$in": ["REGISTRATION_CLOSED", "LIVE", "ONGOING", "IN_PROGRESS"]}
-    }).to_list(length=100)
-    ready_tournaments = []
-
-    for t in tournaments:
-        tid = str(t.get("_id", t.get("id")))
-        tslug = t.get("slug", tid)
-        reg_cursor = db.tournament_registrations.find({
-            "$or": [{"tournament_id": tid}, {"tournament_id": tslug}],
-            "payment_status": {"$in": ["PAID", "FREE"]}
-        })
-        registrations = await reg_cursor.to_list(length=100)
-
-        tourn_matches = await db.matches.find({
-            "$or": [{"tournament_id": tid}, {"tournament_id": tslug}],
-            "status": {"$in": ["SCHEDULED", "CHECK_IN_OPEN", "LIVE", "PENDING_VERIFICATION", "DISPUTED"]}
-        }).to_list(length=100)
-
-        paired_team_ids = set()
-        for m in tourn_matches:
-            if m.get("team_a_id"):
-                paired_team_ids.add(str(m["team_a_id"]))
-            if m.get("team_b_id"):
-                paired_team_ids.add(str(m["team_b_id"]))
-
-        registered_teams_list = []
-        for reg in registrations:
-            team_id = reg.get("team_id")
-            player_id = reg.get("player_id")
-            if team_id:
-                team_doc = await db.teams.find_one({"$or": [{"_id": team_id}, {"id": team_id}]})
-                if team_doc:
-                    t_id_str = str(team_doc.get("_id", team_doc.get("id")))
-                    registered_teams_list.append({
-                        "id": t_id_str,
-                        "name": team_doc.get("name", "Team"),
-                        "tag": team_doc.get("tag", "TEAM"),
-                        "captain_username": team_doc.get("captain_username", "Captain"),
-                        "is_paired": t_id_str in paired_team_ids,
-                    })
-            elif player_id:
-                user_doc = await db.users.find_one({"$or": [{"_id": player_id}, {"id": player_id}]})
-                if user_doc:
-                    u_id_str = str(user_doc.get("_id", user_doc.get("id")))
-                    registered_teams_list.append({
-                        "id": u_id_str,
-                        "name": user_doc.get("username", "Contender"),
-                        "tag": "SOLO",
-                        "captain_username": user_doc.get("username", "Contender"),
-                        "is_paired": u_id_str in paired_team_ids,
-                    })
-
-        ready_tournaments.append({
-            "id": tid,
-            "slug": tslug,
-            "title": t.get("title", "Tournament"),
-            "status": "REGISTRATION_CLOSED",
-            "max_teams": t.get("max_teams", 16),
-            "match_format": t.get("match_format") or t.get("tournament_type") or "Single Elimination",
-            "series_format": t.get("series_format") or "BO1",
-            "stage_formats": t.get("stage_formats") or {},
-            "teams": registered_teams_list,
-            "unpaired_count": len([x for x in registered_teams_list if not x["is_paired"]]),
-            "paired_count": len([x for x in registered_teams_list if x["is_paired"]]),
-        })
-
-    async def enrich_match(m: dict) -> Optional[dict]:
-        mid = str(m.get("_id", m.get("id")))
-        tourn_id = m.get("tournament_id")
-        tourn = await db.tournaments.find_one({"$or": [{"_id": tourn_id}, {"id": tourn_id}, {"slug": tourn_id}]}) if tourn_id else None
-        if not tourn:
-            # Omit orphaned matches belonging to deleted tournaments
-            return None
-
-        team_a_id = m.get("team_a_id")
-        team_b_id = m.get("team_b_id")
-
-        team_a = await db.teams.find_one({"$or": [{"_id": team_a_id}, {"id": team_a_id}]}) if team_a_id else None
-        if not team_a and team_a_id:
-            user_a = await db.users.find_one({"$or": [{"_id": team_a_id}, {"id": team_a_id}]})
-            if user_a:
-                team_a = {"name": user_a.get("username") or "Player A", "tag": "SOLO"}
-        if not team_a and m.get("team_a_placeholder"):
-            team_a = {"name": m.get("team_a_placeholder"), "tag": "TBD"}
-
-        team_b = await db.teams.find_one({"$or": [{"_id": team_b_id}, {"id": team_b_id}]}) if team_b_id else None
-        if not team_b and team_b_id:
-            user_b = await db.users.find_one({"$or": [{"_id": team_b_id}, {"id": team_b_id}]})
-            if user_b:
-                team_b = {"name": user_b.get("username") or "Player B", "tag": "SOLO"}
-        if not team_b and m.get("team_b_placeholder"):
-            team_b = {"name": m.get("team_b_placeholder"), "tag": "TBD"}
-
-        scheduled_at = m.get("scheduled_at")
-        scheduled_at_iso = scheduled_at.isoformat() if isinstance(scheduled_at, datetime) else scheduled_at
-
-        return {
-            "id": mid,
-            "tournament_id": tourn_id,
-            "tournament_title": tourn.get("title") if tourn else "Tournament",
-            "round_name": m.get("round_name") or m.get("stage", "Round 1"),
-            "round_number": m.get("round_number", 1),
-            "match_number": m.get("match_number", 1),
-            "stage": m.get("stage", "Round 1"),
-            "match_type": m.get("match_type", "MATCH"),
-            "format": m.get("series_format") or m.get("format") or "BO1",
-            "series_format": m.get("series_format") or m.get("format") or "BO1",
-            "order": m.get("order", 0),
-            "status": m.get("status", "SCHEDULED"),
-            "scheduled_time": m.get("scheduled_time", "TBD"),
-            "scheduled_at": scheduled_at_iso,
-            "live_link": m.get("youtube_live_url") or m.get("live_link"),
-            "youtube_live_url": m.get("youtube_live_url") or m.get("live_link"),
-            "team_a": {"id": team_a_id, "name": team_a["name"], "tag": team_a.get("tag", "TEAM"), "score": m.get("score_a", 0)} if team_a else None,
-            "team_b": {"id": team_b_id, "name": team_b["name"], "tag": team_b.get("tag", "TEAM"), "score": m.get("score_b", 0)} if team_b else None,
-            "team_a_placeholder": m.get("team_a_placeholder"),
-            "team_b_placeholder": m.get("team_b_placeholder"),
-            "winner_team_id": m.get("winner_team_id"),
-            "check_in_status": m.get("check_in_status") or {"team_a": False, "team_b": False},
-            "games": m.get("games", []),
-            "score_a": m.get("score_a", 0),
-            "score_b": m.get("score_b", 0),
-        }
-
-    sched_cursor = db.matches.find({"status": {"$in": ["SCHEDULED", "CHECK_IN_OPEN"]}}).sort("created_at", -1)
-    sched_raw = await sched_cursor.to_list(length=100)
-    scheduled_matches = [res for res in [await enrich_match(m) for m in sched_raw] if res is not None]
-
-    live_cursor = db.matches.find({"status": {"$in": ["LIVE", "PENDING_VERIFICATION", "DISPUTED"]}}).sort("created_at", -1)
-    live_raw = await live_cursor.to_list(length=100)
-    live_matches = [res for res in [await enrich_match(m) for m in live_raw] if res is not None]
-
-    comp_cursor = db.matches.find({"status": "COMPLETED"}).sort("updated_at", -1).limit(50)
-    comp_raw = await comp_cursor.to_list(length=50)
-    completed_matches = [res for res in [await enrich_match(m) for m in comp_raw] if res is not None]
-
-    return {
-        "tournaments_ready": ready_tournaments,
-        "ready_for_match_creation": ready_tournaments,
-        "scheduled_matches": scheduled_matches,
-        "scheduled": scheduled_matches,
-        "live_matches": live_matches,
-        "live_now": live_matches,
-        "completed_matches": completed_matches,
-        "completed": completed_matches,
-    }
+# ----------------- ADMIN MATCH PAIRING SYSTEM -----------------
 
 @router.post("/matches/pair")
 async def pair_match_teams(
@@ -2522,14 +2360,6 @@ async def update_match_status(
 
     await db.matches.update_one({"_id": match["_id"]}, {"$set": update_dict})
 
-    try:
-        from app.services.live_match_service import sync_live_match_for_tournament
-        tid = str(match.get("tournament_id"))
-        if tid:
-            await sync_live_match_for_tournament(tid, db)
-    except Exception:
-        pass
-
     await ws_manager.broadcast({
         "type": "MATCH_STATUS_CHANGED",
         "match_id": str(match.get("_id", match.get("id"))),
@@ -2602,12 +2432,6 @@ async def update_match_score_admin(
             )
         except Exception:
             pass
-
-    try:
-        from app.services.live_match_service import sync_live_match_for_tournament
-        await sync_live_match_for_tournament(str(match.tournament_id), db)
-    except Exception:
-        pass
 
     new_stat = "COMPLETED" if payload.complete_match else "RESULTS_SAVED"
 
@@ -3232,12 +3056,6 @@ async def generate_battle_royale_matches_admin(
             "players_per_team": calc["players_per_team"],
         }}
     )
-
-    try:
-        from app.services.live_match_service import sync_live_match_for_tournament
-        await sync_live_match_for_tournament(tid, db)
-    except Exception as e:
-        pass
 
     return {
         "status": "success",
@@ -4002,12 +3820,6 @@ async def update_match_details_admin(
         details=str(update_fields),
     )
 
-    try:
-        from app.services.live_match_service import sync_live_match_for_tournament
-        await sync_live_match_for_tournament(str(match.get("tournament_id")), db)
-    except Exception as e:
-        pass
-
     return {"status": "success", "message": "Match updated successfully", "updated": update_fields}
 
 @router.delete("/matches/{id}")
@@ -4366,12 +4178,6 @@ async def complete_match_admin(
         target=f"Match {match.id}",
         details=f"Scores: {score_a}-{score_b} | Winner: {winner_id}",
     )
-
-    try:
-        from app.services.live_match_service import sync_live_match_for_tournament
-        await sync_live_match_for_tournament(str(match.tournament_id), db)
-    except Exception as e:
-        pass
 
     return {
         "status": "success",
@@ -4764,8 +4570,6 @@ async def release_round_credentials_admin(
         }}
     )
 
-    from app.services.live_match_service import sync_live_match_for_tournament
-    await sync_live_match_for_tournament(tid, db)
 
     return {
         "status": "success",
@@ -4820,8 +4624,6 @@ async def start_round_live_admin(
             {"$set": {"status": "LIVE"}}
         )
 
-    from app.services.live_match_service import sync_live_match_for_tournament
-    await sync_live_match_for_tournament(tid, db)
 
     return {
         "status": "success",
@@ -5103,8 +4905,6 @@ async def record_knockout_match_result_admin(
 
     await db.tournament_rounds.update_one({"_id": r["_id"]}, {"$set": round_updates})
 
-    from app.services.live_match_service import sync_live_match_for_tournament
-    await sync_live_match_for_tournament(tid, db)
 
     return {
         "status": "success",
@@ -5409,8 +5209,6 @@ async def update_tournament_round_admin(
 
     await db.tournament_rounds.update_one({"_id": r["_id"]}, {"$set": upd})
 
-    from app.services.live_match_service import sync_live_match_for_tournament
-    await sync_live_match_for_tournament(tid, db)
 
     updated_round = await db.tournament_rounds.find_one({"_id": r["_id"]})
     if updated_round:
@@ -5494,8 +5292,6 @@ async def delete_tournament_round_admin(
         ]
     })
 
-    from app.services.live_match_service import sync_live_match_for_tournament
-    await sync_live_match_for_tournament(tid, db)
 
     updated_tourn = await db.tournaments.find_one({"_id": tourn["_id"]})
     return {
@@ -5571,8 +5367,6 @@ async def update_round_match_admin(
 
     await db.matches.update_one({"_id": m["_id"]}, {"$set": upd})
 
-    from app.services.live_match_service import sync_live_match_for_tournament
-    await sync_live_match_for_tournament(tid, db)
 
     updated_m = await db.matches.find_one({"_id": m["_id"]})
     if updated_m:
@@ -5642,8 +5436,6 @@ async def delete_round_match_admin(
     )
     await db.matches.delete_one({"_id": m["_id"]})
 
-    from app.services.live_match_service import sync_live_match_for_tournament
-    await sync_live_match_for_tournament(tid, db)
 
     return {
         "status": "success",
@@ -5714,8 +5506,6 @@ async def save_knockout_match_credentials_admin(
         }}
     )
 
-    from app.services.live_match_service import sync_live_match_for_tournament
-    await sync_live_match_for_tournament(tid, db)
 
     return {
         "status": "success",
@@ -5829,8 +5619,6 @@ async def release_knockout_match_credentials_admin(
         except Exception as e:
             logger.warning(f"Match credentials email batch notice: {e}")
 
-    from app.services.live_match_service import sync_live_match_for_tournament
-    await sync_live_match_for_tournament(tid, db)
 
     return {
         "status": "success",
@@ -6932,11 +6720,6 @@ async def update_match_credentials_admin(
 
     if upd:
         await db.matches.update_one(m_query, {"$set": upd})
-        try:
-            from app.services.live_match_service import sync_live_match_for_tournament
-            await sync_live_match_for_tournament(str(match.get("tournament_id")), db)
-        except Exception:
-            pass
 
     return {
         "status": "success",
@@ -7015,12 +6798,6 @@ async def release_match_credentials_admin(
         target=f"Match {mid}",
         details="Match credentials released for participants. Status unchanged.",
     )
-
-    try:
-        from app.services.live_match_service import sync_live_match_for_tournament
-        await sync_live_match_for_tournament(str(match.get("tournament_id")), db)
-    except Exception:
-        pass
 
     return {
         "status": "success",
@@ -7448,12 +7225,6 @@ async def submit_battle_royale_results_admin(
             details=f"Draft BR results saved. Placements: {len(processed_results)}. Status: RESULTS_SAVED.",
         )
 
-        try:
-            from app.services.live_match_service import sync_live_match_for_tournament
-            await sync_live_match_for_tournament(tid, db)
-        except Exception:
-            pass
-
         return {
             "status": "success",
             "message": "Battle Royale results saved as draft. Review and finalize when ready.",
@@ -7638,12 +7409,6 @@ async def submit_battle_royale_results_admin(
         target=f"Match {id}",
         details=f"BR results submitted. Winner: {winner_team_id}. Qualifiers: {len(raw_qualifier_ids)}. Final round: {payload.is_final_round}.",
     )
-
-    try:
-        from app.services.live_match_service import sync_live_match_for_tournament
-        await sync_live_match_for_tournament(tid, db)
-    except Exception as e:
-        pass
 
     return {
         "status": "success",

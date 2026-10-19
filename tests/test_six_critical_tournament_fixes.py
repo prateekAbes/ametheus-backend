@@ -9,7 +9,6 @@ from app.core.database import get_db, set_database
 from app.main import app
 from app.models.user import User
 from app.api.deps import get_current_user, get_current_user_optional, require_organizer, require_super_admin
-from app.services.live_match_service import sync_live_match_for_tournament
 
 
 @pytest_asyncio.fixture
@@ -142,124 +141,6 @@ async def test_bug1_registered_br_player_receives_credentials_when_released(mock
 # ==============================================================================
 # BUG 2 REGRESSION TESTS: Live Battle Royale Matches on Matches Page
 # ==============================================================================
-
-@pytest.mark.asyncio
-async def test_bug2_live_br_matches_synthesized_and_visible_on_matches_page(mock_db, make_client):
-    """
-    Verifies that a tournament with an active Battle Royale round in tournament_rounds
-    is correctly synthesized and appears on the Matches page (/matches), even if
-    valid_encounters from db.matches already had records or was empty.
-    """
-    tourn_oid = ObjectId()
-    tourn_id = str(tourn_oid)
-
-    await mock_db.tournaments.insert_one({
-        "_id": tourn_oid,
-        "id": tourn_id,
-        "title": "Apex Legends BR Clash",
-        "slug": "apex-br-clash",
-        "status": "LIVE",
-        "format": "Battle Royale",
-        "game_slug": "apex",
-    })
-
-    # Stale/completed knockout match in db.matches
-    await mock_db.matches.insert_one({
-        "_id": ObjectId(),
-        "tournament_id": tourn_id,
-        "status": "COMPLETED",
-        "round_number": 1,
-        "roster_status": "PUBLISHED",
-        "team_a_name": "Old Squad 1",
-        "team_b_name": "Old Squad 2",
-    })
-
-    # Active LIVE Battle Royale round in tournament_rounds
-    round_oid = ObjectId()
-    await mock_db.tournament_rounds.insert_one({
-        "_id": round_oid,
-        "id": str(round_oid),
-        "tournament_id": tourn_id,
-        "round_number": 2,
-        "round_name": "Round 2 - Semis",
-        "stage_name": "Round 2",
-        "format": "Battle Royale",
-        "status": "LIVE",
-        "eligible_contenders": [
-            {"id": "team_1", "name": "Apex Kings"},
-            {"id": "team_2", "name": "Viper Squad"},
-            {"id": "team_3", "name": "Shadow Ravens"},
-        ],
-        "room_id": "APEX-LIVE-ROOM",
-        "room_password": "SECURE",
-        "credentials_released": True,
-    })
-
-    # Run sync service
-    live_doc = await sync_live_match_for_tournament(tourn_id, mock_db)
-    assert live_doc is not None
-    assert live_doc["tournament_id"] == tourn_id
-    assert live_doc["status"] == "LIVE"
-
-    # Query public matches endpoint
-    public_client = make_client()
-    resp = await public_client.get("/api/v1/matches")
-    assert resp.status_code == 200, resp.text
-    matches = resp.json()
-    assert len(matches) >= 1
-
-    br_match = next((m for m in matches if m.get("tournament_id") == tourn_id), None)
-    assert br_match is not None
-    assert br_match["status"] == "LIVE"
-    assert br_match["format"] == "Battle Royale"
-
-
-# ==============================================================================
-# BUG 3 REGRESSION TESTS: Match Number and Round Display Distinction
-# ==============================================================================
-
-@pytest.mark.asyncio
-async def test_bug3_round_label_and_encounter_number_distinction(mock_db):
-    """
-    Verifies that the round label correctly displays 'Round 2' instead of being
-    overwritten with 'Match 1'.
-    """
-    tourn_oid = ObjectId()
-    tourn_id = str(tourn_oid)
-
-    await mock_db.tournaments.insert_one({
-        "_id": tourn_oid,
-        "id": tourn_id,
-        "title": "Valorant Championship",
-        "slug": "val-champ",
-        "status": "LIVE",
-        "format": "Single Elimination",
-    })
-
-    match_oid = ObjectId()
-    await mock_db.matches.insert_one({
-        "_id": match_oid,
-        "id": str(match_oid),
-        "tournament_id": tourn_id,
-        "round_number": 2,
-        "round_name": "Round 2",
-        "match_number": 1,
-        "order": 1,
-        "stage": "Round 2",
-        "status": "LIVE",
-        "team_a_name": "Sentinels",
-        "team_b_name": "Fnatic",
-        "roster_status": "PUBLISHED",
-    })
-
-    live_doc = await sync_live_match_for_tournament(tourn_id, mock_db)
-    assert live_doc is not None
-    assert live_doc["current_round_name"] == "Round 2"
-    assert live_doc["current_round_number"] == 2
-    assert live_doc["current_encounter_number"] == 1
-    assert live_doc["current_encounter_title"] == "Match 1"
-
-
 # ==============================================================================
 # BUG 5 REGRESSION TESTS: Second-Round Credentials Return Round 2
 # ==============================================================================

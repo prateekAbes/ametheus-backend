@@ -749,6 +749,77 @@ async def get_tournament_by_slug(slug: str, db: AsyncIOMotorDatabase = Depends(g
         completed_at=str(t["completed_at"]) if t.get("completed_at") else None,
     )
 
+async def is_match_authorized_viewer(current_user: Optional[User], match: dict, db: AsyncIOMotorDatabase) -> bool:
+    if not current_user:
+        return False
+    if current_user.role in ["SUPER_ADMIN", "ADMIN", "ORGANIZER"]:
+        return True
+
+    tourn_id = match.get("tournament_id")
+    if tourn_id:
+        assign_check = await db.tournament_admin_assignments.find_one({
+            "admin_user_id": current_user.id,
+            "tournament_id": tourn_id,
+        })
+        if assign_check:
+            return True
+
+    valid_uids = [str(current_user.id)]
+    if getattr(current_user, "clerk_user_id", None):
+        valid_uids.append(str(current_user.clerk_user_id))
+
+    team_a_id = match.get("team_a_id")
+    team_b_id = match.get("team_b_id")
+    raw_team_ids = [str(x) for x in (match.get("team_ids") or []) if x]
+    reg_part_ids = [str(x) for x in (match.get("registered_participant_ids") or []) if x]
+    br_teams = match.get("teams") or []
+    br_team_ids = [str(t.get("id") or t.get("_id") or t.get("team_id")) for t in br_teams if isinstance(t, dict)]
+
+    all_part_ids = set([str(tid) for tid in [team_a_id, team_b_id] + raw_team_ids + reg_part_ids + br_team_ids if tid])
+
+    for uid in valid_uids:
+        if uid in all_part_ids:
+            return True
+
+    competing_teams = list(set([tid for tid in [team_a_id, team_b_id] + raw_team_ids + br_team_ids if tid]))
+
+    if competing_teams:
+        team_doc = await db.teams.find_one({
+            "$and": [
+                {"$or": [{"_id": {"$in": competing_teams}}, {"id": {"$in": competing_teams}}]},
+                {"$or": [
+                    {"captain_id": {"$in": valid_uids}},
+                    {"members.user_id": {"$in": valid_uids}},
+                ]}
+            ]
+        })
+        if team_doc:
+            return True
+
+    # Check tournament registrations for solo or team contender
+    if tourn_id:
+        tid_str = str(tourn_id)
+        reg_check = await db.tournament_registrations.find_one({
+            "$or": [{"tournament_id": tid_str}, {"tournament_id": match.get("tournament_slug", tid_str)}],
+            "$or": [
+                {"player_id": {"$in": valid_uids}},
+                {"user_id": {"$in": valid_uids}},
+                {"team_id": {"$in": competing_teams}} if competing_teams else {"team_id": "NONE"},
+            ],
+            "payment_status": {"$in": ["PAID", "FREE"]},
+        })
+        if reg_check:
+            if competing_teams:
+                reg_tid = str(reg_check.get("team_id") or "")
+                reg_pid = str(reg_check.get("player_id") or reg_check.get("user_id") or "")
+                if reg_tid in competing_teams or reg_pid in all_part_ids:
+                    return True
+            else:
+                return True
+            return True
+
+    return False
+
 @router.get("/{slug}/matches", response_model=List[MatchResponse])
 async def get_tournament_matches(
     slug: str,
@@ -769,7 +840,6 @@ async def get_tournament_matches(
     gid = t.get("game_id")
     game = await db.games.find_one({"$or": [{"_id": gid}, {"id": gid}, {"slug": gid}]})
 
-    from app.api.v1.endpoints.matches import is_match_authorized_viewer
     is_admin_or_organizer = bool(current_user and current_user.role in ["SUPER_ADMIN", "ADMIN", "ORGANIZER"])
 
     response = []

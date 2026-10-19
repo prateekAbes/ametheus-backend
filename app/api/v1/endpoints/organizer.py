@@ -939,12 +939,6 @@ async def start_tournament_live(
         details=f"Status transitioned: {prev_status} -> LIVE",
     )
 
-    try:
-        from app.services.live_match_service import sync_live_match_for_tournament
-        await sync_live_match_for_tournament(tid, db)
-    except Exception:
-        pass
-
     updated = await db.tournaments.find_one({"_id": tourn["_id"]})
     gid = updated.get("game_id")
     game = await db.games.find_one({"$or": [{"_id": gid}, {"id": gid}, {"slug": gid}]})
@@ -991,12 +985,6 @@ async def complete_tournament_organizer(
         target=f"Tournament {tourn.get('title')} ({tid})",
         details=f"Status transitioned: {prev_status} -> COMPLETED",
     )
-
-    try:
-        from app.services.live_match_service import sync_live_match_for_tournament
-        await sync_live_match_for_tournament(tid, db)
-    except Exception:
-        pass
 
     updated = await db.tournaments.find_one({"_id": tourn["_id"]})
     gid = updated.get("game_id")

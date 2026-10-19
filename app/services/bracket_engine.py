@@ -209,11 +209,6 @@ async def build_single_elimination_bracket(
         {"$or": [{"_id": tournament.id}, {"id": tournament.id}]},
         {"$set": {"bracket_rounds": bracket_tree, "status": "LIVE"}}
     )
-    try:
-        from app.services.live_match_service import sync_live_match_for_tournament
-        await sync_live_match_for_tournament(str(tournament.id), db)
-    except Exception as e:
-        print(f"[Live Match Sync Warning in build_single_elimination_bracket]: {e}")
     return {"total_rounds": total_rounds, "bracket": bracket_tree}
 
 # 2. DOUBLE ELIMINATION
@@ -469,11 +464,6 @@ async def build_round_robin_schedule(
         {"$or": [{"_id": tournament.id}, {"id": tournament.id}]},
         {"$set": {"bracket_rounds": bracket_tree, "status": "LIVE"}}
     )
-    try:
-        from app.services.live_match_service import sync_live_match_for_tournament
-        await sync_live_match_for_tournament(str(tournament.id), db)
-    except Exception as e:
-        print(f"[Live Match Sync Warning in build_round_robin_schedule]: {e}")
     return {"total_rounds": total_rounds, "bracket": bracket_tree}
 
 # 5. DOUBLE ROUND ROBIN
@@ -869,11 +859,6 @@ async def generate_tournament_bracket(
             {"$or": [{"_id": tournament.id}, {"id": tournament.id}]},
             {"$set": {"bracket_rounds": bracket_tree, "status": "LIVE"}}
         )
-        try:
-            from app.services.live_match_service import sync_live_match_for_tournament
-            await sync_live_match_for_tournament(str(tournament.id), db)
-        except Exception as e:
-            print(f"[Live Match Sync Warning in generate_matches_for_tournament]: {e}")
         return {"total_rounds": 1, "bracket": bracket_tree}
     elif "robin" in raw_fmt:
         return await build_round_robin_schedule(tournament, db)
@@ -1201,12 +1186,6 @@ async def advance_bracket_match(
                     upd_t_query,
                     {"$set": {"status": "COMPLETED", "winner_team_id": winner_team_id}}
                 )
-
-    try:
-        from app.services.live_match_service import sync_live_match_for_tournament
-        await sync_live_match_for_tournament(str(tournament_id), db)
-    except Exception as e:
-        print(f"[Live Match Sync Warning in advance_bracket_match]: {e}")
 
     return next_match
 
